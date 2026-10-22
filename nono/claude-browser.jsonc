@@ -1,0 +1,30 @@
+// Install to ~/.config/nono/profiles/claude-browser.jsonc
+//
+// Claude Code under nono, able to drive its project's AIO Sandbox over
+// MCP. The per-project sandbox port is NOT listed here: bin/claude-in
+// adds it with --open-port, so each session can reach only its own
+// sandbox, not the other projects'.
+{
+  "meta": {
+    "name": "claude-browser",
+    "version": "0.1.0",
+    "description": "Claude Code + per-project AIO Sandbox over localhost MCP"
+  },
+  "extends": "nolabs-ai/claude",
+  "network": {
+    // The nolabs-ai/claude pack leaves egress open; filter it through
+    // nono's proxy. Add project-specific hosts to "allow_domain".
+    "network_profile": "claude-code",
+    // MCP traffic to 127.0.0.1:<port> must go direct, not via nono's proxy.
+    // nono may already exclude these by default; drop this if it complains.
+    "no_proxy": ["127.0.0.1", "localhost"]
+  },
+  "session_hooks": {
+    // Runs outside the sandbox before Claude starts; exports AIO_PORT and
+    // AIO_KEY for the project in the working directory (see the script).
+    "before": {
+      "script": "/home/metahertz/.config/nono/hooks/aio-env.sh",
+      "timeout_secs": 5
+    }
+  }
+}

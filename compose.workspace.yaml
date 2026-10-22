@@ -1,0 +1,34 @@
+# One AIO Sandbox (browser + VNC + MCP) for one workspace. Values come
+# from workspaces/<name>.env; normally driven by the web UI:
+#
+#   docker compose -p aio-<name> --env-file workspaces/<name>.env \
+#     -f compose.workspace.yaml up -d
+#
+# Sized for this host (8 cores / 9 GB): ~2 GB RAM + 2 GB shm each, so
+# three running at once is the practical ceiling.
+
+services:
+  sandbox:
+    image: ghcr.io/agent-infra/sandbox:1.11.0   # pinned; bump deliberately
+    container_name: aio-${WS_NAME:?}
+    # Upstream requires this (Chromium's own sandbox needs syscalls the
+    # default Docker seccomp profile blocks).
+    security_opt:
+      - seccomp:unconfined
+    # Deliberately no `host.docker.internal` mapping (upstream adds one):
+    # the container has no business reaching services on the host.
+    restart: unless-stopped
+    shm_size: "2gb"
+    mem_limit: "2g"
+    cpus: "2"
+    ports:
+      - "127.0.0.1:${WS_PORT:?}:8080"
+    environment:
+      SANDBOX_API_KEY: ${WS_KEY:?}
+      TZ: Etc/UTC
+      WORKSPACE: /home/gem/workspace
+      # code-server backs the UI's "VS Code" tab; Jupyter isn't exposed.
+      DISABLE_JUPYTER: "true"
+      DISABLE_CODE_SERVER: "false"
+    volumes:
+      - ${WS_DIR:?}:/home/gem/workspace

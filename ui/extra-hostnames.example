@@ -1,0 +1,6 @@
+# Copy to ui/extra-hostnames (git-ignored) and edit.
+# Extra DNS names for this host: accepted by the web UI and included in its
+# TLS certificate (and the CA's name constraints). One per line. After editing:
+#   sudo systemctl restart agent-sandboxes-ui
+# Changing this list regenerates the CA, which must then be re-imported.
+# my-host.example.com

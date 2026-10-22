@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Maintain the web UI's private CA and server certificate in ui/tls/.
+#
+# The CA is name-constrained to this host (its IP, hostname, localhost), so
+# trusting it on your laptop can't be abused to impersonate other sites.
+# Import ui/tls/ca.crt on your laptop once. The server certificate is
+# (re)issued when missing, expiring within 30 days, or when the names it
+# must cover change (host IP, hostname, workspace <name>.localhost).
+#
+# Prints "issued" or "unchanged". Safe to run any time.
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+D="$ROOT/ui/tls"
+mkdir -p "$D" && chmod 700 "$D"
+umask 077
+
+ip="$(ip -4 route get 192.0.2.1 2>/dev/null | grep -oP 'src \K\S+' || true)"
+host="$(hostname)"
+fqdn="$(hostname -f 2>/dev/null || echo "$host")"
+
+# Extra DNS names for this host (e.g. its DNS record), one per line.
+extra=()
+if [[ -r "$ROOT/ui/extra-hostnames" ]]; then
+  while read -r n; do
+    n="${n%%#*}"; n="${n//[[:space:]]/}"; n="${n,,}"
+    [[ -z "$n" ]] && continue
+    [[ "$n" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || { echo "ignoring bad hostname: $n" >&2; continue; }
+    extra+=("$n")
+  done < "$ROOT/ui/extra-hostnames"
+fi
+
+# --- CA: name constraints pin it to this host; rebuild if the names change.
+constraints="permitted;DNS:localhost,permitted;DNS:${host},permitted;IP:127.0.0.0/255.0.0.0"
+[[ "$fqdn" != "$host" ]] && constraints+=",permitted;DNS:${fqdn}"
+for n in "${extra[@]}"; do constraints+=",permitted;DNS:${n}"; done
+[[ -n "$ip" ]] && constraints+=",permitted;IP:${ip}/255.255.255.255"
+
+if [[ ! -s "$D/ca.crt" || ! -s "$D/ca.key" || "$(cat "$D/ca.constraints" 2>/dev/null)" != "$constraints" ]]; then
+  [[ -s "$D/ca.crt" ]] && echo "CA name constraints changed (host IP/names?) — new CA; re-import ca.crt" >&2
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout "$D/ca.key" -out "$D/ca.crt" -days 3650 \
+    -subj "/CN=Agent Sandboxes local CA (${host})" \
+    -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -addext "nameConstraints=critical,${constraints}" 2>/dev/null
+  printf '%s' "$constraints" > "$D/ca.constraints"
+  rm -f "$D/server.crt"
+fi
+
+# --- server certificate
+sans="DNS:localhost,DNS:${host},IP:127.0.0.1"
+[[ "$fqdn" != "$host" ]] && sans+=",DNS:${fqdn}"
+for n in "${extra[@]}"; do sans+=",DNS:${n}"; done
+[[ -n "$ip" ]] && sans+=",IP:${ip}"
+for f in "$ROOT"/workspaces/*.env; do
+  [[ -r "$f" ]] || continue
+  n="$(grep -oP '^WS_NAME=\K.*' "$f" || true)"
+  [[ -n "$n" ]] && sans+=",DNS:${n}.localhost"
+done
+
+if [[ -s "$D/server.crt" && -s "$D/server.key" \
+      && "$(cat "$D/server.sans" 2>/dev/null)" == "$sans" ]] \
+   && openssl x509 -in "$D/server.crt" -noout -checkend 2592000 >/dev/null \
+   && openssl verify -CAfile "$D/ca.crt" "$D/server.crt" >/dev/null 2>&1; then
+  echo unchanged
+  exit 0
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "$tmp/server.key" -out "$tmp/server.csr" -subj "/CN=${host}" 2>/dev/null
+printf 'subjectAltName=%s\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n' \
+  "$sans" > "$tmp/ext"
+openssl x509 -req -in "$tmp/server.csr" -CA "$D/ca.crt" -CAkey "$D/ca.key" \
+  -set_serial "0x$(openssl rand -hex 16)" -days 397 -extfile "$tmp/ext" \
+  -out "$tmp/server.crt" 2>/dev/null
+# Swap in key+cert together so a reload never sees a mismatched pair.
+mv "$tmp/server.key" "$D/server.key.new" && mv "$tmp/server.crt" "$D/server.crt.new"
+mv "$D/server.key.new" "$D/server.key" && mv "$D/server.crt.new" "$D/server.crt"
+printf '%s' "$sans" > "$D/server.sans"
+chmod 644 "$D/ca.crt"
+echo issued

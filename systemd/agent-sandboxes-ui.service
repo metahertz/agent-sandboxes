@@ -1,0 +1,31 @@
+# System unit: runs as metahertz with only CAP_NET_BIND_SERVICE, to serve on 443.
+# Install: sudo install -m 644 ~/agent-sandboxes/systemd/agent-sandboxes-ui.service /etc/systemd/system/
+[Unit]
+Description=Agent Sandboxes web UI (nono + AIO Sandbox workspaces)
+Documentation=file:///home/metahertz/agent-sandboxes/README.md
+Wants=network-online.target
+After=network-online.target docker.service user-runtime-dir@1000.service
+
+[Service]
+Type=simple
+User=metahertz
+Group=metahertz
+ExecStart=/home/metahertz/agent-sandboxes/bin/sandbox-ui
+Environment=PYTHONUNBUFFERED=1
+Environment=AIO_UI_PORT=443
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+# Bind 443 and nothing more. The server clears the ambient set once its
+# sockets are bound, so tmux / Claude / docker children don't inherit it.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+Restart=on-failure
+RestartSec=3
+# Claude sessions live in a tmux server forked from this service; stopping
+# or restarting the UI must not kill them.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

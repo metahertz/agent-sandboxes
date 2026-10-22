@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "aio-sandbox": {
+      "type": "http",
+      "url": "http://127.0.0.1:${AIO_PORT}/mcp",
+      "headers": {
+        "X-AIO-API-Key": "${AIO_KEY}"
+      }
+    }
+  }
+}

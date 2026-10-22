@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Sandboxes</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/vendor/xterm.js" defer></script>
+<script src="/static/vendor/addon-fit.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <header class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <span>Agent Sandboxes</span>
+    </header>
+
+    <nav id="ws-list" class="ws-list" aria-label="Workspaces"></nav>
+
+    <button id="new-toggle" class="btn ghost new-toggle" type="button">+ New workspace</button>
+    <form id="new-form" class="new-form" hidden>
+      <label>Name
+        <input name="name" required pattern="[a-z0-9][a-z0-9\-]{0,29}" placeholder="my-app" autocomplete="off">
+      </label>
+      <label>Project folder <span class="muted">(optional)</span>
+        <input name="dir" placeholder="~/projects/my-app" autocomplete="off">
+      </label>
+      <div class="row">
+        <button class="btn primary" type="submit">Create</button>
+        <button class="btn ghost" type="button" id="new-cancel">Cancel</button>
+      </div>
+      <p class="form-msg" id="new-msg" role="status"></p>
+    </form>
+  </aside>
+
+  <main class="main">
+    <section id="empty" class="empty">
+      <h1>No workspace selected</h1>
+      <p>Each workspace is a project folder, a Claude Code session confined by nono, and a browser sandbox container that only that session can reach.</p>
+    </section>
+
+    <section id="detail" class="detail" hidden>
+      <header class="detail-head">
+        <div class="title">
+          <h1 id="d-name"></h1>
+          <p class="meta"><span id="d-dir"></span> · sandbox port <span id="d-port"></span></p>
+        </div>
+        <div class="status">
+          <span class="pill" id="d-container"></span>
+          <span class="pill" id="d-claude"></span>
+        </div>
+      </header>
+
+      <div class="toolbar">
+        <div class="group">
+          <span class="group-label">Container</span>
+          <button class="btn" data-act="container/start">Start</button>
+          <button class="btn" data-act="container/stop">Stop</button>
+        </div>
+        <div class="group">
+          <span class="group-label">Claude</span>
+          <button class="btn primary" data-act="claude/start">Start</button>
+          <button class="btn" data-act="claude/restart">Restart</button>
+          <button class="btn" data-act="claude/stop">Stop</button>
+        </div>
+        <div class="group end">
+          <button class="btn danger ghost" id="remove-btn">Remove…</button>
+        </div>
+      </div>
+      <div class="confirm" id="remove-confirm" hidden>
+        <p>Remove <strong id="rm-name"></strong>? Stops Claude, deletes the container and its key. The project folder <code id="rm-dir"></code> is kept.</p>
+        <div class="row">
+          <button class="btn danger" id="rm-yes">Remove workspace</button>
+          <button class="btn ghost" id="rm-no">Cancel</button>
+        </div>
+      </div>
+      <p class="action-msg" id="action-msg" role="status"></p>
+
+      <div class="tabs" role="tablist">
+        <button role="tab" data-tab="claude" aria-selected="true">Claude</button>
+        <button role="tab" data-tab="browser">Browser</button>
+        <button role="tab" data-tab="vscode">VS Code</button>
+        <button role="tab" data-tab="shell">Terminal</button>
+        <button role="tab" data-tab="files">Files</button>
+        <button role="tab" data-tab="logs">Logs</button>
+      </div>
+
+      <div class="panel" data-panel="claude">
+        <div id="term" class="term"></div>
+        <div class="overlay" id="term-overlay" hidden>
+          <p id="term-overlay-msg"></p>
+          <button class="btn primary" data-act="claude/start">Start Claude</button>
+        </div>
+      </div>
+
+      <div class="panel" data-panel="browser" hidden>
+        <div class="panel-bar">
+          <span class="muted">Live view of the sandbox's browser (VNC). Interact directly; Claude sees the same session.</span>
+          <span class="spacer"></span>
+          <button class="btn" data-frame-reload>Reconnect</button>
+          <button class="btn" id="open-sandbox">Sandbox home ↗</button>
+          <button class="btn" data-frame-open>Open in new tab ↗</button>
+        </div>
+        <iframe class="frame vnc" title="Sandbox browser"></iframe>
+        <div class="overlay" hidden><p>The container isn't running.</p>
+          <button class="btn primary" data-act="container/start">Start container</button></div>
+      </div>
+
+      <div class="panel" data-panel="vscode" hidden>
+        <div class="panel-bar">
+          <span class="muted">VS Code in the sandbox container, on the project folder <span class="d-dir-inline"></span>.</span>
+          <span class="spacer"></span>
+          <button class="btn" data-frame-reload>Reload</button>
+          <button class="btn" data-frame-open>Open in new tab ↗</button>
+        </div>
+        <iframe class="frame" title="VS Code" allow="clipboard-read; clipboard-write"></iframe>
+        <div class="overlay" hidden><p>The container isn't running.</p>
+          <button class="btn primary" data-act="container/start">Start container</button></div>
+      </div>
+
+      <div class="panel" data-panel="shell" hidden>
+        <div class="panel-bar">
+          <span class="muted">A shell inside the sandbox container (user <code>gem</code>), not on the host. The project folder is <code>/home/gem/workspace</code>.</span>
+          <span class="spacer"></span>
+          <button class="btn" data-frame-reload>New session</button>
+          <button class="btn" data-frame-open>Open in new tab ↗</button>
+        </div>
+        <iframe class="frame" title="Container terminal" allow="clipboard-read; clipboard-write"></iframe>
+        <div class="overlay" hidden><p>The container isn't running.</p>
+          <button class="btn primary" data-act="container/start">Start container</button></div>
+      </div>
+
+      <div class="panel" data-panel="files" hidden>
+        <div class="panel-bar">
+          <button class="btn" id="f-up" title="Parent folder">↑</button>
+          <form id="f-form" class="path-form"><input id="f-path" spellcheck="false" aria-label="Path"></form>
+          <button class="btn ghost" data-jump="/home/gem/workspace">Project</button>
+          <button class="btn ghost" data-jump="/home/gem/workspace/Downloads">Downloads</button>
+          <button class="btn ghost" data-jump="/home/gem">Home</button>
+          <button class="btn" id="f-zip">Download folder (.tar)</button>
+        </div>
+        <div class="files-wrap">
+          <table class="files">
+            <thead><tr><th>Name</th><th class="num">Size</th><th>Modified</th><th></th></tr></thead>
+            <tbody id="f-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel" data-panel="logs" hidden>
+        <div class="panel-bar">
+          <span class="muted">Last 300 lines from the container</span>
+          <span class="spacer"></span>
+          <button class="btn" id="logs-refresh">Refresh</button>
+        </div>
+        <pre id="logs" class="logs"></pre>
+      </div>
+    </section>
+  </main>
+</div>
+</body>
+</html>

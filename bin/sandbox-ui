@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Start the Agent Sandboxes web UI on 127.0.0.1 and the host's primary IP,
+# port ${AIO_UI_PORT:-9000} (443 under the system unit) (sandboxes on 9101-9199). Restrict with
+# AIO_UI_BIND=127.0.0.1 and use: ssh -L 8443:localhost:443 <this-host>
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+TOKEN_FILE="$ROOT/ui/token"
+PORT="${AIO_UI_PORT:-9000}"
+HOST_IP="$(ip -4 route get 192.0.2.1 2>/dev/null | grep -oP 'src \K\S+' || true)"
+HOST_IP="${HOST_IP:-localhost}"
+SCHEME=https; [[ "${AIO_UI_TLS:-1}" == 0 ]] && SCHEME=http
+HOSTPORT="${HOST_IP}:${PORT}"
+[[ "$SCHEME:$PORT" == https:443 || "$SCHEME:$PORT" == http:80 ]] && HOSTPORT="$HOST_IP"
+
+if [[ ! -s "$TOKEN_FILE" ]]; then
+  (umask 077; openssl rand -hex 24 > "$TOKEN_FILE")
+fi
+if [[ -t 1 ]]; then
+  echo "Login: ${SCHEME}://${HOSTPORT}/login?token=$(cat "$TOKEN_FILE")"
+else   # e.g. under systemd: keep the token out of the journal
+  echo "Login: ${SCHEME}://${HOSTPORT}/login?token=<contents of $TOKEN_FILE>"
+fi
+
+export PATH="$HOME/.local/bin:$PATH"   # claude, for sessions started via tmux
+
+cmd=(python3 -I "$ROOT/ui/server.py")
+if id -nG | tr ' ' '\n' | grep -qx docker; then
+  exec "${cmd[@]}"
+else
+  # Group added since this login session began; pick it up without re-login.
+  exec sg docker -c "$(printf '%q ' "${cmd[@]}")"
+fi

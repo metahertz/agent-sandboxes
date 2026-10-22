@@ -1,0 +1,7 @@
+# Secrets and per-host state — never commit
+workspaces/
+ui/token
+ui/tls/
+ui/extra-hostnames
+
+__pycache__/

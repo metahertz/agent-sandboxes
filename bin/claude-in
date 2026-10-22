@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Start Claude Code for one workspace inside nono, allowed to reach only
+# that workspace's AIO Sandbox port.
+#
+#   claude-in <workspace> [claude args...]
+set -euo pipefail
+
+WS_ROOT="${AIO_WORKSPACES:-$HOME/agent-sandboxes/workspaces}"
+name="${1:?usage: claude-in <workspace> [claude args...]}"; shift
+env_file="$WS_ROOT/$name.env"
+[[ -r "$env_file" ]] || { echo "No workspace '$name' ($env_file)." >&2; exit 1; }
+
+set -a; source "$env_file"; set +a
+
+if ! curl -fsS -o /dev/null --max-time 2 -H "X-AIO-API-Key: $WS_KEY" "http://127.0.0.1:${WS_PORT}/v1/docs"; then
+  echo "AIO sandbox for '$name' isn't answering on :${WS_PORT} — start it from the web UI." >&2
+fi
+
+cd "$WS_DIR"
+exec nono run --profile claude-browser --allow-cwd --open-port "$WS_PORT" -- claude "$@"
