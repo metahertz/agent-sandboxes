@@ -2,13 +2,15 @@
 # Monitoring for Agent Sandboxes (monitoring/compose.yaml + ui/exporter.py).
 #
 #   monitoring up        set up on first run, start the stack and the exporter
+#   monitoring init      set up only (monitoring/.env, password, exporter unit)
 #   monitoring down      stop both (data is kept)
 #   monitoring status    containers, exporter, Grafana URL
 #   monitoring logs [service]
 #   monitoring password  print Grafana's admin password
 #
-# Once it's set up (monitoring/.env exists), Claude sessions started from
-# then on send their telemetry to Alloy.
+# The web UI's Settings page edits monitoring/.env and runs up / down.
+# Once it's set up, Claude sessions started from then on send their
+# telemetry to Alloy (unless CLAUDE_TELEMETRY=0).
 set -euo pipefail
 
 ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
@@ -18,10 +20,15 @@ PW_FILE="$ROOT/secrets/grafana-admin-password"
 UNIT=agent-sandboxes-exporter.service
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
 
+setting() {
+  # shellcheck disable=SC1090
+  (source "$ENV_FILE"; eval "echo \"\${$1:-$2}\"")
+}
+
+# with the local stack's services only when MON_STACK=1 (or "all")
 compose() {
   local profile=()
-  # shellcheck disable=SC1090
-  [[ "$(source "$ENV_FILE"; echo "${MON_STACK:-1}")" == 1 ]] && profile=(--profile stack)
+  [[ "${STACK:-$(setting MON_STACK 1)}" != 0 ]] && profile=(--profile stack)
   docker compose --env-file "$ENV_FILE" -f "$MON/compose.yaml" "${profile[@]}" "$@"
 }
 
@@ -43,6 +50,11 @@ HOST_NAME=$(hostname -s)
 GRAFANA_BIND=${ip:-127.0.0.1}
 GRAFANA_PORT=3000
 GRAFANA_DOMAIN=${domain}
+# Dashboards link on the web UI's Settings page; point it at an external
+# Grafana if you use one.
+MONITORING_URL=https://${domain}:3000/
+# 1 = Claude Code sends OpenTelemetry to Alloy (restart Claude to apply)
+CLAUDE_TELEMETRY=1
 # 1 = run Prometheus, Loki and Grafana here. 0 = only Alloy, shipping to:
 MON_STACK=1
 #PROM_WRITE_URL=https://prometheus.example/api/v1/write
@@ -52,19 +64,32 @@ PROM_RETENTION_SIZE=5GB
 LOKI_RETENTION=336h
 CONF
   fi
+  # settings added since an existing .env was written
+  grep -q '^#\{0,1\}MONITORING_URL=' "$ENV_FILE" ||
+    printf '# Dashboards link on the web UI Settings page\nMONITORING_URL=https://%s:%s/\n' \
+      "$(setting GRAFANA_DOMAIN localhost)" "$(setting GRAFANA_PORT 3000)" >> "$ENV_FILE"
+  grep -q '^#\{0,1\}CLAUDE_TELEMETRY=' "$ENV_FILE" ||
+    printf '# 1 = Claude Code sends OpenTelemetry to Alloy\nCLAUDE_TELEMETRY=1\n' >> "$ENV_FILE"
   install -Dm644 "$ROOT/systemd/$UNIT" "$HOME/.config/systemd/user/$UNIT"
   systemctl --user daemon-reload
 }
 
 url() {
-  # shellcheck disable=SC1090
-  (source "$ENV_FILE"; echo "https://${GRAFANA_DOMAIN}:${GRAFANA_PORT}/  (user admin, password: monitoring password)")
+  if [[ "$(setting MON_STACK 1)" != 0 ]]; then
+    echo "Grafana: https://$(setting GRAFANA_DOMAIN localhost):$(setting GRAFANA_PORT 3000)/  (user admin, password: monitoring password)"
+  else
+    echo "External: metrics -> $(setting PROM_WRITE_URL), logs -> $(setting LOKI_URL)"
+  fi
+  echo "Dashboards link: $(setting MONITORING_URL '<none>')"
 }
 
 case "${1:-status}" in
   up)
     setup
     compose up -d --remove-orphans
+    if [[ "$(setting MON_STACK 1)" == 0 ]]; then   # switched to external: drop the local stack (data kept)
+      STACK=1 compose rm -sf prometheus loki grafana
+    fi
     systemctl --user enable --now "$UNIT"
     systemctl --user restart "$UNIT"
     url
@@ -72,7 +97,7 @@ case "${1:-status}" in
     ;;
   down)
     systemctl --user disable --now "$UNIT" 2>/dev/null || true
-    [[ -f "$ENV_FILE" ]] && compose down
+    [[ -f "$ENV_FILE" ]] && STACK=1 compose down
     ;;
   status)
     [[ -f "$ENV_FILE" ]] || { echo "Not set up yet: monitoring up"; exit 0; }
@@ -83,10 +108,13 @@ case "${1:-status}" in
   logs)
     shift; compose logs --tail 100 -f "$@"
     ;;
+  init)
+    setup
+    ;;
   password)
     cat "$PW_FILE"; echo
     ;;
   *)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2
     ;;
 esac

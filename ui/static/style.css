@@ -48,6 +48,7 @@ code { font-family: var(--mono); font-size: 12.5px; background: var(--sunken); p
 .ws-list { display: flex; flex-direction: column; gap: 2px; }
 .ws-item { all: unset; cursor: pointer; display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 2px 8px; padding: 8px 10px; border-radius: 6px; }
 .ws-item:hover { background: var(--sunken); }
+.ws-item[hidden] { display: none; }
 .ws-item[aria-current="true"] { background: var(--sunken); box-shadow: inset 3px 0 0 var(--accent); }
 .ws-item .n { font-weight: 560; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-item .dots { display: flex; gap: 5px; }
@@ -173,7 +174,19 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 .matrix input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
 .matrix .note { padding: 14px 10px; }
 #pool-msg { padding: 0 2px; word-break: break-all; }
+
+/* settings */
+.card h3 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+.three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.three label, #mon-form .card > label:not(.check) { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; font-weight: 550; }
+#mon-form .radios label { display: flex; gap: 8px; align-items: baseline; font-size: 13px; cursor: pointer; }
+.mon-status { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.linkish { all: unset; cursor: pointer; color: var(--accent); text-decoration: underline; }
+.linkish:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#mon-pw-val { user-select: all; }
+.mon-log pre { max-height: 18rem; overflow: auto; margin: 6px 0 0; padding: 10px; background: var(--sunken); border-radius: 6px; font: 12px/1.4 var(--mono); white-space: pre-wrap; }
+#mon-msg { margin: 0; }
 @media (max-width: 760px) {
-  .two, .two.narrow { grid-template-columns: 1fr; }
+  .two, .two.narrow, .three { grid-template-columns: 1fr; }
   .pool { height: auto; }
 }

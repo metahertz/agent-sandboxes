@@ -124,6 +124,9 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   which workspaces get each. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+- **Settings** (sidebar): monitoring — dashboards link, local or external Prometheus /
+  Loki, local Grafana address and retention, Claude Code telemetry — with *Save & apply*
+  and *Stop monitoring*. See [Monitoring](#monitoring).
 - **Shell access:** `bin/claude-in <name>` runs a workspace's Claude directly;
   `tmux -L agent-sandboxes attach -t cl-<name>` attaches to a UI-started session.
 - **Service:** `sudo systemctl restart agent-sandboxes-ui` after editing `ui/server.py`;
@@ -131,9 +134,11 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
 
 ## Monitoring
 
+Start it from **Settings → Save & apply** in the UI, or from a shell:
+
 ```bash
 bin/monitoring up          # first run writes monitoring/.env; also starts the exporter
-bin/monitoring password    # Grafana admin password
+bin/monitoring password    # Grafana admin password (also on the Settings page)
 sudo ufw allow from <your-subnet> to any port 3000 proto tcp
 ```
 
@@ -151,11 +156,17 @@ workspace in detail, with its logs). What's collected:
 | node exporter (in Alloy) | Prometheus `node_*` | Host CPU, memory, disk, load |
 | Docker, journald | Loki `{source="docker"}`, `{source="journal"}` | `aio-*` / `mon-*` container logs; system journal |
 
-Once `monitoring/.env` exists, workspace profiles add Claude Code's telemetry settings
-and open localhost:4318 (Alloy's OTLP receiver) to the sandbox, so sessions started from
-then on report. Prometheus and Loki aren't published outside the compose network; to
-ship to existing ones instead, set `MON_STACK=0` and `PROM_WRITE_URL` / `LOKI_URL` in
-`monitoring/.env`. Retention: 30 days / 5 GB of metrics, 14 days of logs.
+Once `monitoring/.env` exists (and unless telemetry is switched off in Settings,
+`CLAUDE_TELEMETRY=0`), workspace profiles add Claude Code's telemetry settings and open
+localhost:4318 (Alloy's OTLP receiver) to the sandbox, so sessions started from then on
+report. Prometheus and Loki aren't published outside the compose network.
+
+To use an external Prometheus and Grafana, choose **External** under *Where data goes*
+(`MON_STACK=0`) with its remote-write and Loki URLs, set the **Dashboards URL**
+(`MONITORING_URL`) to your Grafana, import `monitoring/grafana/dashboards/*.json` there
+(datasource UIDs `prometheus` and `loki`), then *Save & apply*: only Alloy and the
+exporter keep running here; the local containers are removed, their volumes kept.
+Remote-write / Loki authentication isn't wired up yet. Default retention: 30 days / 5 GB of metrics, 14 days of logs.
 
 Claude always runs in a `systemd --user` scope (`claude-<name>-<pid>`, for resource
 limits and its metrics), which needs lingering (`sudo loginctl enable-linger <user>`).

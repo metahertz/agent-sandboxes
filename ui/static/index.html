@@ -40,6 +40,9 @@
       <button id="pool-btn" class="ws-item pool-item" type="button" aria-current="false">
         <span class="n">Keys &amp; tokens</span><span class="sub">SSH keys and API tokens, assigned per workspace</span>
       </button>
+      <button id="settings-btn" class="ws-item pool-item" type="button" aria-current="false">
+        <span class="n">Settings</span><span class="sub">Monitoring, dashboards and telemetry</span>
+      </button>
     </div>
   </aside>
 
@@ -267,6 +270,68 @@
         </section>
         <p class="form-msg" id="pool-msg" role="status"></p>
       </div>
+    </section>
+
+    <section id="settings" class="pool" hidden>
+      <header class="detail-head"><div class="title">
+        <h1>Settings</h1>
+        <p class="meta">Stored in ~/agent-sandboxes/monitoring/.env, which <code>bin/monitoring</code> uses too.</p>
+      </div></header>
+
+      <form id="mon-form" class="pool-body access">
+        <section class="card">
+          <div class="card-head"><h2>Monitoring</h2>
+            <a class="btn" id="mon-open" target="_blank" rel="noopener noreferrer" hidden>Open dashboards ↗</a></div>
+          <p class="hint">Alloy on this host collects workspace, container and host metrics, nono's network log, container logs and the journal, and sends them to Prometheus and Loki.</p>
+          <div class="mon-status" id="mon-status"></div>
+          <label><span>Dashboards URL <span class="muted">(Grafana, here or external; blank hides the button above)</span></span>
+            <input name="MONITORING_URL" type="url" placeholder="https://grafana.example.com/d/aio-overview" autocomplete="off"></label>
+        </section>
+
+        <section class="card">
+          <h2>Where data goes</h2>
+          <div class="radios">
+            <label><input type="radio" name="MON_STACK" value="1"> <span><strong>This host</strong> — run Prometheus, Loki and Grafana here</span></label>
+            <label><input type="radio" name="MON_STACK" value="0"> <span><strong>External</strong> — only Alloy runs here and ships to your Prometheus and Loki</span></label>
+          </div>
+          <div class="two" data-when-stack="0">
+            <label>Prometheus remote-write URL <input name="PROM_WRITE_URL" type="url" placeholder="https://prometheus.example.com/api/v1/write" autocomplete="off"></label>
+            <label>Loki base URL
+              <input name="LOKI_URL" type="url" placeholder="https://loki.example.com" autocomplete="off"></label>
+          </div>
+          <p class="hint" data-when-stack="0">Alloy pushes logs to <code>/loki/api/v1/push</code> and Claude Code events to <code>/otlp</code> under the Loki URL. Import the dashboards from <code>monitoring/grafana/dashboards/</code> into your Grafana, with datasource UIDs <code>prometheus</code> and <code>loki</code>. Switching to external removes the local containers; their data volumes are kept.</p>
+        </section>
+
+        <section class="card" data-when-stack="1">
+          <h2>Local Grafana</h2>
+          <p class="hint">Served over HTTPS with this UI's certificate. User <code>admin</code>, password <button class="linkish" type="button" id="mon-pw">show</button><code id="mon-pw-val" hidden></code>.</p>
+          <div class="three">
+            <label>Listen address <input name="GRAFANA_BIND" placeholder="10.0.0.5" autocomplete="off"></label>
+            <label>Port <input name="GRAFANA_PORT" inputmode="numeric" placeholder="3000" autocomplete="off"></label>
+            <label>Hostname <input name="GRAFANA_DOMAIN" placeholder="host.example.com" autocomplete="off"></label>
+          </div>
+          <h3>Retention</h3>
+          <div class="three">
+            <label>Metrics <input name="PROM_RETENTION" placeholder="30d" autocomplete="off"></label>
+            <label>Metrics size cap <input name="PROM_RETENTION_SIZE" placeholder="5GB" autocomplete="off"></label>
+            <label>Logs <input name="LOKI_RETENTION" placeholder="336h" autocomplete="off"></label>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Claude Code telemetry</h2>
+          <label class="check"><input type="checkbox" name="CLAUDE_TELEMETRY"> <span>Send each workspace's Claude Code usage (tokens, cost, tool use, errors) to Alloy</span></label>
+          <p class="hint">Prompt and response text stays redacted. Restart Claude in a workspace to apply.</p>
+        </section>
+
+        <div class="row sticky-save">
+          <button class="btn primary" type="submit">Save</button>
+          <button class="btn" type="button" id="mon-apply">Save &amp; apply</button>
+          <button class="btn ghost danger" type="button" id="mon-stop">Stop monitoring</button>
+          <p class="form-msg" id="mon-msg" role="status"></p>
+        </div>
+        <details class="mon-log" id="mon-log-wrap" hidden><summary>Output</summary><pre id="mon-log"></pre></details>
+      </form>
     </section>
   </main>
 </div>

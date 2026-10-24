@@ -4,10 +4,12 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const POOL_HASH = "#~keys";
+const SETTINGS_HASH = "#~settings";
+const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings" };
 const state = {
   workspaces: [],
-  view: location.hash === POOL_HASH ? "pool" : "ws",
-  selected: location.hash === POOL_HASH ? null : decodeURIComponent(location.hash.slice(1)) || null,
+  view: VIEW_OF_HASH[location.hash] || "ws",
+  selected: VIEW_OF_HASH[location.hash] ? null : decodeURIComponent(location.hash.slice(1)) || null,
   tab: "claude",
   filesPath: {},          // per-workspace current folder in the Files tab
   frameFor: {},           // tab -> workspace its sandbox iframe is showing
@@ -82,10 +84,13 @@ function setPill(el, label, value, tone) {
 
 function renderDetail() {
   const pool = state.view === "pool";
+  const settings = state.view === "settings";
   $("#pool").hidden = !pool;
   $("#pool-btn").setAttribute("aria-current", String(pool));
-  const w = pool ? null : current();
-  $("#empty").hidden = !!w || pool;
+  $("#settings").hidden = !settings;
+  $("#settings-btn").setAttribute("aria-current", String(settings));
+  const w = pool || settings ? null : current();
+  $("#empty").hidden = !!w || pool || settings;
   $("#detail").hidden = !w;
   if (!w) { disconnectTerm(); return; }
 
@@ -140,16 +145,17 @@ function select(name) {
   if (state.tab === "access") loadAccess();
 }
 
-function showPool() {
-  state.view = "pool";
-  history.replaceState(null, "", POOL_HASH);
+function showPage(view) {
+  state.view = view;
+  history.replaceState(null, "", view === "pool" ? POOL_HASH : SETTINGS_HASH);
   disconnectTerm();
   Object.keys(FRAMES).forEach(clearFrame);
   renderList();
   renderDetail();
-  loadPool();
+  (view === "pool" ? loadPool : loadSettings)();
 }
-$("#pool-btn").addEventListener("click", showPool);
+$("#pool-btn").addEventListener("click", () => showPage("pool"));
+$("#settings-btn").addEventListener("click", () => showPage("settings"));
 
 // ------------------------------------------------------------------ actions
 
@@ -697,15 +703,135 @@ $("#add-tokens").addEventListener("submit", (ev) => {
       format: f.format.value.trim(), env_var: f.env_var.value.trim() } : undefined });
 });
 
+// ------------------------------------------------------------------ settings (monitoring)
+
+const MON_SERVICES = { alloy: "Alloy", prometheus: "Prometheus", loki: "Loki", grafana: "Grafana" };
+
+function monMsg(text, isErr = false) {
+  $("#mon-msg").textContent = text;
+  $("#mon-msg").classList.toggle("err", isErr);
+}
+
+function showMonLog(log) {
+  $("#mon-log-wrap").hidden = !log;
+  $("#mon-log").textContent = log || "";
+}
+
+function syncStackFields() {
+  const stack = $("#mon-form").elements.MON_STACK.value;
+  $$("[data-when-stack]").forEach((n) => (n.hidden = n.dataset.whenStack !== stack));
+}
+
+function renderMonStatus(st) {
+  const box = $("#mon-status");
+  box.replaceChildren();
+  if (!st.configured) {
+    box.append(el("span", { className: "pill", textContent: "Not set up — Save & apply starts it" }));
+  } else {
+    const local = st.settings.MON_STACK !== "0";
+    const want = local ? Object.keys(MON_SERVICES) : ["alloy"];
+    for (const svc of want) {
+      const s = st.services.find((x) => x.name === svc);
+      const state_ = s ? s.state : "absent";
+      box.append(el("span", { className: `pill ${state_ === "running" ? "ok" : "bad"}`,
+        title: s ? s.detail : "not created", textContent: `${MON_SERVICES[svc]} ${state_}` }));
+    }
+    const age = st.exporterAge;
+    const fresh = age !== null && age < 90;
+    box.append(el("span", { className: `pill ${fresh ? "ok" : "bad"}`,
+      textContent: `exporter ${age === null ? "not running" : `updated ${age}s ago`}` }));
+    box.append(el("span", { className: `pill ${st.telemetry ? "ok" : ""}`, textContent: `telemetry ${st.telemetry ? "on" : "off"}` }));
+  }
+  const url = st.settings.MONITORING_URL;
+  const open = $("#mon-open");
+  open.hidden = !url;
+  if (url) open.href = url;
+}
+
+function fillMonForm(st) {
+  const f = $("#mon-form").elements;
+  for (const [k, v] of Object.entries(st.settings)) {
+    if (k === "CLAUDE_TELEMETRY") f[k].checked = v !== "0";
+    else if (k === "MON_STACK") f[k].value = v === "0" ? "0" : "1";
+    else if (f[k]) f[k].value = v;
+  }
+  syncStackFields();
+}
+
+async function loadSettings() {
+  try {
+    const st = await api("GET", "settings/monitoring");
+    renderMonStatus(st);
+    fillMonForm(st);
+  } catch (e) {
+    monMsg(e.message, true);
+  }
+}
+
+function monValues() {
+  const f = $("#mon-form").elements;
+  const out = {};
+  for (const n of ["MONITORING_URL", "PROM_WRITE_URL", "LOKI_URL", "GRAFANA_BIND", "GRAFANA_PORT",
+    "GRAFANA_DOMAIN", "PROM_RETENTION", "PROM_RETENTION_SIZE", "LOKI_RETENTION"]) out[n] = f[n].value.trim();
+  out.MON_STACK = f.MON_STACK.value;
+  out.CLAUDE_TELEMETRY = f.CLAUDE_TELEMETRY.checked ? "1" : "0";
+  return out;
+}
+
+async function monAction(kind) {
+  const buttons = $$("#mon-form .sticky-save .btn");
+  buttons.forEach((b) => (b.disabled = true));
+  showMonLog("");
+  try {
+    if (kind !== "stop") {
+      monMsg("Saving…");
+      renderMonStatus(await api("PUT", "settings/monitoring", monValues()));
+    }
+    if (kind === "save") {
+      monMsg("Saved. Apply to restart monitoring with these settings; telemetry changes apply when Claude restarts.");
+    } else {
+      monMsg(kind === "apply" ? "Applying… (pulling images can take a few minutes)" : "Stopping…");
+      const res = await api("POST", `settings/monitoring/${kind}`);
+      renderMonStatus(res);
+      showMonLog(res.log);
+      monMsg(kind === "apply" ? "Applied." : "Monitoring stopped. Data is kept.");
+    }
+  } catch (e) {
+    monMsg(e.message.split("\n").slice(-3).join(" "), true);
+    showMonLog(e.message);
+  }
+  buttons.forEach((b) => (b.disabled = false));
+  refresh();
+}
+
+$("#mon-form").addEventListener("submit", (ev) => { ev.preventDefault(); monAction("save"); });
+$("#mon-apply").addEventListener("click", () => monAction("apply"));
+$("#mon-stop").addEventListener("click", () => {
+  if (confirm("Stop monitoring? Collection stops; stored metrics and logs are kept.")) monAction("stop");
+});
+$("#mon-form").addEventListener("change", (ev) => { if (ev.target.name === "MON_STACK") syncStackFields(); });
+$("#mon-pw").addEventListener("click", async () => {
+  const out = $("#mon-pw-val");
+  try {
+    out.textContent = (await api("GET", "settings/monitoring/password")).password;
+    out.hidden = false;
+    $("#mon-pw").hidden = true;
+  } catch (e) {
+    monMsg(e.message, true);
+  }
+});
+
 // ------------------------------------------------------------------ boot
 
 window.addEventListener("hashchange", () => {
-  if (location.hash === POOL_HASH) return state.view !== "pool" && showPool();
+  const view = VIEW_OF_HASH[location.hash];
+  if (view) return state.view !== view && showPage(view);
   const name = decodeURIComponent(location.hash.slice(1));
   if (name && (name !== state.selected || state.view !== "ws")) select(name);
 });
 
 if (state.view === "pool") loadPool();
+if (state.view === "settings") loadSettings();
 refresh();
 setInterval(refresh, 4000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });

@@ -40,6 +40,7 @@ import ssl
 import struct
 import sys
 import termios
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -336,6 +337,9 @@ async def handle_ui(req: Request, reader, w):
 async def api(req: Request, w):
     parts = [p for p in req.path.split("/") if p][1:]   # drop "api"
     m = req.method
+
+    if parts and parts[0] == "settings":
+        return await settings_api(req, parts[1:], w)
 
     if parts == ["workspaces"] and m == "GET":
         return await send_json(w, await status_all())
@@ -849,7 +853,7 @@ async def sync_agent(name: str):
 def render_profile(ws: dict[str, str], pol: dict) -> dict:
     name = ws["WS_NAME"]
     st = STATE_ROOT / name
-    telemetry = MONITORING_ENV.exists()
+    telemetry = telemetry_enabled()
     net: dict = {"open_port": [int(ws["WS_PORT"])] + ([OTLP_PORT] if telemetry else [])}
     mode = pol["network"]["mode"]
     net["network_profile"] = None if mode == "open" else mode
@@ -973,6 +977,130 @@ async def pool_api(req: Request, parts: list[str], w):
         return await send_json(w, {"error": str(e)}, 400)
     except RuntimeError as e:
         return await send_json(w, {"error": str(e)}, 500)
+    await respond(w, 404, "Not found\n")
+
+
+# ---- settings: monitoring (monitoring/.env, shared with bin/monitoring and compose)
+
+def http_url(v: str) -> bool:
+    u = urllib.parse.urlsplit(v)
+    return u.scheme in ("http", "https") and bool(u.netloc) and not re.search(r"\s", v)
+
+
+def grafana_port(v: str) -> bool:
+    if not re.fullmatch(r"[1-9][0-9]{0,4}", v):
+        return False
+    n = int(v)
+    taken = (LISTEN_PORT, OTLP_PORT, *SANDBOX_PORTS, *(x + PROXY_PORT_OFFSET for x in SANDBOX_PORTS))
+    return 1024 <= n <= 65535 and n not in taken
+
+
+# key: (default, check, what's wrong when it fails)
+MON_FIELDS = {
+    "MONITORING_URL": ("", lambda v: v == "" or http_url(v), "Dashboards URL must be http(s)://…"),
+    "CLAUDE_TELEMETRY": ("1", lambda v: v in ("0", "1"), "Telemetry is on or off"),
+    "MON_STACK": ("1", lambda v: v in ("0", "1"), "Choose where data goes"),
+    "PROM_WRITE_URL": ("", lambda v: v == "" or http_url(v), "Prometheus URL must be http(s)://…"),
+    "LOKI_URL": ("", lambda v: v == "" or http_url(v), "Loki URL must be http(s)://…"),
+    "GRAFANA_BIND": ("127.0.0.1", lambda v: re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", v) is not None,
+                     "Grafana address must be an IPv4 address of this host"),
+    "GRAFANA_PORT": ("3000", grafana_port, "Grafana port must be 1024-65535 and not one the UI or sandboxes use"),
+    "GRAFANA_DOMAIN": ("localhost", lambda v: re.fullmatch(r"[A-Za-z0-9.-]{1,253}", v) is not None,
+                       "Grafana hostname: letters, digits, dots and dashes"),
+    "PROM_RETENTION": ("30d", lambda v: re.fullmatch(r"[1-9][0-9]{0,3}[hdwy]", v) is not None,
+                       "Metrics retention: e.g. 30d"),
+    "PROM_RETENTION_SIZE": ("5GB", lambda v: re.fullmatch(r"[1-9][0-9]{0,4}(MB|GB|TB)", v) is not None,
+                            "Metrics size cap: e.g. 5GB"),
+    "LOKI_RETENTION": ("336h", lambda v: re.fullmatch(r"[1-9][0-9]{0,5}h", v) is not None,
+                       "Log retention in hours: e.g. 336h"),
+}
+MON_TOOL = ROOT / "bin" / "monitoring"
+EXPORTER_PROM = ROOT / "monitoring" / "data" / "exporter" / "workspaces.prom"
+mon_lock = asyncio.Lock()
+
+
+def monitoring_settings() -> dict[str, str]:
+    env = read_env(MONITORING_ENV) if MONITORING_ENV.is_file() else {}
+    return {k: env.get(k, d).strip().strip("'\"") for k, (d, _, _) in MON_FIELDS.items()}
+
+
+def telemetry_enabled() -> bool:
+    return MONITORING_ENV.is_file() and monitoring_settings()["CLAUDE_TELEMETRY"] != "0"
+
+
+def update_env(path: Path, values: dict[str, str]):
+    """Set KEY=value lines in place, keeping comments: replace the active line,
+    else uncomment a '#KEY=' example (left alone when the value is blank), else append."""
+    lines = path.read_text().splitlines()
+    todo = dict(values)
+    for commented in (False, True):
+        for i, line in enumerate(lines):
+            body = line.lstrip("#").strip() if commented and line.startswith("#") else line
+            if (line.startswith("#") == commented) and "=" in body:
+                key = body.split("=", 1)[0].strip()
+                if key in todo and not (commented and todo[key] == ""):   # blank: keep the example
+                    lines[i] = f"{key}={todo.pop(key)}"
+    lines += [f"{k}={v}" for k, v in todo.items() if v != ""]     # absent already means blank
+    private_write(path, "\n".join(lines) + "\n")
+
+
+def validate_monitoring(body: dict) -> dict[str, str]:
+    cur = monitoring_settings()
+    out = {}
+    for k, (_, check, err) in MON_FIELDS.items():
+        v = str(body.get(k, cur[k])).strip()
+        if "\n" in v or not check(v):
+            raise ValueError(err)
+        out[k] = v
+    if out["MON_STACK"] == "0" and not (out["PROM_WRITE_URL"] and out["LOKI_URL"]):
+        raise ValueError("External monitoring needs both the Prometheus remote-write and Loki URLs")
+    return out
+
+
+async def monitoring_status() -> dict:
+    _, ps, _ = await run("docker", "ps", "-a", "--filter", "name=^mon-",
+                         "--format", "{{.Names}}\t{{.State}}\t{{.Status}}")
+    services = []
+    for line in ps.splitlines():
+        n, state, detail = (line.split("\t") + ["", ""])[:3]
+        services.append({"name": n.removeprefix("mon-"), "state": state, "detail": detail})
+    try:
+        age = int(time.time() - EXPORTER_PROM.stat().st_mtime)
+    except OSError:
+        age = None
+    return {"configured": MONITORING_ENV.is_file(), "services": services, "exporterAge": age,
+            "settings": monitoring_settings(), "telemetry": telemetry_enabled()}
+
+
+async def settings_api(req: Request, parts: list[str], w):
+    m = req.method
+    if parts == ["monitoring"] and m == "GET":
+        return await send_json(w, await monitoring_status())
+    if parts == ["monitoring"] and m == "PUT":
+        try:
+            values = validate_monitoring(json.loads(req.body or b"{}"))
+        except (ValueError, json.JSONDecodeError) as e:
+            return await send_json(w, {"error": str(e)}, 400)
+        async with mon_lock:
+            if not MONITORING_ENV.is_file():
+                rc, out, err = await run(str(MON_TOOL), "init", timeout=60)
+                if rc != 0:
+                    return await send_json(w, {"error": (err or out).strip()}, 500)
+            update_env(MONITORING_ENV, values)
+        return await send_json(w, await monitoring_status())
+    if parts in (["monitoring", "apply"], ["monitoring", "stop"]) and m == "POST":
+        if mon_lock.locked():
+            return await send_json(w, {"error": "Monitoring is already being changed"}, 409)
+        async with mon_lock:
+            rc, out, err = await run(str(MON_TOOL), "up" if parts[1] == "apply" else "down", timeout=900)
+        log = (out + err).strip()[-6000:]
+        return await send_json(w, {**await monitoring_status(), "ok": rc == 0, "log": log},
+                               200 if rc == 0 else 500)
+    if parts == ["monitoring", "password"] and m == "GET":
+        try:
+            return await send_json(w, {"password": (SECRETS / "grafana-admin-password").read_text().strip()})
+        except OSError:
+            return await send_json(w, {"error": "No local Grafana password yet: apply first"}, 404)
     await respond(w, 404, "Not found\n")
 
 
