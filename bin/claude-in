@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Start Claude Code for one workspace inside nono, allowed to reach only
-# that workspace's AIO Sandbox port.
+# Start Claude Code for one workspace inside nono, with that workspace's
+# policy: its own sandbox port only, its SSH agent, its tokens, its network
+# allowlist and resource limits (all set in the web UI).
 #
 #   claude-in <workspace> [claude args...]
 set -euo pipefail
 
-WS_ROOT="${AIO_WORKSPACES:-$HOME/agent-sandboxes/workspaces}"
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+WS_ROOT="${AIO_WORKSPACES:-$ROOT/workspaces}"
 name="${1:?usage: claude-in <workspace> [claude args...]}"; shift
 env_file="$WS_ROOT/$name.env"
 [[ -r "$env_file" ]] || { echo "No workspace '$name' ($env_file)." >&2; exit 1; }
@@ -16,5 +18,20 @@ if ! curl -fsS -o /dev/null --max-time 2 -H "X-AIO-API-Key: $WS_KEY" "http://127
   echo "AIO sandbox for '$name' isn't answering on :${WS_PORT} — start it from the web UI." >&2
 fi
 
+# Loads the agent's SSH keys and writes workspaces/<name>.profile.json;
+# sets WS_PROFILE, WS_MEMORY, WS_PIDS.
+eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name")"
+
+cmd=(nono run --profile "$WS_PROFILE" --allow-cwd)
+[[ -n "$WS_MEMORY" ]] && cmd+=(--memory "$WS_MEMORY")
+[[ "$WS_PIDS" != 0 ]] && cmd+=(--max-processes "$WS_PIDS")
+cmd+=(-- claude "$@")
+
 cd "$WS_DIR"
-exec nono run --profile claude-browser --allow-cwd --open-port "$WS_PORT" -- claude "$@"
+if [[ -n "$WS_MEMORY" || "$WS_PIDS" != 0 ]]; then
+  # nono's limits need a delegated cgroup: run it in a scope of the user's
+  # systemd instance (needs lingering, so it exists without a login).
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
+  exec systemd-run --user --scope --quiet --collect --unit "claude-$name-$$" -- "${cmd[@]}"
+fi
+exec "${cmd[@]}"

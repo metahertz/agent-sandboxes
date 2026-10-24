@@ -5,7 +5,9 @@ Manages the lifecycle of nono-sandboxed Claude Code workspaces, each
 paired with an AIO Sandbox container: create / start / stop / remove,
 a browser terminal onto the workspace's Claude session (tmux), a file
 browser with downloads from the container, and the container's VNC /
-web UI through an authenticating reverse proxy.
+web UI through an authenticating reverse proxy. Also a pool of SSH keys and
+API tokens assigned per workspace, and each workspace's nono policy
+(network allowlist, resource limits), rendered to a per-workspace profile.
 
 Stdlib only (this host has no pip). Listens on 127.0.0.1 and the host's
 primary IP (override with AIO_UI_BIND=addr[,addr...]).
@@ -31,9 +33,12 @@ import posixpath
 import pwd
 import re
 import secrets
+import shlex
+import shutil
 import socket
 import ssl
 import struct
+import sys
 import termios
 import urllib.parse
 from pathlib import Path
@@ -48,6 +53,12 @@ TOKEN_FILE = ROOT / "ui" / "token"
 TLS_DIR = ROOT / "ui" / "tls"
 CERT_TOOL = ROOT / "bin" / "sandbox-ui-cert"
 TMUX_CONF = ROOT / "ui" / "tmux.conf"
+SECRETS = ROOT / "secrets"              # key/token pool; never readable inside nono
+SSH_POOL = SECRETS / "ssh"
+TOKEN_POOL = SECRETS / "tokens"
+STATE_ROOT = ROOT / "state"             # per-workspace ssh_config / known_hosts (Claude-writable)
+LIBEXEC = ROOT / "libexec"              # helpers Claude may run (read-only)
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "agent-sandboxes"
 PROJECTS_BASE = Path(os.environ.get("AIO_PROJECTS", Path.home() / "projects"))
 LISTEN_PORT = int(os.environ.get("AIO_UI_PORT", "9000"))
 SANDBOX_PORTS = range(8101, 8200)
@@ -55,6 +66,11 @@ PROXY_PORT_OFFSET = 1000          # sandbox 8101 is served to browsers on 9101
 
 TMUX = ["tmux", "-L", "agent-sandboxes", "-f", str(TMUX_CONF)]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
+ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")          # pool key / token ids
+DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
+ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
+HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+MEM_RE = re.compile(r"^[1-9][0-9]{0,5}[MG]$")
 DIR_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
 UI_HOSTNAMES = {"localhost", "127.0.0.1"}   # extended at startup with bind IPs / hostname
 BIND: list[str] = []
@@ -324,6 +340,9 @@ async def api(req: Request, w):
     if parts == ["workspaces"] and m == "POST":
         return await create_ws(req, w)
 
+    if parts and parts[0] == "pool":
+        return await pool_api(req, parts[1:], w)
+
     if len(parts) < 2 or parts[0] != "workspaces":
         return await respond(w, 404, "Not found\n")
     ws = load_ws(parts[1])
@@ -337,6 +356,11 @@ async def api(req: Request, w):
         if rc != 0:
             return await send_json(w, {"error": err or out}, 500)
         (WS_ROOT / f"{name}.env").unlink()
+        kill_agent(name)
+        for p in (policy_path(name), profile_path(name)):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(STATE_ROOT / name, ignore_errors=True)
+        shutil.rmtree(RUNTIME / name, ignore_errors=True)
         close_sandbox_listener(name)
         await refresh_cert()
         return await send_json(w, {"ok": True, "kept": ws["WS_DIR"]})
@@ -357,6 +381,9 @@ async def api(req: Request, w):
     if action == ["claude", "stop"] and m == "POST":
         await run(*TMUX, "kill-session", "-t", f"cl-{name}")
         return await send_json(w, {"ok": True})
+
+    if action == ["policy"] and m in ("GET", "PUT"):
+        return await policy_api(ws, req, w)
 
     if action == ["sandbox-link"] and m == "GET":
         return await send_json(w, {"prefix": sandbox_prefix(name),
@@ -391,9 +418,13 @@ async def status_all() -> list[dict]:
     for ws in all_ws():
         n = ws.get("WS_NAME", "")
         state, detail = states.get(container(n), ("absent", ""))
+        pol = load_policy(n)
         out.append({"name": n, "dir": ws.get("WS_DIR"), "port": ws.get("WS_PORT"),
                     "container": state, "containerDetail": detail,
-                    "claude": claude.get(n, "stopped")})
+                    "claude": claude.get(n, "stopped"),
+                    "sshKeys": len(pol["ssh_keys"]), "tokens": len(pol["tokens"]),
+                    "network": pol["network"]["mode"],
+                    "policyPending": claude.get(n) == "running" and policy_pending(ws)})
     return out
 
 
@@ -476,6 +507,459 @@ async def claude_start(ws: dict[str, str], w):
     rc, out, err = await run(*TMUX, "new-session", "-d", "-s", session, "-x", "160", "-y", "45",
                              "-c", ws["WS_DIR"], str(CLAUDE_IN), name)
     return await send_json(w, {"ok": rc == 0, "error": err.strip()}, 200 if rc == 0 else 500)
+
+
+# --------------------------------------------------------------- policy, key & token pool
+
+NET_MODES = {
+    "minimal": "Claude's own APIs only",
+    "claude-code": "Claude APIs, package registries, GitHub, GitLab, docs (default)",
+    "enterprise": "As above, plus Google Cloud, Azure and AWS Bedrock",
+    "open": "Unfiltered internet (raw TCP still blocked when tokens or blocked domains are set)",
+}
+# Phantom-token routes: the sandbox sees a placeholder in env_var; nono's proxy
+# swaps in the real secret only on requests to the upstream. (No "anthropic":
+# ANTHROPIC_API_KEY would switch Claude Code itself off your subscription.)
+TOKEN_SERVICES = {
+    "github": {"label": "GitHub API", "upstream": "https://api.github.com",
+               "inject_header": "Authorization", "credential_format": "token {}", "env_var": "GITHUB_TOKEN"},
+    "gitlab": {"label": "GitLab API", "upstream": "https://gitlab.com/api",
+               "inject_header": "Authorization", "credential_format": "Bearer {}", "env_var": "GITLAB_TOKEN"},
+    "openai": {"label": "OpenAI API", "upstream": "https://api.openai.com/v1",
+               "inject_header": "Authorization", "credential_format": "Bearer {}", "env_var": "OPENAI_API_KEY"},
+    "gemini": {"label": "Gemini API", "upstream": "https://generativelanguage.googleapis.com",
+               "inject_header": "x-goog-api-key", "credential_format": "{}", "env_var": "GEMINI_API_KEY"},
+}
+DEFAULT_POLICY = {"ssh_keys": [], "tokens": [],
+                  "network": {"mode": "claude-code", "allow": [], "deny": []},
+                  "limits": {"memory": "", "pids": 0}}
+
+
+def private_write(path: Path, data: str | bytes):
+    """Create/replace a 0600 file atomically."""
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data.encode() if isinstance(data, str) else data)
+    os.chown(tmp, -1, USER_GID)
+    os.replace(tmp, path)
+
+
+def ensure_dirs():
+    for d in (WS_ROOT, SECRETS, SSH_POOL, TOKEN_POOL, STATE_ROOT, RUNTIME):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def policy_path(name: str) -> Path:
+    return WS_ROOT / f"{name}.policy.json"
+
+
+def profile_path(name: str) -> Path:
+    return WS_ROOT / f"{name}.profile.json"
+
+
+def agent_sock(name: str) -> Path:
+    return RUNTIME / name / "agent.sock"
+
+
+def load_policy(name: str) -> dict:
+    pol = json.loads(json.dumps(DEFAULT_POLICY))
+    try:
+        saved = json.loads(policy_path(name).read_text())
+    except (OSError, json.JSONDecodeError):
+        saved = {}
+    for k in ("ssh_keys", "tokens"):
+        pol[k] = [i for i in saved.get(k, []) if (SSH_POOL if k == "ssh_keys" else TOKEN_POOL).joinpath(
+            i if k == "ssh_keys" else f"{i}.json").is_file()]
+    pol["network"].update(saved.get("network", {}))
+    pol["limits"].update(saved.get("limits", {}))
+    return pol
+
+
+def save_policy(name: str, pol: dict):
+    private_write(policy_path(name), json.dumps(pol, indent=2, sort_keys=True) + "\n")
+
+
+def clean_list(v, pattern: re.Pattern, what: str, limit: int = 100) -> list[str]:
+    if not isinstance(v, list) or len(v) > limit:
+        raise ValueError(f"{what}: expected a list of at most {limit}")
+    out = []
+    for x in v:
+        x = str(x).strip().lower() if pattern is DOMAIN_RE else str(x).strip()
+        if not x:
+            continue
+        if not pattern.match(x):
+            raise ValueError(f"{what}: invalid entry {x!r}")
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def validate_policy(body: dict) -> dict:
+    pol = json.loads(json.dumps(DEFAULT_POLICY))
+    pol["ssh_keys"] = clean_list(body.get("ssh_keys", []), ITEM_RE, "SSH keys")
+    for k in pol["ssh_keys"]:
+        if not (SSH_POOL / k).is_file():
+            raise ValueError(f"No SSH key '{k}' in the pool")
+    pol["tokens"] = clean_list(body.get("tokens", []), ITEM_RE, "Tokens")
+    seen_env = {}
+    for t in pol["tokens"]:
+        meta = token_meta(t)
+        if not meta:
+            raise ValueError(f"No token '{t}' in the pool")
+        if meta["env_var"] in seen_env:
+            raise ValueError(f"Tokens '{seen_env[meta['env_var']]}' and '{t}' both set {meta['env_var']}")
+        seen_env[meta["env_var"]] = t
+    net = body.get("network", {}) or {}
+    if net.get("mode", "claude-code") not in NET_MODES:
+        raise ValueError("Unknown network mode")
+    pol["network"] = {"mode": net.get("mode", "claude-code"),
+                      "allow": clean_list(net.get("allow", []), DOMAIN_RE, "Allowed domains"),
+                      "deny": clean_list(net.get("deny", []), DOMAIN_RE, "Blocked domains")}
+    lim = body.get("limits", {}) or {}
+    mem = str(lim.get("memory", "") or "").strip().upper()
+    if mem and not MEM_RE.match(mem):
+        raise ValueError("Memory limit: a number with M or G, e.g. 4G")
+    try:
+        pids = int(lim.get("pids", 0) or 0)
+    except (TypeError, ValueError):
+        raise ValueError("Max processes: a whole number")
+    if not 0 <= pids <= 100000 or 0 < pids < 32:
+        raise ValueError("Max processes: 0 (no limit) or 32–100000")
+    pol["limits"] = {"memory": mem, "pids": pids}
+    return pol
+
+
+# ---- pool
+
+def token_meta(tid: str) -> dict | None:
+    if not ITEM_RE.match(tid):
+        return None
+    try:
+        return json.loads((TOKEN_POOL / f"{tid}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+async def ssh_key_info(kid: str) -> dict:
+    pub = (SSH_POOL / f"{kid}.pub").read_text().strip()
+    _, fp, _ = await run("ssh-keygen", "-l", "-f", str(SSH_POOL / f"{kid}.pub"))
+    parts = fp.split()
+    return {"id": kid, "public": pub, "fingerprint": parts[1] if len(parts) > 1 else "",
+            "type": parts[-1].strip("()") if parts else "", "comment": " ".join(pub.split()[2:])}
+
+
+async def pool_listing() -> dict:
+    policies = {ws["WS_NAME"]: load_policy(ws["WS_NAME"]) for ws in all_ws()}
+    keys = []
+    for p in sorted(SSH_POOL.glob("*.pub")):
+        kid = p.name.removesuffix(".pub")
+        if ITEM_RE.match(kid) and (SSH_POOL / kid).is_file():
+            info = await ssh_key_info(kid)
+            info["workspaces"] = [n for n, pol in policies.items() if kid in pol["ssh_keys"]]
+            keys.append(info)
+    tokens = []
+    for p in sorted(TOKEN_POOL.glob("*.json")):
+        tid = p.name.removesuffix(".json")
+        if (meta := token_meta(tid)) and (TOKEN_POOL / tid).is_file():
+            tokens.append({"id": tid, **{k: meta[k] for k in ("service", "upstream", "env_var", "label")},
+                           "workspaces": [n for n, pol in policies.items() if tid in pol["tokens"]]})
+    return {"ssh": keys, "tokens": tokens, "workspaces": sorted(policies),
+            "services": {k: {"label": v["label"], "env_var": v["env_var"], "upstream": v["upstream"]}
+                         for k, v in TOKEN_SERVICES.items()},
+            "netModes": NET_MODES}
+
+
+async def add_ssh_key(body: dict) -> dict:
+    kid = str(body.get("id", "")).strip()
+    if not ITEM_RE.match(kid):
+        raise ValueError("Key name: lowercase letters, digits and dashes, max 40")
+    if (SSH_POOL / kid).exists():
+        raise ValueError(f"Key '{kid}' already exists")
+    comment = str(body.get("comment") or f"agent-sandboxes:{kid}@{socket.gethostname()}").strip()
+    if not re.fullmatch(r"[\w.@:+=-][\w .@:+=-]{0,99}", comment):
+        raise ValueError("Comment: letters, digits, spaces and . @ : + = - only")
+    tmp = SSH_POOL / f".new-{kid}-{secrets.token_hex(4)}"
+    try:
+        if body.get("generate"):
+            rc, _, err = await run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", str(tmp))
+            if rc != 0:
+                raise ValueError(f"ssh-keygen failed: {err.strip()}")
+        else:
+            pem = str(body.get("private_key", "")).replace("\r\n", "\n").strip() + "\n"
+            if "PRIVATE KEY-----" not in pem or len(pem) > 20000:
+                raise ValueError("Paste an OpenSSH/PEM private key")
+            private_write(tmp, pem)
+            rc, pub, err = await run("ssh-keygen", "-y", "-P", "", "-f", str(tmp))
+            if rc != 0:
+                if "passphrase" in err.lower() or "incorrect" in err.lower():
+                    raise ValueError("That key is passphrase-protected. Remove it first "
+                                     "(ssh-keygen -p -N '' -f <key>) or generate a key here.")
+                raise ValueError(f"Not a usable private key: {err.strip()}")
+            # Keep the key's own comment if it has one, else use ours.
+            fields = pub.split()
+            Path(f"{tmp}.pub").write_text(" ".join(fields[:2] + [comment]) + "\n")
+        os.chmod(tmp, 0o600)
+        for p in (tmp, Path(f"{tmp}.pub")):
+            os.chown(p, -1, USER_GID)
+        os.replace(f"{tmp}.pub", SSH_POOL / f"{kid}.pub")
+        os.replace(tmp, SSH_POOL / kid)
+    finally:
+        for p in (tmp, Path(f"{tmp}.pub")):
+            p.unlink(missing_ok=True)
+    return await ssh_key_info(kid)
+
+
+def add_token(body: dict) -> dict:
+    tid = str(body.get("id", "")).strip()
+    if not ITEM_RE.match(tid):
+        raise ValueError("Token name: lowercase letters, digits and dashes, max 40")
+    if (TOKEN_POOL / f"{tid}.json").exists():
+        raise ValueError(f"Token '{tid}' already exists")
+    secret = str(body.get("secret", "")).strip()
+    if not secret or len(secret) > 8192 or any(c in secret for c in "\r\n\0"):
+        raise ValueError("Paste the token (single line)")
+    service = str(body.get("service", ""))
+    if service in TOKEN_SERVICES:
+        meta = {"service": service, **TOKEN_SERVICES[service]}
+    elif service == "custom":
+        c = body.get("custom", {}) or {}
+        up = urllib.parse.urlsplit(str(c.get("upstream", "")).strip())
+        if up.scheme != "https" or not up.hostname or not DOMAIN_RE.match(up.hostname) \
+                or up.query or up.fragment or up.username:
+            raise ValueError("Upstream: an https:// URL (host and optional path)")
+        header = str(c.get("header") or "Authorization").strip()
+        fmt = str(c.get("format") or "Bearer {}").strip()
+        env = str(c.get("env_var", "")).strip().upper()
+        if not HEADER_RE.match(header):
+            raise ValueError("Header: letters, digits and dashes")
+        if fmt.count("{}") != 1 or len(fmt) > 100 or any(ch in fmt for ch in "\r\n"):
+            raise ValueError("Format must contain {} exactly once, e.g. 'Bearer {}'")
+        if not ENV_RE.match(env) or env in ("PATH", "HOME", "SSH_AUTH_SOCK") or env.startswith("NONO_"):
+            raise ValueError("Environment variable: e.g. ACME_API_KEY")
+        meta = {"service": "custom", "label": up.hostname,
+                "upstream": urllib.parse.urlunsplit(("https", up.netloc, up.path.rstrip("/"), "", "")),
+                "inject_header": header, "credential_format": fmt, "env_var": env}
+    else:
+        raise ValueError("Unknown service")
+    private_write(TOKEN_POOL / tid, secret)
+    private_write(TOKEN_POOL / f"{tid}.json", json.dumps(meta, indent=2) + "\n")
+    return {"id": tid, **meta}
+
+
+async def remove_pool_item(kind: str, iid: str):
+    key = "ssh_keys" if kind == "ssh" else "tokens"
+    for ws in all_ws():
+        pol = load_policy(ws["WS_NAME"])
+        if iid in pol[key]:
+            pol[key].remove(iid)
+            save_policy(ws["WS_NAME"], pol)
+    if kind == "ssh":
+        # Pull it out of every agent (by public key) before deleting the files.
+        for ws in all_ws():
+            await sync_agent(ws["WS_NAME"])
+        for p in (SSH_POOL / iid, SSH_POOL / f"{iid}.pub"):
+            p.unlink(missing_ok=True)
+    else:
+        for p in (TOKEN_POOL / iid, TOKEN_POOL / f"{iid}.json"):
+            p.unlink(missing_ok=True)
+
+
+async def assign(kind: str, iid: str, workspaces: list[str]):
+    key = "ssh_keys" if kind == "ssh" else "tokens"
+    wanted = set(clean_list(workspaces, NAME_RE, "Workspaces"))
+    known = {ws["WS_NAME"] for ws in all_ws()}
+    if wanted - known:
+        raise ValueError(f"No such workspace: {', '.join(sorted(wanted - known))}")
+    for name in sorted(known):
+        pol = load_policy(name)
+        has = iid in pol[key]
+        if (name in wanted) != has:
+            pol[key] = [i for i in pol[key] if i != iid] + ([iid] if name in wanted else [])
+            save_policy(name, validate_policy(pol))      # re-checks env-var clashes
+            if kind == "ssh":
+                await sync_agent(name)
+
+
+# ---- per-workspace ssh-agent: Claude gets the socket, never the key files
+
+async def ssh_add(name: str, *args: str) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "ssh-add", *args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env={**os.environ, "SSH_AUTH_SOCK": str(agent_sock(name))})
+    out, err = await asyncio.wait_for(proc.communicate(), 20)
+    return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+def kill_agent(name: str):
+    pidfile = RUNTIME / name / "agent.pid"
+    try:
+        pid = int(pidfile.read_text())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if b"ssh-agent" in cmdline and str(agent_sock(name)).encode() in cmdline:
+            os.kill(pid, 15)
+    except (OSError, ValueError):
+        pass
+    pidfile.unlink(missing_ok=True)
+    agent_sock(name).unlink(missing_ok=True)
+
+
+async def start_agent(name: str):
+    kill_agent(name)
+    (RUNTIME / name).mkdir(mode=0o700, parents=True, exist_ok=True)
+    rc, out, err = await run("ssh-agent", "-s", "-a", str(agent_sock(name)))
+    if rc != 0 or not (m := re.search(r"SSH_AGENT_PID=(\d+)", out)):
+        raise RuntimeError(f"ssh-agent failed: {err.strip()}")
+    (RUNTIME / name / "agent.pid").write_text(m[1])
+
+
+async def sync_agent(name: str):
+    """Make the workspace agent hold exactly its assigned keys. Takes
+    effect immediately, including for a Claude that's already running."""
+    want = {}
+    for kid in load_policy(name)["ssh_keys"]:
+        pub = (SSH_POOL / f"{kid}.pub").read_text().split()
+        want[pub[1]] = kid
+    for attempt in range(2):
+        rc, listed, _ = await ssh_add(name, "-L")
+        if rc == 2 or attempt == 1:          # no agent, or it misbehaved (e.g. locked by the agent)
+            await start_agent(name)
+            listed = ""
+        have = {l.split()[1]: l for l in listed.splitlines() if len(l.split()) >= 2}
+        for blob, line in have.items():
+            if blob not in want:
+                tmp = RUNTIME / name / "remove.pub"
+                tmp.write_text(line + "\n")
+                await ssh_add(name, "-d", str(tmp))
+                tmp.unlink(missing_ok=True)
+        for blob, kid in want.items():
+            if blob not in have:
+                await ssh_add(name, "-q", str(SSH_POOL / kid))
+        rc, listed, _ = await ssh_add(name, "-L")
+        now = {l.split()[1] for l in listed.splitlines() if len(l.split()) >= 2} if rc == 0 else set()
+        if now == set(want):
+            return
+    raise RuntimeError(f"could not load SSH keys into {name}'s agent")
+
+
+# ---- nono profile per workspace
+
+def render_profile(ws: dict[str, str], pol: dict) -> dict:
+    name = ws["WS_NAME"]
+    st = STATE_ROOT / name
+    net: dict = {"open_port": [int(ws["WS_PORT"])]}
+    mode = pol["network"]["mode"]
+    net["network_profile"] = None if mode == "open" else mode
+    if pol["network"]["allow"]:
+        net["allow_domain"] = pol["network"]["allow"]
+    if pol["network"]["deny"]:
+        net["deny_domain"] = pol["network"]["deny"]
+    creds = {}
+    for tid in pol["tokens"]:
+        meta = token_meta(tid)
+        creds["pool_" + tid.replace("-", "_")] = {
+            "upstream": meta["upstream"], "credential_key": f"file://{TOKEN_POOL / tid}",
+            "inject_header": meta["inject_header"], "credential_format": meta["credential_format"],
+            "env_var": meta["env_var"]}
+    if creds:
+        net["credentials"] = sorted(creds)
+        net["custom_credentials"] = creds
+    return {
+        "meta": {"name": f"ws-{name}", "version": "1.0.0",
+                 "description": f"Generated by agent-sandboxes for workspace {name}; edit in the web UI"},
+        "extends": "claude-browser",
+        # Default-deny pathname Unix sockets: no Docker socket, no tmux server
+        # (other workspaces' sessions), no D-Bus / systemd --user.
+        "linux": {"af_unix_mediation": "pathname"},
+        "filesystem": {"unix_socket": [str(agent_sock(name))],
+                       "read": [str(LIBEXEC)], "allow": [str(st)]},
+        "network": net,
+        "environment": {"set_vars": {"SSH_AUTH_SOCK": str(agent_sock(name)),
+                                     "GIT_SSH_COMMAND": f"ssh -F {st / 'ssh_config'}"}},
+    }
+
+
+def profile_text(ws: dict[str, str]) -> str:
+    return json.dumps(render_profile(ws, load_policy(ws["WS_NAME"])), indent=2, sort_keys=True) + "\n"
+
+
+def write_ssh_config(name: str):
+    st = STATE_ROOT / name
+    st.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (st / "known_hosts").touch(mode=0o600)
+    (st / "ssh_config").write_text(
+        "# Generated by agent-sandboxes. Used via GIT_SSH_COMMAND inside nono.\n"
+        "Host *\n"
+        f"  IdentityAgent {agent_sock(name)}\n"
+        f"  UserKnownHostsFile {st / 'known_hosts'}\n"
+        "  StrictHostKeyChecking accept-new\n"
+        f"  ProxyCommand {LIBEXEC / 'ssh-proxy-connect'} %h %p\n"
+        "  ServerAliveInterval 30\n")
+
+
+async def prepare(name: str) -> dict:
+    """Everything Claude needs before nono starts: agent with its keys,
+    ssh config, and the rendered profile (what's now 'applied')."""
+    ensure_dirs()
+    ws = load_ws(name)
+    if not ws:
+        raise SystemExit(f"No workspace '{name}'")
+    await sync_agent(name)
+    write_ssh_config(name)
+    private_write(profile_path(name), profile_text(ws))
+    return {"profile": str(profile_path(name)), **load_policy(name)["limits"]}
+
+
+def policy_pending(ws: dict[str, str]) -> bool:
+    """True if the saved policy differs from what the running Claude got."""
+    try:
+        return profile_path(ws["WS_NAME"]).read_text() != profile_text(ws)
+    except OSError:
+        return True     # started before per-workspace profiles existed
+
+
+async def policy_api(ws: dict[str, str], req: Request, w):
+    name = ws["WS_NAME"]
+    if req.method == "PUT":
+        try:
+            pol = validate_policy(json.loads(req.body or b"{}"))
+        except (ValueError, json.JSONDecodeError) as e:
+            return await send_json(w, {"error": str(e)}, 400)
+        old = load_policy(name)
+        save_policy(name, pol)
+        if old["ssh_keys"] != pol["ssh_keys"]:
+            await sync_agent(name)
+    rc, out, _ = await run(*TMUX, "list-panes", "-t", f"cl-{name}", "-F", "#{pane_dead}")
+    running = rc == 0 and "0" in out.split()
+    return await send_json(w, {"policy": load_policy(name), "pending": running and policy_pending(ws)})
+
+
+async def pool_api(req: Request, parts: list[str], w):
+    m = req.method
+    try:
+        body = json.loads(req.body or b"{}") if req.body else {}
+        if parts == [] and m == "GET":
+            return await send_json(w, await pool_listing())
+        if parts == ["ssh"] and m == "POST":
+            return await send_json(w, await add_ssh_key(body), 201)
+        if parts == ["tokens"] and m == "POST":
+            return await send_json(w, add_token(body), 201)
+        if len(parts) >= 2 and parts[0] in ("ssh", "tokens") and ITEM_RE.match(parts[1]):
+            kind, iid = ("ssh" if parts[0] == "ssh" else "token"), parts[1]
+            exists = (SSH_POOL / iid).is_file() if kind == "ssh" else token_meta(iid) is not None
+            if not exists:
+                return await send_json(w, {"error": "Not found"}, 404)
+            if parts[2:] == [] and m == "DELETE":
+                await remove_pool_item(kind, iid)
+                return await send_json(w, {"ok": True})
+            if parts[2:] == ["workspaces"] and m == "PUT":
+                await assign(kind, iid, body.get("workspaces", []))
+                return await send_json(w, {"ok": True})
+    except (ValueError, json.JSONDecodeError) as e:
+        return await send_json(w, {"error": str(e)}, 400)
+    except RuntimeError as e:
+        return await send_json(w, {"error": str(e)}, 500)
+    await respond(w, 404, "Not found\n")
 
 
 def clean_container_path(p: str) -> str | None:
@@ -847,7 +1331,7 @@ def make_tls_context() -> ssl.SSLContext:
 async def main():
     global TOKEN, BIND, TLS_CTX, SCHEME, WS_SCHEME
     TOKEN = TOKEN_FILE.read_text().strip()
-    WS_ROOT.mkdir(mode=0o700, exist_ok=True)
+    ensure_dirs()
     BIND = await resolve_bind()
     UI_HOSTNAMES.update(BIND)
     UI_HOSTNAMES.update(h.lower() for h in {socket.gethostname(), socket.getfqdn()} if h)
@@ -875,7 +1359,18 @@ async def main():
     await asyncio.gather(renew_daily(), *(s.serve_forever() for s in servers))
 
 
+def cli_prepare(name: str):
+    """bin/claude-in calls this (outside nono) and evals the output."""
+    info = asyncio.run(prepare(name))
+    print(f"WS_PROFILE={shlex.quote(info['profile'])}")
+    print(f"WS_MEMORY={shlex.quote(info['memory'])}")
+    print(f"WS_PIDS={int(info['pids'])}")
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["prepare"] and len(sys.argv) == 3:
+        cli_prepare(sys.argv[2])
+        sys.exit(0)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

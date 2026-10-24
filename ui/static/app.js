@@ -3,9 +3,11 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+const POOL_HASH = "#~keys";
 const state = {
   workspaces: [],
-  selected: decodeURIComponent(location.hash.slice(1)) || null,
+  view: location.hash === POOL_HASH ? "pool" : "ws",
+  selected: location.hash === POOL_HASH ? null : decodeURIComponent(location.hash.slice(1)) || null,
   tab: "claude",
   filesPath: {},          // per-workspace current folder in the Files tab
   frameFor: {},           // tab -> workspace its sandbox iframe is showing
@@ -59,7 +61,7 @@ function renderList() {
     const b = document.createElement("button");
     b.className = "ws-item";
     b.type = "button";
-    b.setAttribute("aria-current", String(w.name === state.selected));
+    b.setAttribute("aria-current", String(state.view === "ws" && w.name === state.selected));
     b.innerHTML = `<span class="n"></span><span class="dots"><span class="dot" title="container"></span><span class="dot" title="Claude"></span></span><span class="sub"></span>`;
     $(".n", b).textContent = w.name;
     $(".sub", b).textContent = w.dir.replace(/^\/home\/[^/]+/, "~");
@@ -79,8 +81,11 @@ function setPill(el, label, value, tone) {
 }
 
 function renderDetail() {
-  const w = current();
-  $("#empty").hidden = !!w;
+  const pool = state.view === "pool";
+  $("#pool").hidden = !pool;
+  $("#pool-btn").setAttribute("aria-current", String(pool));
+  const w = pool ? null : current();
+  $("#empty").hidden = !!w || pool;
   $("#detail").hidden = !w;
   if (!w) { disconnectTerm(); return; }
 
@@ -90,6 +95,7 @@ function renderDetail() {
   $("#d-port").textContent = w.port;
   setPill($("#d-container"), "container", w.container, CONTAINER_TONE[w.container]);
   setPill($("#d-claude"), "Claude", w.claude, CLAUDE_TONE[w.claude]);
+  $("#d-pending").hidden = !w.policyPending;
 
   const up = w.container === "running";
   for (const b of $$('[data-act="container/start"]')) b.disabled = up;
@@ -118,7 +124,8 @@ function renderDetail() {
 }
 
 function select(name) {
-  if (state.selected !== name) {
+  if (state.selected !== name || state.view !== "ws") {
+    state.view = "ws";
     state.selected = name;
     history.replaceState(null, "", `#${encodeURIComponent(name)}`);
     hideConfirm();
@@ -130,7 +137,19 @@ function select(name) {
   renderDetail();
   if (state.tab === "files") loadFiles();
   if (state.tab === "logs") loadLogs();
+  if (state.tab === "access") loadAccess();
 }
+
+function showPool() {
+  state.view = "pool";
+  history.replaceState(null, "", POOL_HASH);
+  disconnectTerm();
+  Object.keys(FRAMES).forEach(clearFrame);
+  renderList();
+  renderDetail();
+  loadPool();
+}
+$("#pool-btn").addEventListener("click", showPool);
 
 // ------------------------------------------------------------------ actions
 
@@ -238,6 +257,7 @@ function selectTab(tab) {
   if (FRAMES[tab] && w.container === "running" && state.frameFor[tab] !== w.name) loadFrame(tab, w);
   if (tab === "files") loadFiles();
   if (tab === "logs") loadLogs();
+  if (tab === "access") loadAccess();
 }
 $$(".tabs [role=tab]").forEach((b) => b.addEventListener("click", () => selectTab(b.dataset.tab)));
 
@@ -476,13 +496,216 @@ async function loadLogs() {
 }
 $("#logs-refresh").addEventListener("click", loadLogs);
 
+// ------------------------------------------------------------------ access (per-workspace policy)
+
+function el(tag, props = {}, ...kids) {
+  const n = Object.assign(document.createElement(tag), props);
+  n.append(...kids);
+  return n;
+}
+
+function checkItem(name, value, checked, title, sub) {
+  const input = el("input", { type: "checkbox", name, value, checked });
+  return el("label", { className: "check" }, input,
+    el("span", {}, el("strong", { textContent: title }), " ", el("span", { className: "muted", textContent: sub })));
+}
+
+const lines = (text) => text.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+
+async function loadAccess() {
+  const w = current();
+  if (!w) return;
+  const form = $("#access-form");
+  $("#acc-msg").textContent = "";
+  $("#acc-msg").classList.remove("err");
+  $("#acc-port").textContent = `(127.0.0.1:${w.port})`;
+  try {
+    const [{ policy }, pool] = await Promise.all([api("GET", wsPath(w.name, "/policy")), api("GET", "pool")]);
+    if (current()?.name !== w.name) return;
+    const ssh = $("#acc-ssh");
+    ssh.replaceChildren(...pool.ssh.map((k) =>
+      checkItem("ssh", k.id, policy.ssh_keys.includes(k.id), k.id, `${k.type} ${k.fingerprint}`)));
+    if (!pool.ssh.length) ssh.append(el("p", { className: "muted", textContent: "No SSH keys in the pool yet — add one under Keys & tokens." }));
+    const tok = $("#acc-tokens");
+    tok.replaceChildren(...pool.tokens.map((t) =>
+      checkItem("token", t.id, policy.tokens.includes(t.id), t.id, `${t.label} → $${t.env_var}`)));
+    if (!pool.tokens.length) tok.append(el("p", { className: "muted", textContent: "No API tokens in the pool yet — add one under Keys & tokens." }));
+    $("#acc-net").replaceChildren(...Object.entries(pool.netModes).map(([mode, desc]) =>
+      el("label", { className: "check" }, el("input", { type: "radio", name: "mode", value: mode, checked: policy.network.mode === mode }),
+        el("span", {}, el("strong", { textContent: mode }), " ", el("span", { className: "muted", textContent: desc })))));
+    form.elements.allow.value = policy.network.allow.join("\n");
+    form.elements.deny.value = policy.network.deny.join("\n");
+    form.elements.memory.value = policy.limits.memory;
+    form.elements.pids.value = policy.limits.pids || "";
+    $("#acc-restart").hidden = w.claude === "stopped";
+  } catch (e) {
+    $("#acc-msg").textContent = e.message;
+    $("#acc-msg").classList.add("err");
+  }
+}
+
+async function saveAccess(restart) {
+  const w = current();
+  const form = $("#access-form");
+  const out = $("#acc-msg");
+  out.classList.remove("err");
+  const body = {
+    ssh_keys: $$('input[name="ssh"]:checked', form).map((i) => i.value),
+    tokens: $$('input[name="token"]:checked', form).map((i) => i.value),
+    network: { mode: form.elements.mode?.value || "claude-code", allow: lines(form.elements.allow.value), deny: lines(form.elements.deny.value) },
+    limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0) },
+  };
+  out.textContent = "Saving…";
+  try {
+    const res = await api("PUT", wsPath(w.name, "/policy"), body);
+    if (restart) {
+      out.textContent = "Saved. Restarting Claude…";
+      await api("POST", wsPath(w.name, "/claude/restart"));
+      disconnectTerm();
+      out.textContent = "Saved and Claude restarted with the new policy.";
+    } else {
+      out.textContent = res.pending
+        ? "Saved. SSH key changes are live; restart Claude for the rest."
+        : w.claude === "stopped" ? "Saved. Applies when Claude starts." : "Saved and applied.";
+    }
+  } catch (e) {
+    out.textContent = e.message;
+    out.classList.add("err");
+  }
+  await refresh();
+}
+$("#access-form").addEventListener("submit", (ev) => { ev.preventDefault(); saveAccess(false); });
+$("#acc-restart").addEventListener("click", () => saveAccess(true));
+
+// ------------------------------------------------------------------ keys & tokens pool
+
+let poolData = null;
+
+function poolMsg(text, isErr = false) {
+  $("#pool-msg").textContent = text;
+  $("#pool-msg").classList.toggle("err", isErr);
+}
+
+function renderMatrix(table, kind, items, describe) {
+  const wss = poolData.workspaces;
+  const head = el("tr", {}, el("th", { textContent: kind === "ssh" ? "Key" : "Token" }),
+    ...wss.map((n) => el("th", { className: "ws-col", textContent: n, title: n })), el("th"));
+  const rows = items.map((it) => {
+    const tds = wss.map((n) => {
+      const cb = el("input", { type: "checkbox", checked: it.workspaces.includes(n), title: `${it.id} → ${n}` });
+      cb.addEventListener("change", async () => {
+        const want = wss.filter((x, i) => $$("input[type=checkbox]", cb.closest("tr"))[i].checked);
+        cb.disabled = true;
+        try {
+          await api("PUT", `pool/${kind}/${encodeURIComponent(it.id)}/workspaces`, { workspaces: want });
+          poolMsg(kind === "ssh" ? `${it.id}: applied to running sessions.` : `${it.id}: restart Claude in ${n} to apply.`);
+        } catch (e) {
+          cb.checked = !cb.checked;
+          poolMsg(e.message, true);
+        }
+        cb.disabled = false;
+        refresh();
+      });
+      return el("td", { className: "ws-col" }, cb);
+    });
+    const actions = el("td", { className: "acts" });
+    if (kind === "ssh") {
+      const copy = el("button", { className: "btn ghost", type: "button", textContent: "Copy public key" });
+      copy.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(it.public); poolMsg(`Copied ${it.id}.pub — add it as a deploy key or to your account.`); }
+        catch { window.prompt("Public key:", it.public); }
+      });
+      actions.append(copy);
+    }
+    const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Delete" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Delete ${it.id}? It is removed from ${it.workspaces.length || "no"} workspace(s) and from disk.`)) return;
+      try { await api("DELETE", `pool/${kind}/${encodeURIComponent(it.id)}`); poolMsg(`Deleted ${it.id}.`); }
+      catch (e) { poolMsg(e.message, true); }
+      loadPool();
+      refresh();
+    });
+    actions.append(del);
+    return el("tr", {}, el("td", { className: "item" }, el("strong", { textContent: it.id }), el("div", { className: "muted", textContent: describe(it) })), ...tds, actions);
+  });
+  if (!items.length) rows.push(el("tr", {}, el("td", { className: "muted note", colSpan: wss.length + 2, textContent: "None yet." })));
+  table.replaceChildren(el("thead", {}, head), el("tbody", {}, ...rows));
+}
+
+async function loadPool() {
+  try {
+    poolData = await api("GET", "pool");
+  } catch (e) {
+    return poolMsg(e.message, true);
+  }
+  renderMatrix($("#m-ssh"), "ssh", poolData.ssh, (k) => `${k.type} ${k.fingerprint} · ${k.comment}`);
+  renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => `${t.label} (${t.upstream}) → $${t.env_var}`);
+  const sel = $("#tok-service");
+  if (!sel.options.length) {
+    for (const [k, v] of Object.entries(poolData.services)) sel.append(el("option", { value: k, textContent: `${v.label} → $${v.env_var}` }));
+    sel.append(el("option", { value: "custom", textContent: "Custom HTTPS API…" }));
+  }
+}
+
+$$("[data-add]").forEach((b) => b.addEventListener("click", () => {
+  const f = $(`#add-${b.dataset.add}`);
+  f.hidden = false;
+  f.elements.id.focus();
+}));
+$$(".add-form [data-cancel]").forEach((b) => b.addEventListener("click", () => {
+  const f = b.closest("form");
+  f.reset();
+  f.hidden = true;
+  $(".form-msg", f).textContent = "";
+}));
+$("#add-ssh").addEventListener("change", (ev) => {
+  if (ev.target.name === "how") ev.currentTarget.elements.private_key.hidden = ev.target.value !== "import";
+});
+$("#tok-service").addEventListener("change", (ev) => ($("#tok-custom").hidden = ev.target.value !== "custom"));
+
+async function submitAdd(form, path, body) {
+  const out = $(".form-msg", form);
+  out.classList.remove("err");
+  out.textContent = "Adding…";
+  try {
+    const res = await api("POST", path, body);
+    form.reset();
+    form.hidden = true;
+    out.textContent = "";
+    $("#tok-custom").hidden = true;
+    form.elements.private_key && (form.elements.private_key.hidden = true);
+    poolMsg(res.public ? `Added ${res.id}. Public key: ${res.public}` : `Added ${res.id}.`);
+    loadPool();
+  } catch (e) {
+    out.textContent = e.message;
+    out.classList.add("err");
+  }
+}
+$("#add-ssh").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const f = ev.currentTarget.elements;
+  const generate = f.how.value === "generate";
+  submitAdd(ev.currentTarget, "pool/ssh", { id: f.id.value.trim(), comment: f.comment.value.trim() || undefined,
+    generate, private_key: generate ? undefined : f.private_key.value });
+});
+$("#add-tokens").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const f = ev.currentTarget.elements;
+  const service = f.service.value;
+  submitAdd(ev.currentTarget, "pool/tokens", { id: f.id.value.trim(), service, secret: f.secret.value,
+    custom: service === "custom" ? { upstream: f.upstream.value.trim(), header: f.header.value.trim(),
+      format: f.format.value.trim(), env_var: f.env_var.value.trim() } : undefined });
+});
+
 // ------------------------------------------------------------------ boot
 
 window.addEventListener("hashchange", () => {
+  if (location.hash === POOL_HASH) return state.view !== "pool" && showPool();
   const name = decodeURIComponent(location.hash.slice(1));
-  if (name && name !== state.selected) select(name);
+  if (name && (name !== state.selected || state.view !== "ws")) select(name);
 });
 
+if (state.view === "pool") loadPool();
 refresh();
 setInterval(refresh, 4000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });

@@ -1,0 +1,52 @@
+#!/usr/bin/python3 -I
+# ssh ProxyCommand for use inside nono: tunnel host:port through nono's
+# filtering proxy (HTTPS_PROXY, with its session credential) via CONNECT,
+# so SSH is subject to the same domain allowlist as everything else.
+# Without a proxy (unfiltered workspaces) it connects directly.
+# Usage: ProxyCommand ssh-proxy-connect %h %p
+import base64, os, select, socket, sys
+from urllib.parse import urlsplit
+
+host, port = sys.argv[1], int(sys.argv[2])
+proxy = urlsplit(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "")
+out, inp = sys.stdout.buffer.raw, sys.stdin.buffer.raw
+
+if not proxy.hostname:
+    s = socket.create_connection((host, port), timeout=15)
+    rest = b""
+else:
+    s = socket.create_connection((proxy.hostname, proxy.port or 80), timeout=15)
+    req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+    if proxy.username:
+        cred = f"{proxy.username}:{proxy.password or ''}".encode()
+        req += "Proxy-Authorization: Basic " + base64.b64encode(cred).decode() + "\r\n"
+    s.sendall((req + "\r\n").encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(4096)
+        if not chunk:
+            sys.exit("ssh-proxy-connect: proxy closed the connection")
+        head += chunk
+    status = head.split(b"\r\n", 1)[0].decode(errors="replace")
+    if " 200" not in status:
+        sys.exit(f"ssh-proxy-connect: proxy refused {host}:{port}: {status}")
+    rest = head.split(b"\r\n\r\n", 1)[1]
+
+s.settimeout(None)
+if rest:
+    out.write(rest)
+fds = [s, inp]
+while fds:
+    for r in select.select(fds, [], [])[0]:
+        if r is s:
+            data = s.recv(65536)
+            if not data:
+                sys.exit(0)
+            out.write(data)
+        else:
+            data = os.read(inp.fileno(), 65536)
+            if not data:
+                s.shutdown(socket.SHUT_WR)
+                fds.remove(inp)
+            else:
+                s.sendall(data)

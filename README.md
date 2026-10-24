@@ -18,6 +18,8 @@ flowchart LR
       claude["Claude Code"]
     end
     proj[("project folder<br/>~/projects/&lt;name&gt;")]
+    agent["ssh-agent<br/>(per workspace)"]
+    pool[("secrets/<br/>SSH keys · API tokens")]
     subgraph docker["Docker container aio-&lt;name&gt;"]
       aio["AIO Sandbox<br/>Chromium · VNC · VS Code · shell · MCP"]
     end
@@ -31,12 +33,22 @@ flowchart LR
   claude -- "MCP 127.0.0.1:81xx only" --> aio
   claude -- "r/w" --> proj
   aio -- "bind mount /home/gem/workspace" --> proj
-  claude -- "allowlisted, via nono proxy" --> net
+  claude -- "allowlisted, via nono proxy<br/>(HTTPS and SSH; tokens injected)" --> net
+  claude -- "socket only" --> agent
+  ui -- "loads assigned keys" --> agent
+  pool -. "read by UI / nono proxy only" .-> agent
   aio -- "unfiltered" --> net
 ```
 
 - **Claude (nono):** reads/writes its project folder; reaches only its own sandbox port
-  on localhost; internet limited to nono's `claude-code` allowlist.
+  on localhost; internet limited to the workspace's allowlist; no Unix sockets except its
+  own ssh-agent (so no Docker, tmux, D-Bus). Per-workspace settings (the **Access** tab)
+  are rendered to `workspaces/<name>.profile.json`, which extends `claude-browser`.
+- **Keys & tokens:** a pool in `secrets/`, assigned per workspace. SSH keys are loaded
+  into that workspace's ssh-agent (live — unticking a key revokes it from a running
+  session); Claude gets the socket, never the file. API tokens use nono's phantom-token
+  proxy: Claude sees a placeholder, the proxy injects the real token only towards that
+  service.
 - **Container:** sees only its project folder; its API key is enforced, held by the
   UI and injected into Claude via a nono hook. Never in the repo.
 - **UI:** token login, same-origin API, per-workspace capability URLs for sandbox views.
@@ -50,7 +62,8 @@ flowchart LR
 | `ui/server.py`, `ui/static/` | Web UI (stdlib Python; vanilla JS; xterm.js 5.5.0 vendored, MIT) |
 | `bin/sandbox-ui` | UI launcher (systemd `ExecStart`) |
 | `bin/sandbox-ui-cert` | Private, name-constrained CA + server cert in `ui/tls/` |
-| `bin/claude-in <name>` | Claude Code inside nono for one workspace |
+| `bin/claude-in <name>` | Claude Code inside nono for one workspace (prepares agent + profile) |
+| `libexec/ssh-proxy-connect` | SSH `ProxyCommand` through nono's proxy (readable in the sandbox) |
 | `compose.workspace.yaml` | Container template (compose project `aio-<name>`) |
 | `nono/claude-browser.jsonc` → `~/.config/nono/profiles/` | nono profile |
 | `nono/aio-env.sh` → `~/.config/nono/hooks/` | nono hook: gives Claude its sandbox port/key |
@@ -58,6 +71,10 @@ flowchart LR
 | `mcp.json.template` → `<project>/.mcp.json` | Claude's MCP link to its sandbox |
 | `ui/tmux.conf` | tmux server for Claude sessions (`tmux -L agent-sandboxes`) |
 | `workspaces/<name>.env` ✱ | Per-workspace folder, port, API key |
+| `workspaces/<name>.policy.json` ✱, `.profile.json` ✱ | Access settings; nono profile last used to start Claude |
+| `secrets/ssh/`, `secrets/tokens/` ✱ | Key / token pool (0600; never readable inside nono) |
+| `state/<name>/` ✱ | Workspace `ssh_config` and `known_hosts` (Claude-writable) |
+| `$XDG_RUNTIME_DIR/agent-sandboxes/<name>/agent.sock` ✱ | Workspace ssh-agent |
 | `ui/token` ✱, `ui/tls/` ✱, `ui/extra-hostnames` ✱ | Login token, TLS keys, extra DNS names |
 
 ✱ created at runtime, git-ignored.
@@ -93,12 +110,22 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
 - **New workspace** in the sidebar: name + optional folder (default `~/projects/<name>`).
   Creates the folder, `.mcp.json`, key and port, and starts the container.
 - **Tabs:** *Claude* (sandboxed session, survives closing the tab) · *Browser* (live VNC,
-  shared with Claude) · *VS Code* and *Terminal* (inside the container) · *Files*
-  (browse/download from the container) · *Logs*.
+  shared with Claude) · *VS Code* and *Terminal* (inside the container) · *Access* (SSH
+  keys, API tokens, network allowlist, memory/process limits) · *Files* (browse/download
+  from the container) · *Logs*.
+- **Keys & tokens** (sidebar): generate or import SSH keys (copy the public key into
+  GitHub etc.), add API tokens (GitHub, GitLab, OpenAI, Gemini, or any HTTPS API), and tick
+  which workspaces get each. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
+  SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
+  Network, token and limit changes need a Claude restart; the header says when.
 - **Shell access:** `bin/claude-in <name>` runs a workspace's Claude directly;
   `tmux -L agent-sandboxes attach -t cl-<name>` attaches to a UI-started session.
 - **Service:** `sudo systemctl restart agent-sandboxes-ui` after editing `ui/server.py`;
   static files reload on browser refresh.
 
+Resource limits run Claude in a `systemd --user` scope, which needs lingering
+(`sudo loginctl enable-linger <user>`).
+
 **Known gaps:** every workspace's Claude shares `~/.claude` (settings, credentials,
-transcripts) and `/tmp/claude-$UID`; container egress is unfiltered.
+transcripts) and `/tmp/claude-$UID`; container egress is unfiltered; SSH host keys are
+trust-on-first-use per workspace; pool secrets are unencrypted at rest (like `~/.ssh`).

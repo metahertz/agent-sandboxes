@@ -35,6 +35,12 @@
       </div>
       <p class="form-msg" id="new-msg" role="status"></p>
     </form>
+
+    <div class="sidebar-foot">
+      <button id="pool-btn" class="ws-item pool-item" type="button" aria-current="false">
+        <span class="n">Keys &amp; tokens</span><span class="sub">SSH keys and API tokens, assigned per workspace</span>
+      </button>
+    </div>
   </aside>
 
   <main class="main">
@@ -52,6 +58,7 @@
         <div class="status">
           <span class="pill" id="d-container"></span>
           <span class="pill" id="d-claude"></span>
+          <span class="pill warn" id="d-pending" hidden title="Access settings changed since Claude started">restart Claude to apply access changes</span>
         </div>
       </header>
 
@@ -85,6 +92,7 @@
         <button role="tab" data-tab="browser">Browser</button>
         <button role="tab" data-tab="vscode">VS Code</button>
         <button role="tab" data-tab="shell">Terminal</button>
+        <button role="tab" data-tab="access">Access</button>
         <button role="tab" data-tab="files">Files</button>
         <button role="tab" data-tab="logs">Logs</button>
       </div>
@@ -134,6 +142,54 @@
           <button class="btn primary" data-act="container/start">Start container</button></div>
       </div>
 
+      <div class="panel" data-panel="access" hidden>
+        <form id="access-form" class="access">
+          <section class="card">
+            <h2>SSH keys</h2>
+            <p class="hint">Claude gets an ssh-agent holding only these keys — never the key files. Changes apply immediately, even to a running session. Git uses them via <code>GIT_SSH_COMMAND</code>; SSH goes through the network allowlist below.</p>
+            <div class="checks" id="acc-ssh"></div>
+          </section>
+          <section class="card">
+            <h2>API tokens</h2>
+            <p class="hint">Claude sees a placeholder in the environment variable; nono's proxy swaps in the real token only on requests to that service. Restart Claude to apply.</p>
+            <div class="checks" id="acc-tokens"></div>
+          </section>
+          <section class="card">
+            <h2>Network</h2>
+            <p class="hint">Outbound traffic from Claude and everything it runs passes through nono's filtering proxy. Restart Claude to apply.</p>
+            <div class="radios" id="acc-net"></div>
+            <div class="two">
+              <label>Also allow <span class="muted">(one domain per line, <code>*.example.com</code> ok)</span>
+                <textarea name="allow" rows="4" spellcheck="false" placeholder="git.example.com"></textarea></label>
+              <label>Block <span class="muted">(wins over everything else)</span>
+                <textarea name="deny" rows="4" spellcheck="false" placeholder="pastebin.com"></textarea></label>
+            </div>
+          </section>
+          <section class="card">
+            <h2>Resource limits</h2>
+            <p class="hint">Applied to Claude's whole process tree via cgroups. Leave empty for no limit. Restart Claude to apply.</p>
+            <div class="two narrow">
+              <label>Memory <input name="memory" placeholder="e.g. 4G" autocomplete="off"></label>
+              <label>Max processes <input name="pids" type="number" min="0" placeholder="0 = no limit"></label>
+            </div>
+          </section>
+          <section class="card fixed">
+            <h2>Always enforced</h2>
+            <ul>
+              <li>Files: read/write the project folder only (plus Claude's own state); <code>~/.ssh</code>, credentials, keyrings, browser data and shell history denied.</li>
+              <li>Unix sockets denied by default: no Docker, tmux, D-Bus or <code>systemd --user</code>.</li>
+              <li>Localhost: only this workspace's sandbox port <span id="acc-port"></span>.</li>
+              <li>Secrets in the pool and other workspaces' keys are never readable inside the sandbox.</li>
+            </ul>
+          </section>
+          <div class="row sticky-save">
+            <button class="btn primary" type="submit">Save</button>
+            <button class="btn" type="button" id="acc-restart" hidden>Save &amp; restart Claude</button>
+            <p class="form-msg" id="acc-msg" role="status"></p>
+          </div>
+        </form>
+      </div>
+
       <div class="panel" data-panel="files" hidden>
         <div class="panel-bar">
           <button class="btn" id="f-up" title="Parent folder">↑</button>
@@ -158,6 +214,58 @@
           <button class="btn" id="logs-refresh">Refresh</button>
         </div>
         <pre id="logs" class="logs"></pre>
+      </div>
+    </section>
+
+    <section id="pool" class="pool" hidden>
+      <header class="detail-head"><div class="title">
+        <h1>Keys &amp; tokens</h1>
+        <p class="meta">Stored on the host in ~/agent-sandboxes/secrets (0600). Tick a box to give that workspace access.</p>
+      </div></header>
+
+      <div class="pool-body">
+        <section class="card">
+          <div class="card-head"><h2>SSH keys</h2>
+            <button class="btn" type="button" data-add="ssh">+ Add key</button></div>
+          <form class="add-form" id="add-ssh" hidden>
+            <div class="row">
+              <label>Name <input name="id" required pattern="[a-z0-9][a-z0-9\-]{0,39}" placeholder="github-deploy" autocomplete="off"></label>
+              <label>Comment <span class="muted">(optional)</span> <input name="comment" autocomplete="off"></label>
+            </div>
+            <div class="radios inline">
+              <label><input type="radio" name="how" value="generate" checked> Generate new ed25519 key</label>
+              <label><input type="radio" name="how" value="import"> Import existing private key</label>
+            </div>
+            <textarea name="private_key" rows="6" spellcheck="false" hidden placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+            <div class="row"><button class="btn primary" type="submit">Add</button>
+              <button class="btn ghost" type="button" data-cancel>Cancel</button></div>
+            <p class="form-msg" role="status"></p>
+          </form>
+          <div class="matrix-wrap"><table class="matrix" id="m-ssh"></table></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>API tokens</h2>
+            <button class="btn" type="button" data-add="tokens">+ Add token</button></div>
+          <form class="add-form" id="add-tokens" hidden>
+            <div class="row">
+              <label>Name <input name="id" required pattern="[a-z0-9][a-z0-9\-]{0,39}" placeholder="gh-readonly" autocomplete="off"></label>
+              <label>Service <select name="service" id="tok-service"></select></label>
+            </div>
+            <div class="row" id="tok-custom" hidden>
+              <label>Upstream URL <input name="upstream" placeholder="https://api.example.com"></label>
+              <label>Header <input name="header" placeholder="Authorization"></label>
+              <label>Format <input name="format" placeholder="Bearer {}"></label>
+              <label>Env var <input name="env_var" placeholder="EXAMPLE_API_KEY"></label>
+            </div>
+            <label>Token <input name="secret" type="password" required autocomplete="off"></label>
+            <div class="row"><button class="btn primary" type="submit">Add</button>
+              <button class="btn ghost" type="button" data-cancel>Cancel</button></div>
+            <p class="form-msg" role="status"></p>
+          </form>
+          <div class="matrix-wrap"><table class="matrix" id="m-tokens"></table></div>
+        </section>
+        <p class="form-msg" id="pool-msg" role="status"></p>
       </div>
     </section>
   </main>

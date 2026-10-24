@@ -1,5 +1,7 @@
 # Secrets and per-host state — never commit
 workspaces/
+secrets/
+state/
 ui/token
 ui/tls/
 ui/extra-hostnames
