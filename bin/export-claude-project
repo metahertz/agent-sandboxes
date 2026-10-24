@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Send a project, with its Claude Code history, to an Agent Sandboxes host.
+
+Run this on the machine the project is on now (Linux or macOS; python3 and
+rsync, nothing else). It uploads into the host's import inbox; then use
+Import in the host's web UI to turn it into a workspace.
+
+  export-claude-project [PROJECT] --to USER@HOST          with an upload key (Import page)
+  export-claude-project [PROJECT] --to USER@HOST:agent-sandboxes/inbox
+                                                          with a normal login
+  export-claude-project [PROJECT] --out DIR               write DIR/<name>/ to copy over
+                                                          yourself (into ~/agent-sandboxes/inbox/)
+
+What's sent: the project folder (including .git, .claude/, CLAUDE.md), and in
+<name>/.claude-import/ its Claude Code sessions (~/.claude/projects/<project>/,
+with auto-memory), their file checkpoints and todos, and its prompt history.
+Big rebuildable folders (node_modules, .venv, __pycache__) are left out unless
+--include-all. Re-running resumes / updates the upload.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+DEFAULT_EXCLUDES = ["node_modules", ".venv", "__pycache__", ".DS_Store"]
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def die(msg):
+    sys.exit("export-claude-project: " + msg)
+
+
+def project_key(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def first_cwd(jsonl):
+    try:
+        with open(jsonl, encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(50), f):
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except (ValueError, AttributeError):
+                    continue
+                if cwd:
+                    return cwd
+    except OSError:
+        pass
+    return None
+
+
+def find_history(claude_home, paths):
+    """Claude Code's folder for this project: by name, else by the cwd recorded
+    in its transcripts (long paths are shortened in the folder name)."""
+    projects = claude_home / "projects"
+    for p in paths:
+        d = projects / project_key(p)
+        if d.is_dir():
+            return d
+    if projects.is_dir():
+        for d in projects.iterdir():
+            t = next(iter(sorted(d.glob("*.jsonl"))), None) if d.is_dir() else None
+            if t and first_cwd(t) in paths:
+                return d
+    return None
+
+
+def copy_files(src, dst):
+    """Regular files only (no symlinks), keeping the tree."""
+    n = 0
+    for root, dirs, files in os.walk(str(src)):
+        dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(root, x))]
+        for f in files:
+            p = Path(root) / f
+            if p.is_symlink() or not p.is_file():
+                continue
+            out = dst / p.relative_to(src)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(p), str(out))
+            n += 1
+    return n
+
+
+def build_history(project, paths, staging, args):
+    claude_home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    out = staging / ".claude-import"
+    out.mkdir()
+    hist = find_history(claude_home, paths)
+    sessions = sorted(f.stem for f in hist.glob("*.jsonl")) if hist else []
+    stats = {"sessions": len(sessions), "files": 0, "checkpoints": 0, "todos": 0, "prompts": 0}
+    if hist:
+        stats["files"] = copy_files(hist, out / "projects")
+    for sid in sessions:
+        if not UUID_RE.match(sid):
+            continue
+        fh = claude_home / "file-history" / sid
+        if fh.is_dir() and not fh.is_symlink():
+            stats["checkpoints"] += copy_files(fh, out / "file-history" / sid)
+        for t in (claude_home / "todos").glob(sid + "*.json") if (claude_home / "todos").is_dir() else []:
+            if t.is_file() and not t.is_symlink():
+                (out / "todos").mkdir(exist_ok=True)
+                shutil.copy2(str(t), str(out / "todos" / t.name))
+                stats["todos"] += 1
+    prompts = []
+    hfile = claude_home / "history.jsonl"
+    if hfile.is_file():
+        with open(str(hfile), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    if json.loads(line).get("project") in paths:
+                        prompts.append(line.rstrip("\n"))
+                except (ValueError, AttributeError):
+                    continue
+    if prompts:
+        (out / "history.jsonl").write_text("\n".join(prompts) + "\n", encoding="utf-8")
+    stats["prompts"] = len(prompts)
+    manifest = {
+        "format": 1, "tool": "export-claude-project", "name": args.name,
+        "source_host": socket.gethostname(), "source_path": project,
+        "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "sessions": sessions, "stats": stats,
+    }
+    return manifest, stats
+
+
+def rsync(src, dest, args, extra=()):
+    ssh = ["ssh"]
+    if args.identity:
+        ssh += ["-i", args.identity]
+    if args.port:
+        ssh += ["-p", str(args.port)]
+    cmd = ["rsync", "-a", "--partial", "-e", " ".join(ssh)] + list(extra) + [src, dest]
+    if subprocess.call(cmd) != 0:
+        die("rsync failed: " + " ".join(cmd))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("project", nargs="?", default=".", help="project folder (default: current)")
+    where = ap.add_mutually_exclusive_group(required=True)
+    where.add_argument("--to", metavar="USER@HOST[:DIR]", help="upload with rsync over SSH")
+    where.add_argument("--out", metavar="DIR", help="write DIR/<name>/ locally instead")
+    ap.add_argument("--name", help="folder name in the inbox (default: the project's)")
+    ap.add_argument("-i", "--identity", help="SSH key to use (e.g. the upload key)")
+    ap.add_argument("-p", "--port", type=int, help="SSH port")
+    ap.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                    help="also leave out (rsync pattern; repeatable)")
+    ap.add_argument("--include-all", action="store_true",
+                    help="don't leave out " + ", ".join(DEFAULT_EXCLUDES))
+    ap.add_argument("--no-history", action="store_true", help="send the files only")
+    args = ap.parse_args()
+
+    project = os.path.realpath(args.project)
+    if not os.path.isdir(project):
+        die(project + " is not a folder")
+    paths = {project, os.path.abspath(args.project)}
+    args.name = args.name or re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(project)).strip("-.") or "project"
+    excludes = ([] if args.include_all else DEFAULT_EXCLUDES) + args.exclude + [".claude-import"]
+
+    with tempfile.TemporaryDirectory(prefix="claude-export-") as tmp:
+        staging = Path(tmp)
+        manifest = stats = None
+        if not args.no_history:
+            manifest, stats = build_history(project, paths, staging, args)
+            print("Claude history: {sessions} session(s), {files} file(s), {checkpoints} checkpoint(s), "
+                  "{todos} todo list(s), {prompts} prompt(s)".format(**stats))
+
+        if args.out:
+            dest = Path(args.out).expanduser() / args.name
+            if dest.exists():
+                die(str(dest) + " already exists")
+            shutil.copytree(project, str(dest), symlinks=True,
+                            ignore=shutil.ignore_patterns(*excludes))
+            if manifest:
+                shutil.copytree(str(staging / ".claude-import"), str(dest / ".claude-import"))
+                (dest / ".claude-import" / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            print("Wrote " + str(dest) + "\nCopy that folder into ~/agent-sandboxes/inbox/ on the host, "
+                  "then use Import in the web UI.")
+            return
+
+        host, _, rdir = args.to.partition(":")
+        base = host + ":" + (rdir.rstrip("/") + "/" if rdir else "") + args.name
+        print("Uploading " + project + " -> " + base)
+        rsync(project + "/", base + "/", args, ["--exclude=" + e for e in excludes])
+        if manifest:
+            rsync(str(staging / ".claude-import") + "/", base + "/.claude-import/", args)
+            # the manifest goes last: its presence marks the upload complete
+            (staging / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            rsync(str(staging / "manifest.json"), base + "/.claude-import/manifest.json", args)
+        print("Done. Open the host's web UI -> Import to create the workspace.")
+
+
+if __name__ == "__main__":
+    main()

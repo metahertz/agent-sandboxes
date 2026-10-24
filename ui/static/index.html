@@ -40,6 +40,9 @@
       <button id="pool-btn" class="ws-item pool-item" type="button" aria-current="false">
         <span class="n">Keys &amp; tokens</span><span class="sub">SSH keys and API tokens, assigned per workspace</span>
       </button>
+      <button id="import-btn" class="ws-item pool-item" type="button" aria-current="false">
+        <span class="n">Import</span><span class="sub">Projects and Claude history from other machines</span>
+      </button>
       <button id="settings-btn" class="ws-item pool-item" type="button" aria-current="false">
         <span class="n">Settings</span><span class="sub">Monitoring, dashboards and telemetry</span>
       </button>
@@ -275,6 +278,39 @@
           <div class="matrix-wrap"><table class="matrix" id="m-tokens"></table></div>
         </section>
         <p class="form-msg" id="pool-msg" role="status"></p>
+      </div>
+    </section>
+
+    <section id="import" class="pool" hidden>
+      <header class="detail-head"><div class="title">
+        <h1>Import</h1>
+        <p class="meta">Uploads land in ~/agent-sandboxes/inbox/&lt;folder&gt;/. Importing moves one into a new workspace and installs its Claude history.</p>
+      </div></header>
+
+      <div class="pool-body">
+        <section class="card">
+          <div class="card-head"><h2>Inbox</h2>
+            <button class="btn" type="button" id="inbox-refresh">Refresh</button></div>
+          <div id="inbox-list"></div>
+        </section>
+
+        <section class="card">
+          <h2>Send a project from another machine</h2>
+          <ol class="steps">
+            <li>On that machine, get <a href="/download/export-claude-project" download>export-claude-project</a> (python3 and rsync; Linux or macOS).</li>
+            <li>Make a key there for uploads (<code>ssh-keygen -t ed25519 -f ~/.ssh/sandboxes-upload</code>) and add its <code>.pub</code> under <em>Upload keys</em> below. It can only rsync into the inbox.</li>
+            <li>Run it from the project folder:</li>
+          </ol>
+          <pre class="snippet" id="import-snippet"></pre>
+          <p class="hint">It sends the folder (with <code>.git</code>, <code>.claude/</code>, <code>CLAUDE.md</code>; not <code>node_modules</code>, <code>.venv</code>, <code>__pycache__</code>) plus the project's Claude Code sessions, auto-memory, file checkpoints and prompt history. Re-running it resumes. With a normal login instead, use <code>--to user@host:agent-sandboxes/inbox</code>, or <code>--out DIR</code> and copy the folder into the inbox yourself. A plain folder with no history works too.</p>
+        </section>
+
+        <section class="card">
+          <h2>Upload keys</h2>
+          <p class="hint">Each can only write into the inbox with rsync: no shell, no reading.</p>
+          <div class="keylist" id="upload-keys"></div>
+        </section>
+        <p class="form-msg" id="import-msg" role="status"></p>
       </div>
     </section>
 

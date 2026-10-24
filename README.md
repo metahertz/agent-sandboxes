@@ -77,7 +77,9 @@ flowchart LR
 | `state/<name>/` ✱ | Workspace `ssh_config` and `known_hosts` (Claude-writable) |
 | `$XDG_RUNTIME_DIR/agent-sandboxes/<name>/agent.sock` ✱ | Workspace ssh-agent |
 | `ui/token` ✱, `ui/tls/` ✱, `ui/extra-hostnames` ✱ | Login token, TLS keys, extra DNS names |
+| `bin/export-claude-project` | Run on another machine: sends a project + its Claude history to the inbox |
 | `bin/ws-ssh` | SSH forced command for upload and per-workspace keys |
+| `inbox/<folder>/` ✱ | Uploaded projects waiting for *Import* |
 | `secrets/ssh-access.json` ✱ → `~/.ssh/authorized_keys` | Upload / workspace SSH keys (a marked block in that file) |
 | `bin/monitoring`, `monitoring/compose.yaml` | Monitoring stack (compose project `agent-sandboxes-mon`) |
 | `ui/exporter.py`, `systemd/agent-sandboxes-exporter.service` | Workspace metrics + nono audit events (user unit) |
@@ -126,6 +128,8 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   which workspaces get each. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+- **Import** (sidebar): projects from other machines, with their Claude Code history.
+  See [Importing projects](#importing-projects).
 - **Remote terminal** (*Access* tab): SSH keys that reach one workspace only. See
   [SSH into a workspace](#ssh-into-a-workspace).
 - **Settings** (sidebar): monitoring — dashboards link, local or external Prometheus /
@@ -135,6 +139,29 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   `tmux -L agent-sandboxes attach -t cl-<name>` attaches to a UI-started session.
 - **Service:** `sudo systemctl restart agent-sandboxes-ui` after editing `ui/server.py`;
   static files reload on browser refresh.
+
+## Importing projects
+
+On the machine the project is on now (Linux or macOS, python3 + rsync), get
+`export-claude-project` (link on the *Import* page, or `bin/` here) and run:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/sandboxes-upload     # add the .pub under Import → Upload keys
+python3 export-claude-project ~/code/my-app --to metahertz@<host> -i ~/.ssh/sandboxes-upload
+```
+
+It uploads to `inbox/my-app/`: the folder (with `.git`, `.claude/`, `CLAUDE.md`; without
+`node_modules`, `.venv`, `__pycache__` unless `--include-all`), plus `.claude-import/` with
+the project's Claude Code sessions and auto-memory (`~/.claude/projects/<project>/`), their
+file checkpoints and todos, its prompt history, and a manifest (sent last, so a half-done
+upload isn't importable). Upload keys can only rsync into the inbox (`rrsync -wo -munge`:
+no shell, no reading; symlinks are stored defused and restored on import). With a normal
+login use `--to user@host:agent-sandboxes/inbox`; or `--out DIR` and copy the folder in
+any way. A plain folder with no `.claude-import/` imports too, without history.
+
+*Import* moves the folder to `~/projects/<name>` (or the folder you give; never merging
+into an existing one), creates the workspace, and installs the history under the new path
+(`cwd` in transcripts rewritten), so `/resume` and `claude -c` pick conversations up.
 
 ## SSH into a workspace
 
@@ -201,6 +228,6 @@ transcripts) and `/tmp/claude-$UID`; container egress is unfiltered; SSH host ke
 trust-on-first-use per workspace; pool secrets are unencrypted at rest (like `~/.ssh`);
 telemetry's `workspace` label is set by the sandbox, so a workspace could mislabel its
 own Claude metrics (nono and container data are labelled outside it); Alloy has the
-Docker socket (root-equivalent, as any container monitor does); upload and workspace
-SSH keys log in as this account (their
-forced command is the boundary).
+Docker socket (root-equivalent, as any container monitor does); imported history lands in
+that shared `~/.claude` too; upload and workspace SSH keys log in as this account (their
+forced command is the boundary), and an upload key can fill the disk.

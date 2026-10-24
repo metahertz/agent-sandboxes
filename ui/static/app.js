@@ -5,8 +5,9 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const POOL_HASH = "#~keys";
 const SETTINGS_HASH = "#~settings";
-const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings" };
-const PAGES = { pool: "#pool", settings: "#settings" };   // view -> section
+const IMPORT_HASH = "#~import";
+const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings", [IMPORT_HASH]: "import" };
+const PAGES = { pool: "#pool", import: "#import", settings: "#settings" };   // view -> section
 const state = {
   workspaces: [],
   view: VIEW_OF_HASH[location.hash] || "ws",
@@ -145,7 +146,7 @@ function select(name) {
   if (state.tab === "access") loadAccess();
 }
 
-const PAGE_LOAD = { pool: () => loadPool(), settings: () => loadSettings() };
+const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), settings: () => loadSettings() };
 
 function showPage(view) {
   state.view = view;
@@ -755,6 +756,87 @@ async function loadWsSshAccess(w) {
     $("#acc-ssh-access").replaceChildren(el("p", { className: "form-msg err", textContent: e.message }));
   }
 }
+
+// ------------------------------------------------------------------ import
+
+function fmtBytes(n) {
+  if (n == null) return "";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i && n < 10 ? 1 : 0)} ${u[i]}`;
+}
+
+function importMsg(text, isErr = false) {
+  $("#import-msg").textContent = text;
+  $("#import-msg").classList.toggle("err", isErr);
+}
+
+function renderDrop(d) {
+  const chips = [];
+  if (d.history) chips.push(`${d.history.sessions} Claude session${d.history.sessions === 1 ? "" : "s"} from ${d.history.sourceHost}:${d.history.sourcePath}`);
+  else if (!d.incomplete) chips.push("no Claude history");
+  if (d.git) chips.push("git");
+  if (d.claudeDir) chips.push(".claude/");
+  if (d.claudeMd) chips.push("CLAUDE.md");
+  if (d.size != null) chips.push(fmtBytes(d.size));
+  const name = el("input", { value: d.suggested, required: true, pattern: "[a-z0-9][a-z0-9\\-]{0,29}", autocomplete: "off" });
+  const dir = el("input", { placeholder: `~/projects/${d.suggested}`, autocomplete: "off" });
+  name.addEventListener("input", () => (dir.placeholder = `~/projects/${name.value || "<name>"}`));
+  const go = el("button", { className: "btn primary", type: "submit", textContent: "Import", disabled: d.incomplete });
+  const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Delete upload" });
+  const out = el("p", { className: "form-msg", role: "status" });
+  const form = el("form", { className: "drop" },
+    el("div", { className: "drop-head" }, el("strong", { textContent: d.drop }),
+      el("span", { className: "muted", textContent: ` · uploaded ${new Date(d.modified * 1000).toLocaleString()}` })),
+    el("div", { className: "chips" }, ...chips.map((c) => el("span", { className: "chip", textContent: c })),
+      ...(d.incomplete ? [el("span", { className: "pill warn", textContent: "upload incomplete — no manifest yet" })] : [])),
+    el("div", { className: "row" },
+      el("label", {}, "Workspace name", name), el("label", {}, el("span", {}, "Folder ", el("span", { className: "muted", textContent: "(optional)" })), dir),
+      go, del),
+    out);
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    go.disabled = del.disabled = true;
+    out.classList.remove("err");
+    out.textContent = "Importing… (moving files, starting the sandbox)";
+    try {
+      const r = await api("POST", `inbox/${encodeURIComponent(d.drop)}/import`, { name: name.value.trim(), dir: dir.value.trim() || undefined });
+      const h = r.history;
+      importMsg(`Imported ${d.drop} as ${r.name} (${r.dir})` +
+        (h ? `, with ${h.sessions} Claude session${h.sessions === 1 ? "" : "s"}${h.prompts ? ` and ${h.prompts} prompts` : ""}` : "") +
+        (r.notes.length ? `. ${r.notes.join(". ")}` : "") + ". Use /resume in its Claude tab to pick a conversation up.");
+      await refresh();
+      loadImport();
+    } catch (e) {
+      out.textContent = e.message;
+      out.classList.add("err");
+      go.disabled = del.disabled = false;
+    }
+  });
+  del.addEventListener("click", async () => {
+    if (!confirm(`Delete the upload ${d.drop} from the inbox? Its files are removed.`)) return;
+    try { await api("DELETE", `inbox/${encodeURIComponent(d.drop)}`); importMsg(`Deleted ${d.drop}.`); }
+    catch (e) { importMsg(e.message, true); }
+    loadImport();
+  });
+  return form;
+}
+
+async function loadImport() {
+  try {
+    const [inbox, acc] = await Promise.all([api("GET", "inbox"), api("GET", "access")]);
+    const list = $("#inbox-list");
+    list.replaceChildren(...inbox.drops.map(renderDrop));
+    if (!inbox.drops.length) list.append(el("p", { className: "muted", textContent: "Nothing in the inbox. Send a project with the steps below." }));
+    renderKeyList($("#upload-keys"), "upload", acc.upload, loadImport);
+    $("#import-snippet").textContent =
+      `python3 export-claude-project . --to ${acc.user}@${sshHost()} -i ~/.ssh/sandboxes-upload`;
+  } catch (e) {
+    importMsg(e.message, true);
+  }
+}
+$("#inbox-refresh").addEventListener("click", () => { importMsg(""); loadImport(); });
 
 // ------------------------------------------------------------------ settings (monitoring)
 

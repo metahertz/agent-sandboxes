@@ -318,6 +318,10 @@ async def handle_ui(req: Request, reader, w):
         await api(req, w)
         return
 
+    if req.path == "/download/export-claude-project" and req.method == "GET":
+        return await respond(w, 200, EXPORT_TOOL.read_bytes(), "text/x-python; charset=utf-8",
+                             {"Content-Disposition": 'attachment; filename="export-claude-project"'})
+
     # static files
     rel = "index.html" if req.path in ("/", "/index.html") else req.path.removeprefix("/static/")
     path = (STATIC / rel).resolve()
@@ -342,6 +346,8 @@ async def api(req: Request, w):
         return await settings_api(req, parts[1:], w)
     if parts and parts[0] == "access":
         return await access_api(req, parts[1:], w)
+    if parts and parts[0] == "inbox":
+        return await inbox_api(req, parts[1:], w)
 
     if parts == ["workspaces"] and m == "GET":
         return await send_json(w, await status_all())
@@ -437,41 +443,49 @@ async def status_all() -> list[dict]:
     return out
 
 
-async def create_ws(req: Request, w):
-    try:
-        body = json.loads(req.body or b"{}")
-    except json.JSONDecodeError:
-        return await send_json(w, {"error": "Invalid JSON"}, 400)
-    name = str(body.get("name", "")).strip()
-    if not NAME_RE.match(name):
-        return await send_json(w, {"error": "Name: lowercase letters, digits and dashes, max 30"}, 400)
-    if load_ws(name):
-        return await send_json(w, {"error": f"Workspace '{name}' already exists"}, 409)
+class WsError(Exception):
+    def __init__(self, msg: str, status: int = 400):
+        super().__init__(msg)
+        self.status = status
 
-    raw_dir = str(body.get("dir") or PROJECTS_BASE / name).strip()
-    raw_dir = os.path.expanduser(raw_dir)
+
+def check_new_ws(name: str, raw_dir: str | None) -> str:
+    """Validate a new workspace's name and folder; returns the real folder path."""
+    if not NAME_RE.match(name):
+        raise WsError("Name: lowercase letters, digits and dashes, max 30")
+    if name == "upload":          # bin/ws-ssh's inbox target
+        raise WsError("'upload' is reserved; choose another name")
+    if load_ws(name):
+        raise WsError(f"Workspace '{name}' already exists", 409)
+    raw_dir = os.path.expanduser(str(raw_dir or PROJECTS_BASE / name).strip())
     if not DIR_RE.match(raw_dir):
-        return await send_json(w, {"error": "Directory must be an absolute path of [A-Za-z0-9._/-]"}, 400)
+        raise WsError("Directory must be an absolute path of [A-Za-z0-9._/-]")
     d = os.path.realpath(raw_dir)
     home = str(Path.home())
     if d in ("/", home) or dirs_overlap(d, str(ROOT)) or not d.startswith(home + "/"):
-        return await send_json(w, {"error": "Directory must be inside your home, and not your home "
-                                            "itself or the agent-sandboxes folder"}, 400)
-    others = all_ws()
-    for o in others:
+        raise WsError("Directory must be inside your home, and not your home "
+                      "itself or the agent-sandboxes folder")
+    for o in all_ws():
         if dirs_overlap(d, os.path.realpath(o["WS_DIR"])):
-            return await send_json(w, {"error": f"Overlaps workspace '{o['WS_NAME']}' "
-                                                f"({o['WS_DIR']}); nono would expose one to the other"}, 400)
+            raise WsError(f"Overlaps workspace '{o['WS_NAME']}' ({o['WS_DIR']}); "
+                          "nono would expose one to the other")
+    return d
 
-    used = {int(o["WS_PORT"]) for o in others}
+
+async def provision_ws(name: str, d: str) -> dict:
+    """Create (or adopt) the folder, link it to a new sandbox and start that."""
+    used = {int(o["WS_PORT"]) for o in all_ws()}
     port = next((p for p in SANDBOX_PORTS if p not in used and port_free(p)), None)
     if port is None:
-        return await send_json(w, {"error": "No free sandbox port"}, 500)
+        raise WsError("No free sandbox port", 500)
 
     created_dir = not os.path.exists(d)
     os.makedirs(d, exist_ok=True)
     notes = []
     mcp = Path(d) / ".mcp.json"
+    if mcp.is_symlink():          # e.g. from an imported project: never write through it
+        mcp.unlink()
+        notes.append("Replaced a symlinked .mcp.json")
     template = json.loads(MCP_TEMPLATE.read_text())
     if not mcp.exists():
         mcp.write_text(json.dumps(template, indent=2) + "\n")
@@ -502,7 +516,20 @@ async def create_ws(req: Request, w):
     await refresh_cert()          # adds <name>.localhost to the certificate
     if err := await open_sandbox_listener(ws):
         notes.append(err)
-    await send_json(w, {"ok": True, "name": name, "dir": d, "port": port, "notes": notes}, 201)
+    return {"ok": True, "name": name, "dir": d, "port": port, "notes": notes}
+
+
+async def create_ws(req: Request, w):
+    try:
+        body = json.loads(req.body or b"{}")
+    except json.JSONDecodeError:
+        return await send_json(w, {"error": "Invalid JSON"}, 400)
+    try:
+        name = str(body.get("name", "")).strip()
+        d = check_new_ws(name, body.get("dir"))
+        return await send_json(w, await provision_ws(name, d), 201)
+    except WsError as e:
+        return await send_json(w, {"error": str(e)}, e.status)
 
 
 async def claude_start(ws: dict[str, str], w):
@@ -555,6 +582,7 @@ def private_write(path: Path, data: str | bytes):
 
 
 def ensure_dirs():
+    INBOX.mkdir(mode=0o700, exist_ok=True)
     for d in (WS_ROOT, SECRETS, SSH_POOL, TOKEN_POOL, STATE_ROOT, RUNTIME):
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -1123,6 +1151,219 @@ async def access_api(req: Request, parts: list[str], w):
                 return await send_json(w, {"error": "Not found"}, 404)
             return await send_json(w, {"ok": True})
     except (ValueError, json.JSONDecodeError) as e:
+        return await send_json(w, {"error": str(e)}, 400)
+    await respond(w, 404, "Not found\n")
+
+
+# ---- import inbox: projects (with their Claude history) from other machines
+
+INBOX = ROOT / "inbox"
+IMPORT_DIR = ".claude-import"            # written by bin/export-claude-project
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+EXPORT_TOOL = ROOT / "bin" / "export-claude-project"
+MUNGED = "/rsyncd-munged/"               # rrsync -munge prefix on uploaded symlinks
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+import_lock = asyncio.Lock()
+
+
+def claude_project_key(path: str) -> str:
+    """Claude Code's folder name for a project under ~/.claude/projects."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def real_dir(p: Path) -> bool:
+    return p.is_dir() and not p.is_symlink()
+
+
+def read_manifest(drop: Path) -> dict | None:
+    m = drop / IMPORT_DIR / "manifest.json"
+    try:
+        if m.is_symlink() or not m.is_file() or m.stat().st_size > 1 << 20:
+            return None
+        man = json.loads(m.read_text())
+        return man if isinstance(man, dict) and isinstance(man.get("source_path"), str) else None
+    except (OSError, ValueError):
+        return None
+
+
+def suggest_name(drop: str) -> str:
+    n = re.sub(r"[^a-z0-9-]+", "-", drop.lower()).strip("-")[:30].strip("-")
+    return n if NAME_RE.match(n) else "imported"
+
+
+async def inbox_listing() -> list[dict]:
+    INBOX.mkdir(mode=0o700, exist_ok=True)
+    out = []
+    for d in sorted(INBOX.iterdir()):
+        if d.name.startswith(".") or not real_dir(d):
+            continue
+        rc, du, _ = await run("du", "-sxB1", str(d), timeout=30)
+        man = read_manifest(d)
+        has_import = real_dir(d / IMPORT_DIR)
+        name = suggest_name(d.name)
+        out.append({
+            "drop": d.name, "suggested": name,
+            "nameTaken": bool(load_ws(name)) or (PROJECTS_BASE / name).exists(),
+            "size": int(du.split()[0]) if rc == 0 and du.split() else None,
+            "modified": int(d.stat().st_mtime),
+            "git": real_dir(d / ".git"), "claudeDir": real_dir(d / ".claude"),
+            "claudeMd": (d / "CLAUDE.md").is_file(),
+            "incomplete": has_import and man is None,
+            "history": None if not man else {
+                "sourceHost": str(man.get("source_host", ""))[:100],
+                "sourcePath": man["source_path"][:300],
+                "sessions": len(man.get("sessions") or []),
+                "exportedAt": str(man.get("exported_at", ""))[:40]},
+        })
+    return out
+
+
+def copy_regular_files(src: Path, dst: Path, transform=None) -> tuple[int, int]:
+    """Copy regular files under src to dst (symlinks and specials skipped, nothing
+    overwritten). Returns (copied, skipped)."""
+    copied = skipped = 0
+    if not real_dir(src):
+        return 0, 0
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(root, x))]
+        for f in files:
+            p = Path(root) / f
+            if p.is_symlink() or not p.is_file():
+                continue
+            out = dst / p.relative_to(src)
+            if out.exists():
+                skipped += 1
+                continue
+            out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            data = p.read_bytes()
+            private_write(out, transform(p, data) if transform else data)
+            copied += 1
+    return copied, skipped
+
+
+def install_history(staging: Path, source: str, target: str) -> dict:
+    """Put an export's Claude history where Claude Code looks for the new folder."""
+    def rehome(v: str) -> str:
+        return target + v[len(source):] if v == source or v.startswith(source + "/") else v
+
+    def fix_jsonl(p: Path, data: bytes) -> bytes:
+        if p.suffix != ".jsonl":
+            return data
+        out = []
+        for line in data.decode(errors="replace").splitlines():
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                out.append(line)
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("cwd"), str):
+                obj["cwd"] = rehome(obj["cwd"])
+                line = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            out.append(line)
+        return ("\n".join(out) + "\n").encode()
+
+    dest = CLAUDE_HOME / "projects" / claude_project_key(target)
+    copied, skipped = copy_regular_files(staging / "projects", dest, fix_jsonl)
+    sessions = len([f for f in dest.glob("*.jsonl")]) if dest.is_dir() else 0
+    fh = staging / "file-history"
+    if real_dir(fh):
+        for sd in fh.iterdir():
+            if UUID_RE.match(sd.name) and real_dir(sd):
+                copy_regular_files(sd, CLAUDE_HOME / "file-history" / sd.name)
+    td = staging / "todos"
+    if real_dir(td):
+        for f in td.iterdir():
+            if re.fullmatch(r"[0-9a-f-]{36}[A-Za-z0-9._-]{0,80}\.json", f.name) and f.is_file() and not f.is_symlink() \
+                    and not (CLAUDE_HOME / "todos" / f.name).exists():
+                (CLAUDE_HOME / "todos").mkdir(mode=0o700, exist_ok=True)
+                private_write(CLAUDE_HOME / "todos" / f.name, f.read_bytes())
+    prompts = 0
+    hist = staging / "history.jsonl"
+    if hist.is_file() and not hist.is_symlink():
+        lines = []
+        for line in hist.read_text(errors="replace").splitlines():
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and obj.get("project") == source:
+                obj["project"] = target
+                lines.append(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+        if lines:
+            fd = os.open(CLAUDE_HOME / "history.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as f:     # one write: Claude may be appending too
+                f.write("\n".join(lines) + "\n")
+            prompts = len(lines)
+    return {"files": copied, "skipped": skipped, "sessions": sessions, "prompts": prompts}
+
+
+def unmunge_symlinks(top: str) -> int:
+    fixed = 0
+    for root, dirs, files in os.walk(top):
+        for n in dirs + files:
+            p = os.path.join(root, n)
+            if os.path.islink(p) and (t := os.readlink(p)).startswith(MUNGED):
+                os.unlink(p)
+                os.symlink(t[len(MUNGED):], p)
+                fixed += 1
+    return fixed
+
+
+async def import_drop(drop: str, name: str, raw_dir: str | None) -> dict:
+    src = INBOX / drop
+    if drop.startswith(".") or "/" in drop or not real_dir(src):
+        raise WsError("No such upload in the inbox", 404)
+    d = check_new_ws(name, raw_dir)
+    if os.path.lexists(d):
+        raise WsError(f"{d} already exists; choose another folder (imports never merge into one)", 409)
+    man = read_manifest(src)
+    if real_dir(src / IMPORT_DIR) and man is None:
+        raise WsError("This upload looks incomplete (no manifest yet); wait for it to finish", 409)
+    if (src / IMPORT_DIR).is_symlink():
+        raise WsError(f"{IMPORT_DIR} is a symlink; refusing")
+
+    staging = INBOX / f".importing-{secrets.token_hex(4)}"
+    if real_dir(src / IMPORT_DIR):
+        (src / IMPORT_DIR).rename(staging)
+    Path(d).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(src, d)
+    except OSError:
+        shutil.move(str(src), d)
+    fixed = await asyncio.to_thread(unmunge_symlinks, d)
+    result = await provision_ws(name, d)
+    if fixed:
+        result["notes"].append(f"Restored {fixed} symlink(s) defused during upload")
+    if man:
+        try:
+            result["history"] = await asyncio.to_thread(install_history, staging, man["source_path"].rstrip("/"), d)
+        except OSError as e:
+            result["notes"].append(f"Claude history not fully imported: {e}")
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    return result
+
+
+async def inbox_api(req: Request, parts: list[str], w):
+    try:
+        if parts == [] and req.method == "GET":
+            return await send_json(w, {"drops": await inbox_listing(), "inbox": str(INBOX)})
+        if len(parts) == 2 and parts[1] == "import" and req.method == "POST":
+            body = json.loads(req.body or b"{}")
+            if import_lock.locked():
+                return await send_json(w, {"error": "Another import is running"}, 409)
+            async with import_lock:
+                res = await import_drop(parts[0], str(body.get("name", "")).strip(), body.get("dir") or None)
+            return await send_json(w, res, 201)
+        if len(parts) == 1 and req.method == "DELETE":
+            p = INBOX / parts[0]
+            if parts[0].startswith(".") or "/" in parts[0] or not real_dir(p):
+                return await send_json(w, {"error": "Not found"}, 404)
+            await asyncio.to_thread(shutil.rmtree, p)
+            return await send_json(w, {"ok": True})
+    except WsError as e:
+        return await send_json(w, {"error": str(e)}, e.status)
+    except json.JSONDecodeError as e:
         return await send_json(w, {"error": str(e)}, 400)
     await respond(w, 404, "Not found\n")
 

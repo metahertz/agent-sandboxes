@@ -9,3 +9,4 @@ ui/extra-hostnames
 __pycache__/
 monitoring/.env
 monitoring/data/
+inbox/
