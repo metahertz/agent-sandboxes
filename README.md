@@ -77,6 +77,8 @@ flowchart LR
 | `state/<name>/` ✱ | Workspace `ssh_config` and `known_hosts` (Claude-writable) |
 | `$XDG_RUNTIME_DIR/agent-sandboxes/<name>/agent.sock` ✱ | Workspace ssh-agent |
 | `ui/token` ✱, `ui/tls/` ✱, `ui/extra-hostnames` ✱ | Login token, TLS keys, extra DNS names |
+| `bin/ws-ssh` | SSH forced command for upload and per-workspace keys |
+| `secrets/ssh-access.json` ✱ → `~/.ssh/authorized_keys` | Upload / workspace SSH keys (a marked block in that file) |
 | `bin/monitoring`, `monitoring/compose.yaml` | Monitoring stack (compose project `agent-sandboxes-mon`) |
 | `ui/exporter.py`, `systemd/agent-sandboxes-exporter.service` | Workspace metrics + nono audit events (user unit) |
 | `monitoring/alloy/`, `prometheus/`, `loki/` | Collector and storage config |
@@ -124,6 +126,8 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   which workspaces get each. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+- **Remote terminal** (*Access* tab): SSH keys that reach one workspace only. See
+  [SSH into a workspace](#ssh-into-a-workspace).
 - **Settings** (sidebar): monitoring — dashboards link, local or external Prometheus /
   Loki, local Grafana address and retention, Claude Code telemetry — with *Save & apply*
   and *Stop monitoring*. See [Monitoring](#monitoring).
@@ -131,6 +135,24 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   `tmux -L agent-sandboxes attach -t cl-<name>` attaches to a UI-started session.
 - **Service:** `sudo systemctl restart agent-sandboxes-ui` after editing `ui/server.py`;
   static files reload on browser refresh.
+
+## SSH into a workspace
+
+Keys added in a workspace's *Access → Remote terminal* get a forced command
+(`bin/ws-ssh <name>`, `restrict`) in `~/.ssh/authorized_keys`:
+
+```bash
+ssh -t -i ~/.ssh/key me@host            # attach to its Claude session (started if needed)
+ssh -t -i ~/.ssh/key me@host shell      # bash inside the workspace's nono sandbox
+ssh -i ~/.ssh/key me@host 'git status'  # any command, in the sandbox; rsync / scp / sftp too
+```
+
+Everything except the Claude session runs through `claude-in --shell / --exec`, i.e. under
+that workspace's own nono profile: the key reaches exactly what Claude there can. No port
+forwarding. tmux is configured so attached clients (SSH or the web terminal) can only
+detach (`C-b d`) and scroll (`C-b [`), not open windows or switch sessions. Use a key per
+workspace, and not one that already logs in to the account unrestricted (sshd would use
+that line first; the UI refuses such keys).
 
 ## Monitoring
 
@@ -179,4 +201,6 @@ transcripts) and `/tmp/claude-$UID`; container egress is unfiltered; SSH host ke
 trust-on-first-use per workspace; pool secrets are unencrypted at rest (like `~/.ssh`);
 telemetry's `workspace` label is set by the sandbox, so a workspace could mislabel its
 own Claude metrics (nono and container data are labelled outside it); Alloy has the
-Docker socket (root-equivalent, as any container monitor does).
+Docker socket (root-equivalent, as any container monitor does); upload and workspace
+SSH keys log in as this account (their
+forced command is the boundary).

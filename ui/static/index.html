@@ -176,12 +176,18 @@
               <label>Max processes <input name="pids" type="number" min="0" placeholder="0 = no limit"></label>
             </div>
           </section>
+          <section class="card">
+            <h2>Remote terminal (SSH)</h2>
+            <p class="hint">Keys added here log in to this workspace only: its Claude session, or a shell and file transfer inside the same nono sandbox as Claude. They apply immediately. Use a key that isn't already allowed to log in to this host.</p>
+            <div class="keylist" id="acc-ssh-access"></div>
+            <pre class="snippet" id="acc-ssh-snippet"></pre>
+          </section>
           <section class="card fixed">
             <h2>Always enforced</h2>
             <ul>
               <li>Files: read/write the project folder only (plus Claude's own state); <code>~/.ssh</code>, credentials, keyrings, browser data and shell history denied.</li>
               <li>Unix sockets denied by default: no Docker, tmux, D-Bus or <code>systemd --user</code>.</li>
-              <li>Localhost: only this workspace's sandbox port <span id="acc-port"></span>.</li>
+              <li>Localhost: only this workspace's sandbox port <span id="acc-port"></span>, plus Alloy's telemetry receiver (4318) when Claude Code telemetry is on.</li>
               <li>Secrets in the pool and other workspaces' keys are never readable inside the sandbox.</li>
             </ul>
           </section>

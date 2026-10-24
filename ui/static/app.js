@@ -6,6 +6,7 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const POOL_HASH = "#~keys";
 const SETTINGS_HASH = "#~settings";
 const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings" };
+const PAGES = { pool: "#pool", settings: "#settings" };   // view -> section
 const state = {
   workspaces: [],
   view: VIEW_OF_HASH[location.hash] || "ws",
@@ -83,14 +84,13 @@ function setPill(el, label, value, tone) {
 }
 
 function renderDetail() {
-  const pool = state.view === "pool";
-  const settings = state.view === "settings";
-  $("#pool").hidden = !pool;
-  $("#pool-btn").setAttribute("aria-current", String(pool));
-  $("#settings").hidden = !settings;
-  $("#settings-btn").setAttribute("aria-current", String(settings));
-  const w = pool || settings ? null : current();
-  $("#empty").hidden = !!w || pool || settings;
+  const page = state.view in PAGES;
+  for (const [view, sel] of Object.entries(PAGES)) {
+    $(sel).hidden = state.view !== view;
+    $(`${sel}-btn`).setAttribute("aria-current", String(state.view === view));
+  }
+  const w = page ? null : current();
+  $("#empty").hidden = !!w || page;
   $("#detail").hidden = !w;
   if (!w) { disconnectTerm(); return; }
 
@@ -145,17 +145,18 @@ function select(name) {
   if (state.tab === "access") loadAccess();
 }
 
+const PAGE_LOAD = { pool: () => loadPool(), settings: () => loadSettings() };
+
 function showPage(view) {
   state.view = view;
-  history.replaceState(null, "", view === "pool" ? POOL_HASH : SETTINGS_HASH);
+  history.replaceState(null, "", Object.keys(VIEW_OF_HASH).find((h) => VIEW_OF_HASH[h] === view));
   disconnectTerm();
   Object.keys(FRAMES).forEach(clearFrame);
   renderList();
   renderDetail();
-  (view === "pool" ? loadPool : loadSettings)();
+  PAGE_LOAD[view]();
 }
-$("#pool-btn").addEventListener("click", () => showPage("pool"));
-$("#settings-btn").addEventListener("click", () => showPage("settings"));
+for (const view of Object.keys(PAGES)) $(`${PAGES[view]}-btn`).addEventListener("click", () => showPage(view));
 
 // ------------------------------------------------------------------ actions
 
@@ -544,6 +545,7 @@ async function loadAccess() {
     form.elements.memory.value = policy.limits.memory;
     form.elements.pids.value = policy.limits.pids || "";
     $("#acc-restart").hidden = w.claude === "stopped";
+    loadWsSshAccess(w);
   } catch (e) {
     $("#acc-msg").textContent = e.message;
     $("#acc-msg").classList.add("err");
@@ -703,6 +705,57 @@ $("#add-tokens").addEventListener("submit", (ev) => {
       format: f.format.value.trim(), env_var: f.env_var.value.trim() } : undefined });
 });
 
+// ------------------------------------------------------------------ SSH access keys (shared widget)
+
+const sshHost = () => location.hostname;
+
+function renderKeyList(box, scope, keys, onChange) {
+  const rows = keys.map((k) => {
+    const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Remove" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Remove ${k.comment || k.fingerprint}? It stops working immediately.`)) return;
+      try { await api("DELETE", `access/${k.id}`); } catch (e) { alert(e.message); }
+      onChange();
+    });
+    return el("div", { className: "keyrow" },
+      el("div", {}, el("strong", { textContent: k.comment || "(no comment)" }),
+        el("div", { className: "muted mono", textContent: `${k.type} ${k.fingerprint}` })), del);
+  });
+  if (!keys.length) rows.push(el("p", { className: "muted", textContent: "No keys yet." }));
+  const ta = el("textarea", { rows: 2, spellcheck: false, placeholder: "ssh-ed25519 AAAA… you@laptop  (contents of the .pub file)" });
+  const add = el("button", { className: "btn", type: "button", textContent: "Add key" });
+  const out = el("p", { className: "form-msg", role: "status" });
+  add.addEventListener("click", async () => {
+    out.classList.remove("err");
+    try {
+      const r = await api("POST", "access", { scope, key: ta.value });
+      ta.value = "";
+      out.textContent = `Added ${r.fingerprint}.`;
+      onChange();
+    } catch (e) {
+      out.textContent = e.message;
+      out.classList.add("err");
+    }
+  });
+  box.replaceChildren(...rows, el("div", { className: "keyadd" }, ta, add), out);
+}
+
+async function loadWsSshAccess(w) {
+  try {
+    const acc = await api("GET", "access");
+    if (current()?.name !== w.name) return;
+    renderKeyList($("#acc-ssh-access"), w.name, acc.workspaces[w.name] || [], () => loadWsSshAccess(w));
+    const t = `${acc.user}@${sshHost()}`, k = "-i ~/.ssh/<this key>";
+    $("#acc-ssh-snippet").textContent =
+      `ssh -t ${k} ${t}               # Claude session (C-b d detaches)\n` +
+      `ssh -t ${k} ${t} shell         # shell in the sandbox\n` +
+      `ssh ${k} ${t} 'git status'     # any command, in the sandbox\n` +
+      `rsync -a -e "ssh ${k}" ./src/ ${t}:src/    # files (scp / sftp work too)`;
+  } catch (e) {
+    $("#acc-ssh-access").replaceChildren(el("p", { className: "form-msg err", textContent: e.message }));
+  }
+}
+
 // ------------------------------------------------------------------ settings (monitoring)
 
 const MON_SERVICES = { alloy: "Alloy", prometheus: "Prometheus", loki: "Loki", grafana: "Grafana" };
@@ -830,8 +883,7 @@ window.addEventListener("hashchange", () => {
   if (name && (name !== state.selected || state.view !== "ws")) select(name);
 });
 
-if (state.view === "pool") loadPool();
-if (state.view === "settings") loadSettings();
+if (state.view in PAGE_LOAD) PAGE_LOAD[state.view]();
 refresh();
 setInterval(refresh, 4000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });

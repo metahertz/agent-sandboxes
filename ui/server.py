@@ -340,6 +340,8 @@ async def api(req: Request, w):
 
     if parts and parts[0] == "settings":
         return await settings_api(req, parts[1:], w)
+    if parts and parts[0] == "access":
+        return await access_api(req, parts[1:], w)
 
     if parts == ["workspaces"] and m == "GET":
         return await send_json(w, await status_all())
@@ -363,7 +365,8 @@ async def api(req: Request, w):
             return await send_json(w, {"error": err or out}, 500)
         (WS_ROOT / f"{name}.env").unlink()
         kill_agent(name)
-        for p in (policy_path(name), profile_path(name)):
+        remove_access(lambda scope, _: scope == name)
+        for p in (policy_path(name), profile_path(name), aux_profile_path(name)):
             p.unlink(missing_ok=True)
         shutil.rmtree(STATE_ROOT / name, ignore_errors=True)
         shutil.rmtree(RUNTIME / name, ignore_errors=True)
@@ -562,6 +565,10 @@ def policy_path(name: str) -> Path:
 
 def profile_path(name: str) -> Path:
     return WS_ROOT / f"{name}.profile.json"
+
+
+def aux_profile_path(name: str) -> Path:
+    return WS_ROOT / f"{name}.aux-profile.json"
 
 
 def agent_sock(name: str) -> Path:
@@ -915,17 +922,19 @@ def write_ssh_config(name: str):
         "  ServerAliveInterval 30\n")
 
 
-async def prepare(name: str) -> dict:
+async def prepare(name: str, aux: bool = False) -> dict:
     """Everything Claude needs before nono starts: agent with its keys,
-    ssh config, and the rendered profile (what's now 'applied')."""
+    ssh config, and the rendered profile (what's now 'applied'). aux: for a
+    shell / SSH command instead, whose profile mustn't count as Claude's."""
     ensure_dirs()
     ws = load_ws(name)
     if not ws:
         raise SystemExit(f"No workspace '{name}'")
     await sync_agent(name)
     write_ssh_config(name)
-    private_write(profile_path(name), profile_text(ws))
-    return {"profile": str(profile_path(name)), **load_policy(name)["limits"]}
+    target = aux_profile_path(name) if aux else profile_path(name)
+    private_write(target, profile_text(ws))
+    return {"profile": str(target), **load_policy(name)["limits"]}
 
 
 def policy_pending(ws: dict[str, str]) -> bool:
@@ -977,6 +986,144 @@ async def pool_api(req: Request, parts: list[str], w):
         return await send_json(w, {"error": str(e)}, 400)
     except RuntimeError as e:
         return await send_json(w, {"error": str(e)}, 500)
+    await respond(w, 404, "Not found\n")
+
+
+# ---- SSH access: per-workspace keys and inbox upload keys (~/.ssh/authorized_keys)
+
+AUTH_KEYS = Path.home() / ".ssh" / "authorized_keys"
+ACCESS_FILE = SECRETS / "ssh-access.json"
+WS_SSH = ROOT / "bin" / "ws-ssh"
+AK_BEGIN = "# >>> agent-sandboxes: managed by the web UI (Import page, Access tab); edits inside are replaced >>>"
+AK_END = "# <<< agent-sandboxes <<<"
+KEY_TYPES = {"ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+             "ecdsa-sha2-nistp521", "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"}
+
+
+def parse_pubkey(text: str) -> tuple[str, str, str]:
+    """One OpenSSH public key line, no options -> (type, base64 blob, comment)."""
+    parts = text.strip().split(None, 2)
+    if "\n" in text.strip() or len(parts) < 2 or parts[0] not in KEY_TYPES:
+        raise ValueError("Paste one public key line (ssh-ed25519 AAAA… comment), e.g. from ~/.ssh/id_ed25519.pub")
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+    except ValueError:
+        raise ValueError("That key isn't valid base64") from None
+    n = struct.unpack(">I", blob[:4])[0] if len(blob) > 4 else 0
+    if blob[4:4 + n].decode(errors="replace") != parts[0]:
+        raise ValueError("Key type and key data don't match")
+    comment = re.sub(r"[^A-Za-z0-9@._+ -]", "", parts[2] if len(parts) > 2 else "")[:80].strip()
+    return parts[0], parts[1], comment
+
+
+def key_fingerprint(b64: str) -> str:
+    return "SHA256:" + base64.b64encode(hashlib.sha256(base64.b64decode(b64)).digest()).decode().rstrip("=")
+
+
+def key_id(b64: str) -> str:
+    return hashlib.sha256(b64.encode()).hexdigest()[:16]
+
+
+def load_access() -> dict:
+    try:
+        acc = json.loads(ACCESS_FILE.read_text())
+    except (OSError, ValueError):
+        acc = {}
+    return {"upload": acc.get("upload", []), "workspaces": acc.get("workspaces", {})}
+
+
+def access_entries(acc: dict):
+    for e in acc["upload"]:
+        yield "upload", e
+    for ws, keys in acc["workspaces"].items():
+        for e in keys:
+            yield ws, e
+
+
+def split_authorized_keys() -> tuple[list[str], list[str]]:
+    """(lines outside our block, lines inside it)."""
+    try:
+        lines = AUTH_KEYS.read_text().splitlines()
+    except FileNotFoundError:
+        lines = []
+    if AK_BEGIN in lines and AK_END in lines[lines.index(AK_BEGIN):]:
+        a = lines.index(AK_BEGIN)
+        b = lines.index(AK_END, a)
+        return lines[:a] + lines[b + 1:], lines[a + 1:b]
+    return lines, []
+
+
+def write_authorized_keys(acc: dict):
+    outside, _ = split_authorized_keys()
+    while outside and not outside[-1].strip():
+        outside.pop()
+    block = []
+    for scope, e in access_entries(acc):
+        opts = f'command="{WS_SSH} {scope}",restrict' + ("" if scope == "upload" else ",pty")
+        block.append(f"{opts} {e['type']} {e['key']} {e['comment']}".rstrip())
+    text = "\n".join(outside + ([""] if outside and block else []) + ([AK_BEGIN, *block, AK_END] if block else []))
+    AUTH_KEYS.parent.mkdir(mode=0o700, exist_ok=True)
+    private_write(AUTH_KEYS, text + "\n" if text else "")
+
+
+def save_access(acc: dict):
+    private_write(ACCESS_FILE, json.dumps(acc, indent=2) + "\n")
+    write_authorized_keys(acc)
+
+
+def add_access_key(scope: str, text: str) -> dict:
+    if scope != "upload" and not load_ws(scope):
+        raise ValueError("No such workspace")
+    ktype, b64, comment = parse_pubkey(text)
+    acc = load_access()
+    for sc, e in access_entries(acc):
+        if e["key"] == b64:
+            raise ValueError(f"That key is already used for {'uploads' if sc == 'upload' else sc}; "
+                             "use a separate key for each")
+    outside, _ = split_authorized_keys()
+    if any(b64 in line.split() for line in outside):
+        raise ValueError("That key already logs in to this account unrestricted (it's in "
+                         "~/.ssh/authorized_keys), so a restriction here wouldn't apply. Use a new key.")
+    entry = {"type": ktype, "key": b64, "comment": comment, "added": int(time.time())}
+    (acc["upload"] if scope == "upload" else acc["workspaces"].setdefault(scope, [])).append(entry)
+    save_access(acc)
+    return {"id": key_id(b64), "fingerprint": key_fingerprint(b64)}
+
+
+def remove_access(pred) -> int:
+    acc = load_access()
+    before = sum(1 for _ in access_entries(acc))
+    acc["upload"] = [e for e in acc["upload"] if not pred("upload", e)]
+    acc["workspaces"] = {ws: kept for ws, keys in acc["workspaces"].items()
+                         if (kept := [e for e in keys if not pred(ws, e)])}
+    removed = before - sum(1 for _ in access_entries(acc))
+    if removed:
+        save_access(acc)
+    return removed
+
+
+def access_listing() -> dict:
+    acc = load_access()
+    view = lambda e: {"id": key_id(e["key"]), "type": e["type"], "comment": e["comment"],
+                      "fingerprint": key_fingerprint(e["key"]), "added": e.get("added")}
+    return {"user": pwd.getpwuid(os.getuid()).pw_name,
+            "upload": [view(e) for e in acc["upload"]],
+            "workspaces": {ws: [view(e) for e in keys] for ws, keys in acc["workspaces"].items()}}
+
+
+async def access_api(req: Request, parts: list[str], w):
+    try:
+        if parts == [] and req.method == "GET":
+            return await send_json(w, access_listing())
+        if parts == [] and req.method == "POST":
+            body = json.loads(req.body or b"{}")
+            return await send_json(w, add_access_key(str(body.get("scope", "")), str(body.get("key", ""))), 201)
+        if len(parts) == 1 and re.fullmatch(r"[0-9a-f]{16}", parts[0]) and req.method == "DELETE":
+            if not remove_access(lambda _, e: key_id(e["key"]) == parts[0]):
+                return await send_json(w, {"error": "Not found"}, 404)
+            return await send_json(w, {"ok": True})
+    except (ValueError, json.JSONDecodeError) as e:
+        return await send_json(w, {"error": str(e)}, 400)
     await respond(w, 404, "Not found\n")
 
 
@@ -1501,17 +1648,17 @@ async def main():
     await asyncio.gather(renew_daily(), *(s.serve_forever() for s in servers))
 
 
-def cli_prepare(name: str):
+def cli_prepare(name: str, aux: bool = False):
     """bin/claude-in calls this (outside nono) and evals the output."""
-    info = asyncio.run(prepare(name))
+    info = asyncio.run(prepare(name, aux))
     print(f"WS_PROFILE={shlex.quote(info['profile'])}")
     print(f"WS_MEMORY={shlex.quote(info['memory'])}")
     print(f"WS_PIDS={int(info['pids'])}")
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["prepare"] and len(sys.argv) == 3:
-        cli_prepare(sys.argv[2])
+    if sys.argv[1:2] == ["prepare"] and len(sys.argv) in (3, 4) and sys.argv[3:] in ([], ["--aux"]):
+        cli_prepare(sys.argv[2], aux=sys.argv[3:] == ["--aux"])
         sys.exit(0)
     try:
         asyncio.run(main())

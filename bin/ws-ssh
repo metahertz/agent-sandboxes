@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# SSH forced command for keys added in the web UI (~/.ssh/authorized_keys,
+# managed block). Never run by hand.
+#
+#   command="…/ws-ssh upload",restrict           rsync into the import inbox only
+#   command="…/ws-ssh <workspace>",restrict,pty   that one workspace:
+#       ssh -t host            its Claude session (started if needed)
+#       ssh -t host shell      a shell inside the workspace's nono sandbox
+#       ssh host <command>     any command (git, rsync, scp, sftp…), inside the
+#                              same sandbox: exactly what Claude there can reach
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+target="${1:?ws-ssh: no target}"
+req="${SSH_ORIGINAL_COMMAND:-}"
+
+if [[ $target == upload ]]; then
+  if [[ $req != "rsync --server "* ]]; then
+    echo "This key can only upload into the import inbox with rsync (use export-claude-project)." >&2
+    exit 1
+  fi
+  # -munge: uploaded symlinks are stored defused (the importer restores them),
+  # so a crafted client can't write through one to outside the inbox.
+  exec rrsync -wo -munge -no-del "$ROOT/inbox"
+fi
+
+[[ $target =~ ^[a-z0-9][a-z0-9-]{0,29}$ && -r "$ROOT/workspaces/$target.env" ]] ||
+  { echo "Workspace '$target' no longer exists." >&2; exit 1; }
+
+tmux=(tmux -L agent-sandboxes -f "$ROOT/ui/tmux.conf")
+session="cl-$target"
+
+case "$req" in
+  ""|claude)
+    [[ -t 0 ]] || { echo "Claude needs a terminal: ssh -t …" >&2; exit 1; }
+    if "${tmux[@]}" has-session -t "=$session" 2>/dev/null; then
+      if [[ "$("${tmux[@]}" display-message -p -t "=$session" '#{pane_dead}')" == 1 ]]; then
+        "${tmux[@]}" respawn-pane -k -t "=$session"     # Claude had exited: start it again
+      fi
+    else
+      ws_dir="$(sed -n 's/^WS_DIR=//p' "$ROOT/workspaces/$target.env")"
+      "${tmux[@]}" new-session -d -s "$session" -x 160 -y 45 -c "$ws_dir" "$ROOT/bin/claude-in" "$target"
+    fi
+    # The tmux config leaves attached clients only detach (C-b d) and scrollback.
+    exec "${tmux[@]}" attach-session -t "=$session"
+    ;;
+  shell)
+    [[ -t 0 ]] || { echo "A shell needs a terminal: ssh -t … shell" >&2; exit 1; }
+    exec "$ROOT/bin/claude-in" --shell "$target"
+    ;;
+  internal-sftp|sftp|*/sftp-server)                     # sftp, and scp (which uses sftp)
+    exec "$ROOT/bin/claude-in" --exec "$target" /usr/lib/openssh/sftp-server
+    ;;
+  *)
+    exec "$ROOT/bin/claude-in" --exec "$target" "$req"
+    ;;
+esac

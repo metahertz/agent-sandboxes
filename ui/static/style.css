@@ -175,6 +175,14 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 .matrix .note { padding: 14px 10px; }
 #pool-msg { padding: 0 2px; word-break: break-all; }
 
+/* SSH access */
+.mono { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+.keylist { display: flex; flex-direction: column; gap: 8px; }
+.keyrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.keyadd { display: flex; gap: 8px; align-items: flex-start; }
+.keyadd textarea { flex: 1; }
+.snippet { margin: 12px 0 0; padding: 10px 12px; background: var(--sunken); border-radius: 6px; font: 12px/1.55 var(--mono); white-space: pre-wrap; word-break: break-all; user-select: all; }
+
 /* settings */
 .card h3 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
 .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }

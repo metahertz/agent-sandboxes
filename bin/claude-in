@@ -4,28 +4,44 @@
 # allowlist and resource limits (all set in the web UI).
 #
 #   claude-in <workspace> [claude args...]
+#   claude-in --shell <workspace>            a login shell under the same sandbox
+#   claude-in --exec <workspace> <command>   one command (sh -c), e.g. rsync / sftp-server
+#                                            for bin/ws-ssh; stdout stays clean
 set -euo pipefail
+
+mode=claude
+case "${1:-}" in
+  --shell) mode=shell; shift ;;
+  --exec)  mode=exec; shift ;;
+esac
 
 ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
 WS_ROOT="${AIO_WORKSPACES:-$ROOT/workspaces}"
-name="${1:?usage: claude-in <workspace> [claude args...]}"; shift
+name="${1:?usage: claude-in [--shell | --exec] <workspace> [claude args... | command]}"; shift
 env_file="$WS_ROOT/$name.env"
 [[ -r "$env_file" ]] || { echo "No workspace '$name' ($env_file)." >&2; exit 1; }
 
 set -a; source "$env_file"; set +a
 
-if ! curl -fsS -o /dev/null --max-time 2 -H "X-AIO-API-Key: $WS_KEY" "http://127.0.0.1:${WS_PORT}/v1/docs"; then
+[[ $mode == exec ]] || if ! curl -fsS -o /dev/null --max-time 2 -H "X-AIO-API-Key: $WS_KEY" "http://127.0.0.1:${WS_PORT}/v1/docs"; then
   echo "AIO sandbox for '$name' isn't answering on :${WS_PORT} — start it from the web UI." >&2
 fi
 
-# Loads the agent's SSH keys and writes workspaces/<name>.profile.json;
+# Loads the agent's SSH keys and writes workspaces/<name>.profile.json
+# (.aux-profile.json for --shell / --exec);
 # sets WS_PROFILE, WS_MEMORY, WS_PIDS.
-eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name")"
+aux=(); [[ $mode == claude ]] || aux=(--aux)   # don't overwrite what Claude started with
+eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${aux[@]}")"
 
 cmd=(nono run --profile "$WS_PROFILE" --allow-cwd)
+[[ $mode == exec ]] && cmd+=(--silent)
 [[ -n "$WS_MEMORY" ]] && cmd+=(--memory "$WS_MEMORY")
 [[ "$WS_PIDS" != 0 ]] && cmd+=(--max-processes "$WS_PIDS")
-cmd+=(-- claude "$@")
+case $mode in
+  claude) cmd+=(-- claude "$@"); unit="claude-$name-$$" ;;
+  shell)  cmd+=(-- bash -l); unit="shell-$name-$$" ;;
+  exec)   cmd+=(-- sh -c "${1:?--exec needs a command}"); unit="exec-$name-$$" ;;
+esac
 
 cd "$WS_DIR"
 # Run in a scope of the user's systemd instance (needs lingering, so it
@@ -33,7 +49,7 @@ cd "$WS_DIR"
 # the metrics exporter reads usage from it (claude-<workspace>-<pid>.scope).
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
 if systemctl --user show-environment >/dev/null 2>&1; then
-  exec systemd-run --user --scope --quiet --collect --unit "claude-$name-$$" -- "${cmd[@]}"
+  exec systemd-run --user --scope --quiet --collect --unit "$unit" -- "${cmd[@]}"
 fi
 if [[ -n "$WS_MEMORY" || "$WS_PIDS" != 0 ]]; then
   echo "No systemd --user instance: can't apply this workspace's resource limits." >&2
