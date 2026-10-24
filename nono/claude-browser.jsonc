@@ -19,6 +19,9 @@
     // nono may already exclude these by default; drop this if it complains.
     "no_proxy": ["127.0.0.1", "localhost"]
   },
+  // Default-deny pathname Unix sockets (Docker, tmux, D-Bus/systemd --user
+  // would all be ways out of the sandbox). Grant specific ones per workspace.
+  "linux": { "af_unix_mediation": "pathname" },
   "session_hooks": {
     // Runs outside the sandbox before Claude starts; exports AIO_PORT and
     // AIO_KEY for the project in the working directory (see the script).
