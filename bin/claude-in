@@ -28,10 +28,15 @@ cmd=(nono run --profile "$WS_PROFILE" --allow-cwd)
 cmd+=(-- claude "$@")
 
 cd "$WS_DIR"
-if [[ -n "$WS_MEMORY" || "$WS_PIDS" != 0 ]]; then
-  # nono's limits need a delegated cgroup: run it in a scope of the user's
-  # systemd instance (needs lingering, so it exists without a login).
-  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
+# Run in a scope of the user's systemd instance (needs lingering, so it
+# exists without a login): nono's limits need that delegated cgroup, and
+# the metrics exporter reads usage from it (claude-<workspace>-<pid>.scope).
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
+if systemctl --user show-environment >/dev/null 2>&1; then
   exec systemd-run --user --scope --quiet --collect --unit "claude-$name-$$" -- "${cmd[@]}"
+fi
+if [[ -n "$WS_MEMORY" || "$WS_PIDS" != 0 ]]; then
+  echo "No systemd --user instance: can't apply this workspace's resource limits." >&2
+  exit 1
 fi
 exec "${cmd[@]}"

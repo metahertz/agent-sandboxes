@@ -1,0 +1,19 @@
+# User unit: per-workspace metrics and nono audit events for the monitoring
+# stack (monitoring/). Installed and started by `bin/monitoring up`:
+#   ~/.config/systemd/user/agent-sandboxes-exporter.service
+[Unit]
+Description=Agent Sandboxes metrics / log exporter
+Documentation=file://%h/agent-sandboxes/README.md
+
+[Service]
+Type=simple
+# sg: the user manager may predate the docker group membership (docker ps)
+ExecStart=/usr/bin/sg docker -c "exec /usr/bin/python3 -I %h/agent-sandboxes/ui/exporter.py"
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_RUNTIME_DIR=%t
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target
