@@ -168,6 +168,9 @@ To use an external Prometheus and Grafana, choose **External** under *Where data
 exporter keep running here; the local containers are removed, their volumes kept.
 Remote-write / Loki authentication isn't wired up yet. Default retention: 30 days / 5 GB of metrics, 14 days of logs.
 
+After updating, a tmux server that was already running keeps its old key bindings:
+`tmux -L agent-sandboxes source-file ui/tmux.conf` applies the locked-down ones.
+
 Claude always runs in a `systemd --user` scope (`claude-<name>-<pid>`, for resource
 limits and its metrics), which needs lingering (`sudo loginctl enable-linger <user>`).
 
