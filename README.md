@@ -51,6 +51,7 @@ flowchart LR
   service.
 - **Container:** sees only its project folder; its API key is enforced, held by the
   UI and injected into Claude via a nono hook. Never in the repo.
+- **Monitoring (optional):** Alloy → Prometheus + Loki → Grafana, see below.
 - **UI:** token login, same-origin API, per-workspace capability URLs for sandbox views.
   Runs as your user with only `CAP_NET_BIND_SERVICE`, which it clears from the
   inheritable set once 443 is bound.
@@ -76,6 +77,11 @@ flowchart LR
 | `state/<name>/` ✱ | Workspace `ssh_config` and `known_hosts` (Claude-writable) |
 | `$XDG_RUNTIME_DIR/agent-sandboxes/<name>/agent.sock` ✱ | Workspace ssh-agent |
 | `ui/token` ✱, `ui/tls/` ✱, `ui/extra-hostnames` ✱ | Login token, TLS keys, extra DNS names |
+| `bin/monitoring`, `monitoring/compose.yaml` | Monitoring stack (compose project `agent-sandboxes-mon`) |
+| `ui/exporter.py`, `systemd/agent-sandboxes-exporter.service` | Workspace metrics + nono audit events (user unit) |
+| `monitoring/alloy/`, `prometheus/`, `loki/` | Collector and storage config |
+| `monitoring/grafana/build-dashboards.py` → `dashboards/*.json` | Provisioned dashboards (edit the script, re-run) |
+| `monitoring/.env` ✱, `monitoring/data/` ✱, `secrets/grafana-admin-password` ✱ | Monitoring settings, exporter output, Grafana data |
 
 ✱ created at runtime, git-ignored.
 
@@ -123,9 +129,40 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
 - **Service:** `sudo systemctl restart agent-sandboxes-ui` after editing `ui/server.py`;
   static files reload on browser refresh.
 
-Resource limits run Claude in a `systemd --user` scope, which needs lingering
-(`sudo loginctl enable-linger <user>`).
+## Monitoring
+
+```bash
+bin/monitoring up          # first run writes monitoring/.env; also starts the exporter
+bin/monitoring password    # Grafana admin password
+sudo ufw allow from <your-subnet> to any port 3000 proto tcp
+```
+
+Grafana is at `https://<host>:3000/` (same certificate as the UI), with two dashboards
+in *Agent Sandboxes*: **overview** (every workspace's sandbox / Claude / policy state,
+CPU and memory, tokens and cost, network denials, host) and **workspace** (one
+workspace in detail, with its logs). What's collected:
+
+| Source | Into | What |
+|---|---|---|
+| `ui/exporter.py` (every 15 s) | Prometheus `aio_*` | Container up/healthy, Claude running, policy pending, keys/tokens, limits, project size; Claude scope CPU / memory / processes / OOM kills |
+| nono audit trail (via the exporter) | Loki `{source="nono"}`, `aio_nono_*` | Session start/end, every connection allowed or denied, with workspace |
+| Claude Code OpenTelemetry | Loki `{service_name="claude-code"}`, Prometheus `claude_code_*` | API requests (tokens, cost, model), tool use and decisions, errors; prompt and response text stays redacted |
+| cAdvisor (in Alloy) | Prometheus `container_*{workspace=…}` | Sandbox container CPU, memory, network |
+| node exporter (in Alloy) | Prometheus `node_*` | Host CPU, memory, disk, load |
+| Docker, journald | Loki `{source="docker"}`, `{source="journal"}` | `aio-*` / `mon-*` container logs; system journal |
+
+Once `monitoring/.env` exists, workspace profiles add Claude Code's telemetry settings
+and open localhost:4318 (Alloy's OTLP receiver) to the sandbox, so sessions started from
+then on report. Prometheus and Loki aren't published outside the compose network; to
+ship to existing ones instead, set `MON_STACK=0` and `PROM_WRITE_URL` / `LOKI_URL` in
+`monitoring/.env`. Retention: 30 days / 5 GB of metrics, 14 days of logs.
+
+Claude always runs in a `systemd --user` scope (`claude-<name>-<pid>`, for resource
+limits and its metrics), which needs lingering (`sudo loginctl enable-linger <user>`).
 
 **Known gaps:** every workspace's Claude shares `~/.claude` (settings, credentials,
 transcripts) and `/tmp/claude-$UID`; container egress is unfiltered; SSH host keys are
-trust-on-first-use per workspace; pool secrets are unencrypted at rest (like `~/.ssh`).
+trust-on-first-use per workspace; pool secrets are unencrypted at rest (like `~/.ssh`);
+telemetry's `workspace` label is set by the sandbox, so a workspace could mislabel its
+own Claude metrics (nono and container data are labelled outside it); Alloy has the
+Docker socket (root-equivalent, as any container monitor does).

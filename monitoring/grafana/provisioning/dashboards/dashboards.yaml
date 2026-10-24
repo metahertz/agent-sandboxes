@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: agent-sandboxes
+    folder: Agent Sandboxes
+    type: file
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana-dashboards

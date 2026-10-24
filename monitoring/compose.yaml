@@ -1,0 +1,139 @@
+# Monitoring for Agent Sandboxes: Alloy collects, Prometheus stores
+# metrics, Loki stores logs, Grafana shows the provisioned dashboards.
+# Normally driven by bin/monitoring (which writes .env):
+#
+#   docker compose -p agent-sandboxes-mon --env-file monitoring/.env \
+#     -f monitoring/compose.yaml --profile stack up -d
+#
+# Only Grafana (TLS, password) and Alloy's OTLP receiver (loopback, for
+# Claude Code inside nono) are published; Prometheus and Loki are reachable
+# only on the internal network. Without the "stack" profile only Alloy runs,
+# shipping to PROM_WRITE_URL / LOKI_URL elsewhere.
+
+name: agent-sandboxes-mon
+
+x-common: &common
+  restart: unless-stopped
+  networks: [mon]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  alloy:
+    <<: *common
+    image: grafana/alloy:v1.20.1
+    container_name: mon-alloy
+    hostname: ${HOST_NAME:-agent-sandboxes}   # becomes the metrics' instance label
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    # Host metrics, cAdvisor (container cgroups) and the journal need the
+    # host's view; Docker socket access is root-equivalent, like any
+    # container-monitoring agent.
+    privileged: true
+    pid: host
+    cgroup: host
+    environment:
+      PROM_WRITE_URL: ${PROM_WRITE_URL:-http://prometheus:9090/api/v1/write}
+      LOKI_URL: ${LOKI_URL:-http://loki:3100}
+      HOST_NAME: ${HOST_NAME:-agent-sandboxes}
+    ports:
+      - "127.0.0.1:4318:4318"           # OTLP/HTTP from Claude Code (nono open_port)
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy/data
+      - ./data/exporter:/exporter:ro      # ui/exporter.py output
+      - /:/host/root:ro,rslave
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+      - /run/udev:/run/udev:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+    mem_limit: 768m
+    cpus: "1"
+
+  prometheus:
+    <<: *common
+    profiles: [stack]
+    image: prom/prometheus:v3.15.0
+    container_name: mon-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROM_RETENTION:-30d}
+      - --storage.tsdb.retention.size=${PROM_RETENTION_SIZE:-5GB}
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    mem_limit: 768m
+    cpus: "1"
+
+  loki:
+    <<: *common
+    profiles: [stack]
+    image: grafana/loki:3.7.8
+    container_name: mon-loki
+    command: [-config.file=/etc/loki/loki.yaml, "-config.expand-env=true"]
+    environment:
+      LOKI_RETENTION: ${LOKI_RETENTION:-336h}
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    mem_limit: 512m
+    cpus: "1"
+
+  grafana:
+    <<: *common
+    profiles: [stack]
+    image: grafana/grafana:13.1.7
+    container_name: mon-grafana
+    # As the host user, to read the UI's TLS key (0600) and own its data dir.
+    user: "${MON_UID:?}:${MON_GID:?}"
+    ports:
+      - "${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SERVER_PROTOCOL: https
+      GF_SERVER_CERT_FILE: /tls/server.crt
+      GF_SERVER_CERT_KEY: /tls/server.key
+      GF_SERVER_CERTS_WATCH_INTERVAL: 1h    # the UI reissues it when names change
+      GF_SERVER_DOMAIN: ${GRAFANA_DOMAIN:-localhost}
+      GF_SERVER_ROOT_URL: https://${GRAFANA_DOMAIN:-localhost}:${GRAFANA_PORT:-3000}/
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana-admin-password
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana-dashboards/overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana-dashboards:ro
+      - ./data/grafana:/var/lib/grafana
+      - ../ui/tls/server.crt:/tls/server.crt:ro
+      - ../ui/tls/server.key:/tls/server.key:ro
+      - ../secrets/grafana-admin-password:/run/secrets/grafana-admin-password:ro
+    mem_limit: 1g
+    cpus: "1"
+
+networks:
+  mon:
+    name: agent-sandboxes-mon
+
+volumes:
+  alloy-data:
+  prometheus-data:
+  loki-data:

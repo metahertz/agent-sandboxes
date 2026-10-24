@@ -1,0 +1,221 @@
+// Alloy: the one collector for Agent Sandboxes.
+//   metrics -> Prometheus (remote write): host (node exporter), containers
+//             (cAdvisor), workspaces (ui/exporter.py textfile), Claude Code (OTLP)
+//   logs    -> Loki: container logs, the journal, nono's audit trail,
+//             Claude Code events (OTLP)
+
+// ---------------------------------------------------------------- sinks
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = sys.env("PROM_WRITE_URL")
+  }
+  external_labels = { host = sys.env("HOST_NAME") }
+}
+
+loki.write "default" {
+  endpoint {
+    url = sys.env("LOKI_URL") + "/loki/api/v1/push"
+  }
+  external_labels = { host = sys.env("HOST_NAME") }
+}
+
+// ---------------------------------------------------------------- host + workspace metrics
+
+prometheus.exporter.unix "host" {
+  procfs_path = "/host/proc"
+  sysfs_path  = "/host/sys"
+  rootfs_path = "/host/root"
+
+  // ui/exporter.py writes workspaces.prom here every 15s
+  textfile {
+    directory = "/exporter"
+  }
+  filesystem {
+    mount_points_exclude = "^/(dev|proc|run|sys|snap|var/lib/docker/.+)($|/)"
+    fs_types_exclude     = "^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs|tmpfs)$"
+  }
+}
+
+prometheus.scrape "host" {
+  targets         = prometheus.exporter.unix.host.targets
+  scrape_interval = "15s"
+  job_name        = "host"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+// ---------------------------------------------------------------- container metrics
+
+prometheus.exporter.cadvisor "containers" {
+  docker_host      = "unix:///var/run/docker.sock"
+  docker_only      = true
+  storage_duration = "2m"
+  // container name only; no other Docker labels (env-derived ones included)
+  store_container_labels = false
+  disabled_metrics = ["advtcp", "cpuset", "hugetlb", "memory_numa", "percpu", "referenced_memory", "resctrl", "tcp", "udp", "sched", "process"]
+}
+
+prometheus.scrape "containers" {
+  targets         = prometheus.exporter.cadvisor.containers.targets
+  scrape_interval = "15s"
+  job_name        = "containers"
+  forward_to      = [prometheus.relabel.containers.receiver]
+}
+
+// aio-<workspace> containers get a workspace label
+prometheus.relabel "containers" {
+  rule {
+    source_labels = ["name"]
+    regex         = "aio-(.+)"
+    target_label  = "workspace"
+  }
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+
+// ---------------------------------------------------------------- Claude Code telemetry (OTLP)
+
+// Claude inside nono reaches this on 127.0.0.1:4318 (the profile's open_port).
+otelcol.receiver.otlp "claude" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  output {
+    metrics = [otelcol.processor.batch.claude.input]
+    logs    = [otelcol.processor.batch.claude.input]
+  }
+}
+
+otelcol.processor.batch "claude" {
+  output {
+    metrics = [otelcol.exporter.prometheus.claude.input]
+    logs    = [otelcol.exporter.otlphttp.loki.input]
+  }
+}
+
+otelcol.exporter.prometheus "claude" {
+  // workspace / service / version resource attributes become labels
+  resource_to_telemetry_conversion = true
+  forward_to                       = [prometheus.relabel.claude.receiver]
+}
+
+// Keep workspace / model / type / tool labels; drop identity and OS details.
+prometheus.relabel "claude" {
+  rule {
+    action = "labeldrop"
+    regex  = "user_.+|organization_id|os_.+|host_arch|terminal_type|service_name"
+  }
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = sys.env("LOKI_URL") + "/otlp"
+  }
+}
+
+// ---------------------------------------------------------------- container logs
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // workspace sandboxes and the monitoring stack itself
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(aio|mon)-.+"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.+)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/aio-(.+)"
+    target_label  = "workspace"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.containers.output
+  labels        = { source = "docker" }
+  relabel_rules = discovery.relabel.containers.rules
+  forward_to    = [loki.write.default.receiver]
+}
+
+// ---------------------------------------------------------------- journal
+
+loki.relabel "journal" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal__systemd_user_unit"]
+    target_label  = "user_unit"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+  rule {
+    source_labels = ["__journal__transport"]
+    target_label  = "transport"
+  }
+  rule {
+    source_labels = ["__journal_syslog_identifier"]
+    target_label  = "identifier"
+  }
+}
+
+loki.source.journal "host" {
+  path          = "/var/log/journal"
+  max_age       = "12h"
+  labels        = { source = "journal" }
+  relabel_rules = loki.relabel.journal.rules
+  forward_to    = [loki.write.default.receiver]
+}
+
+// ---------------------------------------------------------------- nono audit trail
+
+// One JSON object per line, written by ui/exporter.py: every sandbox
+// session start / end and every network connection nono allowed or denied.
+local.file_match "nono" {
+  path_targets = [{ "__path__" = "/exporter/nono-audit.ndjson" }]
+}
+
+loki.source.file "nono" {
+  targets    = local.file_match.nono.targets
+  forward_to = [loki.process.nono.receiver]
+}
+
+loki.process "nono" {
+  stage.json {
+    expressions = { ts = "", workspace = "", type = "", decision = "" }
+  }
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339Nano"
+  }
+  stage.labels {
+    values = { workspace = "", type = "", decision = "" }
+  }
+  stage.static_labels {
+    values = { source = "nono", service_name = "nono" }
+  }
+  stage.label_drop {
+    values = ["filename"]
+  }
+  forward_to = [loki.write.default.receiver]
+}

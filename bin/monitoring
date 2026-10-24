@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Monitoring for Agent Sandboxes (monitoring/compose.yaml + ui/exporter.py).
+#
+#   monitoring up        set up on first run, start the stack and the exporter
+#   monitoring down      stop both (data is kept)
+#   monitoring status    containers, exporter, Grafana URL
+#   monitoring logs [service]
+#   monitoring password  print Grafana's admin password
+#
+# Once it's set up (monitoring/.env exists), Claude sessions started from
+# then on send their telemetry to Alloy.
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+MON="$ROOT/monitoring"
+ENV_FILE="$MON/.env"
+PW_FILE="$ROOT/secrets/grafana-admin-password"
+UNIT=agent-sandboxes-exporter.service
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
+
+compose() {
+  local profile=()
+  # shellcheck disable=SC1090
+  [[ "$(source "$ENV_FILE"; echo "${MON_STACK:-1}")" == 1 ]] && profile=(--profile stack)
+  docker compose --env-file "$ENV_FILE" -f "$MON/compose.yaml" "${profile[@]}" "$@"
+}
+
+setup() {
+  umask 077
+  mkdir -p "$MON/data/grafana" "$MON/data/exporter" "$ROOT/secrets"
+  [[ -s "$PW_FILE" ]] || openssl rand -base64 18 | tr -d '\n' > "$PW_FILE"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    local ip domain
+    ip="$(ip -4 route get 192.0.2.1 2>/dev/null | grep -oP 'src \K\S+' || true)"
+    # the UI certificate's public name, if one is configured
+    domain="$(grep -v '^#' "$ROOT/ui/extra-hostnames" 2>/dev/null | grep -m1 '\.' || hostname -f)"
+    cat > "$ENV_FILE" <<CONF
+# bin/monitoring settings (docker compose --env-file). Edit, then: monitoring up
+MON_UID=$(id -u)
+MON_GID=$(id -g)
+HOST_NAME=$(hostname -s)
+# Grafana: https://GRAFANA_DOMAIN:GRAFANA_PORT/ with the UI's certificate
+GRAFANA_BIND=${ip:-127.0.0.1}
+GRAFANA_PORT=3000
+GRAFANA_DOMAIN=${domain}
+# 1 = run Prometheus, Loki and Grafana here. 0 = only Alloy, shipping to:
+MON_STACK=1
+#PROM_WRITE_URL=https://prometheus.example/api/v1/write
+#LOKI_URL=https://loki.example
+PROM_RETENTION=30d
+PROM_RETENTION_SIZE=5GB
+LOKI_RETENTION=336h
+CONF
+  fi
+  install -Dm644 "$ROOT/systemd/$UNIT" "$HOME/.config/systemd/user/$UNIT"
+  systemctl --user daemon-reload
+}
+
+url() {
+  # shellcheck disable=SC1090
+  (source "$ENV_FILE"; echo "https://${GRAFANA_DOMAIN}:${GRAFANA_PORT}/  (user admin, password: monitoring password)")
+}
+
+case "${1:-status}" in
+  up)
+    setup
+    compose up -d --remove-orphans
+    systemctl --user enable --now "$UNIT"
+    systemctl --user restart "$UNIT"
+    url
+    echo "Claude sessions started from now on report telemetry; restart running ones to include them."
+    ;;
+  down)
+    systemctl --user disable --now "$UNIT" 2>/dev/null || true
+    [[ -f "$ENV_FILE" ]] && compose down
+    ;;
+  status)
+    [[ -f "$ENV_FILE" ]] || { echo "Not set up yet: monitoring up"; exit 0; }
+    compose ps --format 'table {{.Name}}\t{{.Status}}'
+    echo "exporter: $(systemctl --user is-active "$UNIT" 2>/dev/null || true)"
+    url
+    ;;
+  logs)
+    shift; compose logs --tail 100 -f "$@"
+    ;;
+  password)
+    cat "$PW_FILE"; echo
+    ;;
+  *)
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2
+    ;;
+esac
