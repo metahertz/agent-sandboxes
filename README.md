@@ -97,7 +97,7 @@ Claude Code. Paths assume a clone at `~/agent-sandboxes` and the unit's user `me
 (uid 1000); edit the unit and `nono/claude-browser.jsonc` hook path otherwise.
 
 ```bash
-git clone <repo> ~/agent-sandboxes && cd ~/agent-sandboxes
+git clone https://github.com/metahertz/agent-sandboxes.git ~/agent-sandboxes && cd ~/agent-sandboxes
 
 nono pull nolabs-ai/claude
 mkdir -p ~/.config/nono/{profiles,hooks}
