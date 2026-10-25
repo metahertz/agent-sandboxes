@@ -648,11 +648,12 @@ async function loadPool() {
     return poolMsg(e.message, true);
   }
   renderMatrix($("#m-ssh"), "ssh", poolData.ssh, (k) => `${k.type} ${k.fingerprint} · ${k.comment}`);
-  renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => `${t.label} (${t.upstream}) → $${t.env_var}`);
+  renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => `${t.label} (${t.upstream}) → $${t.env_var}`
+    + (t.upstream.startsWith("http://") ? ` · call it via $${baseUrlVar(t.id)}` : ""));
   const sel = $("#tok-service");
   if (!sel.options.length) {
     for (const [k, v] of Object.entries(poolData.services)) sel.append(el("option", { value: k, textContent: `${v.label} → $${v.env_var}` }));
-    sel.append(el("option", { value: "custom", textContent: "Custom HTTPS API…" }));
+    sel.append(el("option", { value: "custom", textContent: "Custom HTTP(S) API…" }));
   }
 }
 
@@ -670,6 +671,9 @@ $$(".add-form [data-cancel]").forEach((b) => b.addEventListener("click", () => {
 $("#add-ssh").addEventListener("change", (ev) => {
   if (ev.target.name === "how") ev.currentTarget.elements.private_key.hidden = ev.target.value !== "import";
 });
+// nono's route for a pool token; http:// APIs can only be reached through it
+const baseUrlVar = (id) => `POOL_${id.replace(/-/g, "_").toUpperCase()}_BASE_URL`;
+
 $("#tok-service").addEventListener("change", (ev) => ($("#tok-custom").hidden = ev.target.value !== "custom"));
 
 async function submitAdd(form, path, body) {

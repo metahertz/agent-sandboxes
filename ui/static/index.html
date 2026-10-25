@@ -265,10 +265,11 @@
               <label>Service <select name="service" id="tok-service"></select></label>
             </div>
             <div class="row" id="tok-custom" hidden>
-              <label>Upstream URL <input name="upstream" placeholder="https://api.example.com"></label>
+              <label>Upstream URL <input name="upstream" placeholder="https://api.example.com or http://10.0.0.5:8080/api"></label>
               <label>Header <input name="header" placeholder="Authorization"></label>
               <label>Format <input name="format" placeholder="Bearer {}"></label>
               <label>Env var <input name="env_var" placeholder="EXAMPLE_API_KEY"></label>
+              <p class="hint">For an <code>http://</code> API, Claude calls <code>$POOL_&lt;NAME&gt;_BASE_URL</code> (e.g. <code>$POOL_GRAFANA_RO_BASE_URL/api/search</code>) instead of the real URL; the token is added on the way and travels unencrypted from this host to the API. HTTPS APIs work at their own URL too.</p>
             </div>
             <label>Token <input name="secret" type="password" required autocomplete="off"></label>
             <div class="row"><button class="btn primary" type="submit">Add</button>

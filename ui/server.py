@@ -68,6 +68,9 @@ LISTEN_PORT = int(os.environ.get("AIO_UI_PORT", "9000"))
 SANDBOX_PORTS = range(8101, 8200)
 PROXY_PORT_OFFSET = 1000          # sandbox 8101 is served to browsers on 9101
 EGRESS_PORT_OFFSET = -1000        # and its port filter (host:port allow entries) is on 7101
+# nono only injects tokens into plain-HTTP upstreams on loopback: HTTP API
+# tokens go to this bridge (127.0.0.2: loopback, but not in nono's NO_PROXY)
+HTTP_BRIDGE = ("127.0.0.2", 7100)
 
 TMUX = ["tmux", "-L", "agent-sandboxes", "-f", str(TMUX_CONF)]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
@@ -820,9 +823,14 @@ def add_token(body: dict) -> dict:
     elif service == "custom":
         c = body.get("custom", {}) or {}
         up = urllib.parse.urlsplit(str(c.get("upstream", "")).strip())
-        if up.scheme != "https" or not up.hostname or not DOMAIN_RE.match(up.hostname) \
-                or up.query or up.fragment or up.username:
-            raise ValueError("Upstream: an https:// URL (host and optional path)")
+        try:
+            if up.scheme not in ("https", "http") or not up.hostname or up.query or up.fragment \
+                    or up.username or up.password is not None:
+                raise ValueError
+            parse_net_entry(up.hostname, "", False)     # a domain or a (non-local) IP address
+            up.port
+        except ValueError:
+            raise ValueError("Upstream: an https:// or http:// URL (host, optional port and path)") from None
         header = str(c.get("header") or "Authorization").strip()
         fmt = str(c.get("format") or "Bearer {}").strip()
         env = str(c.get("env_var", "")).strip().upper()
@@ -833,7 +841,7 @@ def add_token(body: dict) -> dict:
         if not ENV_RE.match(env) or env in ("PATH", "HOME", "SSH_AUTH_SOCK") or env.startswith("NONO_"):
             raise ValueError("Environment variable: e.g. ACME_API_KEY")
         meta = {"service": "custom", "label": up.hostname,
-                "upstream": urllib.parse.urlunsplit(("https", up.netloc, up.path.rstrip("/"), "", "")),
+                "upstream": urllib.parse.urlunsplit((up.scheme, up.netloc.lower(), up.path.rstrip("/"), "", "")),
                 "inject_header": header, "credential_format": fmt, "env_var": env}
     else:
         raise ValueError("Unknown service")
@@ -959,7 +967,7 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
     for tid in pol["tokens"]:
         meta = token_meta(tid)
         creds["pool_" + tid.replace("-", "_")] = {
-            "upstream": meta["upstream"], "credential_key": f"file://{TOKEN_POOL / tid}",
+            "upstream": bridge_upstream(tid, meta["upstream"]), "credential_key": f"file://{TOKEN_POOL / tid}",
             "inject_header": meta["inject_header"], "credential_format": meta["credential_format"],
             "env_var": meta["env_var"]}
     if creds:
@@ -1966,6 +1974,105 @@ async def handle_egress(reader, w, name: str):
         w.close()
 
 
+# --------------------------------------------------------------- HTTP API bridge
+# A token for an http:// API gets the nono route http://127.0.0.2:7100/<id><path>;
+# nono adds the token and we relay to the real host. One request per
+# connection (Connection: close both ways), so nono's keep-alive can't carry a
+# request for one token on to another token's host. Only nono's proxy can
+# reach this: it's not one of the sandbox's ports.
+
+def bridge_upstream(tid: str, upstream: str) -> str:
+    if not upstream.startswith("http://"):
+        return upstream
+    host, port = HTTP_BRIDGE
+    return f"http://{host}:{port}/{tid}{urllib.parse.urlsplit(upstream).path}"
+
+
+HOP_HEADERS = {"host", "connection", "keep-alive", "proxy-connection", "expect", "upgrade", "te"}
+
+
+async def copy_body(reader, writer, headers: dict[str, str]):
+    """The request body, by Content-Length or chunked framing (and nothing after it)."""
+    if "chunked" in headers.get("transfer-encoding", "").lower():
+        while True:
+            line = await reader.readuntil(b"\r\n")
+            writer.write(line)
+            size = int(line.split(b";", 1)[0].strip() or b"0", 16)
+            if size == 0:
+                while (trailer := await reader.readuntil(b"\r\n")) != b"\r\n":
+                    writer.write(trailer)
+                writer.write(b"\r\n")
+                break
+            writer.write(await reader.readexactly(size + 2))
+            await writer.drain()
+    else:
+        left = int(headers.get("content-length") or 0)
+        while left > 0:
+            data = await reader.read(min(left, 65536))
+            if not data:
+                raise asyncio.IncompleteReadError(b"", left)
+            writer.write(data)
+            await writer.drain()
+            left -= len(data)
+    await writer.drain()
+
+
+async def handle_bridge(reader, w):
+    up_w = None
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 30)
+        lines = head[:-4].decode("latin-1").split("\r\n")
+        m = re.match(r"^([A-Z]+) /([a-z0-9][a-z0-9-]{0,39})(/[^ ]*)? HTTP/1\.[01]$", lines[0])
+        meta = token_meta(m[2]) if m else None
+        if not meta or not meta.get("upstream", "").startswith("http://"):
+            w.write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            return
+        target = urllib.parse.urlsplit(meta["upstream"])
+        headers = {}
+        out = [f"{m[1]} {m[3] or '/'} HTTP/1.1", f"Host: {target.netloc}"]
+        for line in lines[1:]:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+            if k.strip().lower() not in HOP_HEADERS:
+                out.append(line)
+        out.append("Connection: close")
+        try:
+            up_r, up_w = await egress_connect(target.hostname, target.port or 80)
+        except OSError as e:
+            w.write(f"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\nX-Bridge-Error: {e}\r\n\r\n"
+                    .encode("latin-1", "replace"))
+            return
+        if headers.get("expect", "").lower() == "100-continue":
+            w.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        up_w.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
+        await copy_body(reader, up_w, headers)
+        while True:     # skip interim 1xx responses, then rewrite the final head
+            resp = await asyncio.wait_for(up_r.readuntil(b"\r\n\r\n"), 300)
+            if not re.match(rb"HTTP/1\.[01] 1\d\d", resp):
+                break
+        rlines = resp[:-4].decode("latin-1").split("\r\n")
+        rheaders = {k.strip().lower(): v.strip() for k, _, v in (x.partition(":") for x in rlines[1:])}
+        rlines = [rlines[0]] + [x for x in rlines[1:] if x.partition(":")[0].strip().lower()
+                                not in ("connection", "keep-alive")] + ["Connection: close"]
+        w.write(("\r\n".join(rlines) + "\r\n\r\n").encode("latin-1"))
+        status = int(rlines[0].split()[1])
+        if m[1] == "HEAD" or status in (204, 304):
+            pass
+        elif "content-length" in rheaders or "chunked" in rheaders.get("transfer-encoding", "").lower():
+            await copy_body(up_r, w, rheaders)    # even if the server ignores Connection: close
+        else:
+            while data := await up_r.read(65536):
+                w.write(data)
+                await w.drain()
+        await w.drain()
+    except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
+        pass
+    finally:
+        if up_w:
+            up_w.close()
+        w.close()
+
+
 async def open_egress_filter(ws: dict[str, str]) -> str | None:
     name, port = ws["WS_NAME"], egress_port(ws)
     try:
@@ -2041,6 +2148,10 @@ async def main():
                for addr in BIND]
     for ws in all_ws():
         await open_sandbox_listener(ws)
+    try:
+        servers.append(await asyncio.start_server(handle_bridge, *HTTP_BRIDGE, limit=MAX_HEAD))
+    except OSError as e:
+        print(f"HTTP API bridge not running on {HTTP_BRIDGE[0]}:{HTTP_BRIDGE[1]}: {e.strerror}", flush=True)
     drop_ambient_caps()
     for addr in BIND:
         print(f"Agent Sandboxes UI on {SCHEME}://{addr}:{LISTEN_PORT}/", flush=True)

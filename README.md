@@ -124,8 +124,11 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   keys, API tokens, network allowlist, memory/process limits) · *Files* (browse/download
   from the container) · *Logs*.
 - **Keys & tokens** (sidebar): generate or import SSH keys (copy the public key into
-  GitHub etc.), add API tokens (GitHub, GitLab, OpenAI, Gemini, or any HTTPS API), and tick
-  which workspaces get each. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
+  GitHub etc.), add API tokens (GitHub, GitLab, OpenAI, Gemini, or any HTTP(S) API), and tick
+  which workspaces get each. nono only injects tokens into plain HTTP on loopback, so an
+  `http://` API's route goes to the UI server's bridge on `127.0.0.2:7100`, which relays to
+  the real host (one request per connection, so nono's keep-alive can't mix tokens). Claude
+  calls it via `$POOL_<NAME>_BASE_URL`; the token crosses the network unencrypted. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
 - **Network allowlist** (*Access* tab): domains, `*.domain` wildcards and IP addresses
