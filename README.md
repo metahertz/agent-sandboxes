@@ -128,6 +128,16 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   which workspaces get each. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+- **Network allowlist** (*Access* tab): domains, `*.domain` wildcards and IP addresses
+  (IPv4, or IPv6 in canonical form; no CIDR ranges: nono's proxy matches hosts only).
+  An allowed host is reachable on every port. `host:port` or `host:lo-hi` (`[v6]:port`)
+  limits it to those ports: nono can't filter ports, so a workspace with such entries
+  gets the UI server's port filter (`127.0.0.1:<sandbox port − 1000>`) as nono's
+  `upstream_proxy`. nono checks the host first and the filter then checks the port, and
+  port changes apply without a restart. While the UI server is down, such workspaces
+  have no outbound network. Loopback, `0.0.0.0` and link-local addresses are refused,
+  including names that resolve to them. Only programs that use `HTTPS_PROXY` (or, for
+  SSH, `ssh-proxy-connect`) get out; raw TCP clients such as `psql` stay blocked.
 - **Import** (sidebar): projects from other machines, with their Claude Code history.
   See [Importing projects](#importing-projects).
 - **Remote terminal** (*Access* tab): SSH keys that reach one workspace only. See

@@ -26,6 +26,7 @@ import ctypes
 import fcntl
 import hashlib
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -66,6 +67,7 @@ PROJECTS_BASE = Path(os.environ.get("AIO_PROJECTS", Path.home() / "projects"))
 LISTEN_PORT = int(os.environ.get("AIO_UI_PORT", "9000"))
 SANDBOX_PORTS = range(8101, 8200)
 PROXY_PORT_OFFSET = 1000          # sandbox 8101 is served to browsers on 9101
+EGRESS_PORT_OFFSET = -1000        # and its port filter (host:port allow entries) is on 7101
 
 TMUX = ["tmux", "-L", "agent-sandboxes", "-f", str(TMUX_CONF)]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
@@ -88,6 +90,7 @@ USER_GID = pwd.getpwuid(os.getuid()).pw_gid
 TOKEN = ""
 CAP_SALT = secrets.token_hex(16)   # sandbox links stop working when the server restarts
 sandbox_listeners: dict[str, list[asyncio.Server]] = {}
+egress_listeners: dict[str, asyncio.Server] = {}
 
 
 # --------------------------------------------------------------- helpers
@@ -637,6 +640,56 @@ def clean_list(v, pattern: re.Pattern, what: str, limit: int = 100) -> list[str]
     return out
 
 
+def unsafe_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """This host (loopback / 0.0.0.0) or link-local (cloud metadata): never a
+    network destination. Loopback is open_port's job."""
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip.is_loopback or ip.is_unspecified or ip.is_link_local or ip.is_multicast
+
+
+def parse_net_entry(x: str, what: str, ports_ok: bool) -> tuple[str, int, int]:
+    """'host', '*.host', an IPv4 / IPv6 address, each optionally ':port' or
+    ':lo-hi' (IPv6 then in brackets). Returns (host, lo, hi), ports 0 = any."""
+    x = x.strip().lower()
+    lo = hi = 0
+    if "://" in x:
+        raise ValueError(f"{what}: just the host, not a URL ({x!r})")
+    m = re.match(r"^\[([0-9a-f:.]+)\](?::(.*))?$", x) or (
+        re.match(r"^([^:]+):(.*)$", x) if x.count(":") == 1 else None)
+    host, port = (m[1], m[2]) if m else (x, None)
+    if port is not None:
+        if not ports_ok:
+            raise ValueError(f"{what}: no ports here, just the host ({x!r})")
+        pm = re.match(r"^([0-9]{1,5})(?:-([0-9]{1,5}))?$", port)
+        lo, hi = (int(pm[1]), int(pm[2] or pm[1])) if pm else (0, 0)
+        if not (pm and 1 <= lo <= hi <= 65535):
+            raise ValueError(f"{what}: bad port in {x!r} (a port, or a range like 8000-8100)")
+    if "/" in host:
+        raise ValueError(f"{what}: {x!r}: nono's proxy can't match address ranges; list each address")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if not DOMAIN_RE.match(host):
+            raise ValueError(f"{what}: invalid entry {x!r}") from None
+    else:
+        if unsafe_ip(ip):
+            raise ValueError(f"{what}: {x!r} is this host or link-local; use the workspace's own ports instead")
+        host = ip.compressed      # the proxy matches IPv6 in canonical form only
+    return host, lo, hi
+
+
+def format_net_entry(host: str, lo: int, hi: int) -> str:
+    if not lo:
+        return host
+    return f"{f'[{host}]' if ':' in host else host}:{lo}" + (f"-{hi}" if hi != lo else "")
+
+
+def clean_net_list(v, what: str, ports_ok: bool) -> list[str]:
+    out = [format_net_entry(*parse_net_entry(x, what, ports_ok))
+           for x in clean_list(v, re.compile(r"^\S+$"), what)]
+    return list(dict.fromkeys(out))
+
+
 def validate_policy(body: dict) -> dict:
     pol = json.loads(json.dumps(DEFAULT_POLICY))
     pol["ssh_keys"] = clean_list(body.get("ssh_keys", []), ITEM_RE, "SSH keys")
@@ -656,8 +709,8 @@ def validate_policy(body: dict) -> dict:
     if net.get("mode", "claude-code") not in NET_MODES:
         raise ValueError("Unknown network mode")
     pol["network"] = {"mode": net.get("mode", "claude-code"),
-                      "allow": clean_list(net.get("allow", []), DOMAIN_RE, "Allowed domains"),
-                      "deny": clean_list(net.get("deny", []), DOMAIN_RE, "Blocked domains")}
+                      "allow": clean_net_list(net.get("allow", []), "Allowed hosts", ports_ok=True),
+                      "deny": clean_net_list(net.get("deny", []), "Blocked hosts", ports_ok=False)}
     lim = body.get("limits", {}) or {}
     mem = str(lim.get("memory", "") or "").strip().upper()
     if mem and not MEM_RE.match(mem):
@@ -893,8 +946,13 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
     net: dict = {"open_port": [int(ws["WS_PORT"])] + ([OTLP_PORT] if telemetry else [])}
     mode = pol["network"]["mode"]
     net["network_profile"] = None if mode == "open" else mode
-    if pol["network"]["allow"]:
-        net["allow_domain"] = pol["network"]["allow"]
+    allow = [parse_net_entry(x, "", True) for x in pol["network"]["allow"]]
+    if allow:
+        net["allow_domain"] = list(dict.fromkeys(h for h, _, _ in allow))
+        if any(lo for _, lo, _ in allow):
+            # nono's proxy matches hosts only; it hands what it allowed to our
+            # port filter, which enforces the host:port entries
+            net["upstream_proxy"] = f"127.0.0.1:{egress_port(ws)}"
     if pol["network"]["deny"]:
         net["deny_domain"] = pol["network"]["deny"]
     creds = {}
@@ -1802,6 +1860,7 @@ async def resolve_bind() -> list[str]:
 async def open_sandbox_listener(ws: dict[str, str]) -> str | None:
     name = ws["WS_NAME"]
     port = int(ws["WS_PORT"]) + PROXY_PORT_OFFSET
+    egress_err = await open_egress_filter(ws)
     servers = []
     try:
         for addr in BIND:
@@ -1815,12 +1874,108 @@ async def open_sandbox_listener(ws: dict[str, str]) -> str | None:
         print(msg, flush=True)
         return msg
     sandbox_listeners[name] = servers
-    return None
+    return egress_err
 
 
 def close_sandbox_listener(name: str):
     for s in sandbox_listeners.pop(name, []):
         s.close()
+    if s := egress_listeners.pop(name, None):
+        s.close()
+
+
+# --------------------------------------------------------------- egress port filter
+# nono's proxy allowlists hosts but not ports. When a workspace has host:port
+# allow entries its profile sets this as nono's upstream_proxy: nono checks
+# the host as usual, then sends us "CONNECT host:port" (plain HTTP too), and
+# we refuse ports those entries don't list. Only nono's proxy can reach this
+# listener: the sandbox may connect to its own open_port and the proxy alone.
+
+def egress_port(ws: dict[str, str]) -> int:
+    return int(ws["WS_PORT"]) + EGRESS_PORT_OFFSET
+
+
+def host_matches(pattern: str, host: str) -> bool:
+    return host == pattern or pattern.startswith("*.") and host.endswith(pattern[1:])
+
+
+def egress_allowed(name: str, host: str, port: int) -> bool:
+    """Entries naming this exact host decide, else wildcard ones; one without
+    a port allows any (nono already allowed the host itself)."""
+    entries = [parse_net_entry(x, "", True) for x in load_policy(name)["network"]["allow"]]
+    hits = [e for e in entries if e[0] == host] or [e for e in entries if host_matches(e[0], host)]
+    return not hits or any(not lo or lo <= port <= hi for _, lo, hi in hits)
+
+
+async def egress_connect(host: str, port: int):
+    """Like nono, never this host or link-local, also when a name resolves there."""
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    addrs = [i for i in infos if not unsafe_ip(ipaddress.ip_address(i[4][0].split("%")[0]))]
+    if not addrs:
+        raise OSError(f"{host} resolves to this host or link-local only")
+    err = None
+    for family, _, _, _, sockaddr in addrs:
+        try:
+            return await asyncio.wait_for(asyncio.open_connection(sockaddr[0], port), 15)
+        except (OSError, asyncio.TimeoutError) as e:
+            err = e
+    raise OSError(str(err))
+
+
+async def handle_egress(reader, w, name: str):
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
+        m = re.match(rb"CONNECT (\S+):([0-9]{1,5}) HTTP/1\.[01]\r\n", head)
+        if not m:
+            w.write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+            return
+        host, port = m[1].decode("latin-1").strip("[]").lower(), int(m[2])
+        try:
+            host = ipaddress.ip_address(host).compressed
+        except ValueError:
+            pass
+        if not egress_allowed(name, host, port):
+            print(f"egress: {name}: denied {host}:{port} (port not allowed)", flush=True)
+            w.write(f"HTTP/1.1 403 Forbidden: port {port} is not allowed for {host}\r\n\r\n".encode())
+            return
+        try:
+            up_r, up_w = await egress_connect(host, port)
+        except OSError as e:
+            w.write(f"HTTP/1.1 502 Bad Gateway: {e}\r\n\r\n".encode("latin-1", "replace"))
+            return
+        w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await w.drain()
+
+        async def pump(src, dst):
+            try:
+                while data := await src.read(65536):
+                    dst.write(data)
+                    await dst.drain()
+                if dst.can_write_eof():
+                    dst.write_eof()
+            except OSError:
+                pass
+
+        try:
+            await asyncio.gather(pump(reader, up_w), pump(up_r, w))
+        finally:
+            up_w.close()
+    except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
+        pass
+    finally:
+        w.close()
+
+
+async def open_egress_filter(ws: dict[str, str]) -> str | None:
+    name, port = ws["WS_NAME"], egress_port(ws)
+    try:
+        egress_listeners[name] = await asyncio.start_server(
+            lambda r, w: handle_egress(r, w, name), "127.0.0.1", port, limit=MAX_HEAD)
+    except OSError as e:
+        msg = f"Can't run the port filter for '{name}' on 127.0.0.1:{port}: {e.strerror}"
+        print(msg, flush=True)
+        return msg
+    return None
 
 
 async def refresh_cert():

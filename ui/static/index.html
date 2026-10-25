@@ -162,12 +162,12 @@
           </section>
           <section class="card">
             <h2>Network</h2>
-            <p class="hint">Outbound traffic from Claude and everything it runs passes through nono's filtering proxy. Restart Claude to apply.</p>
+            <p class="hint">Outbound traffic from Claude and everything it runs passes through nono's filtering proxy. An allowed host is reachable on any port, unless you list it with ports: then only those (port changes apply at once, the rest when Claude restarts). Programs that ignore <code>HTTPS_PROXY</code> (database clients, for example) can't connect; SSH and git are set up to use it. Restart Claude to apply.</p>
             <div class="radios" id="acc-net"></div>
             <div class="two">
-              <label>Also allow <span class="muted">(one domain per line, <code>*.example.com</code> ok)</span>
-                <textarea name="allow" rows="4" spellcheck="false" placeholder="git.example.com"></textarea></label>
-              <label>Block <span class="muted">(wins over everything else)</span>
+              <label>Also allow <span class="muted">(one per line: a domain, <code>*.example.com</code>, or an IP address; <code>:443</code> or <code>:8000-8100</code> limits the ports, <code>[…]:22</code> for IPv6)</span>
+                <textarea name="allow" rows="4" spellcheck="false" placeholder="git.example.com&#10;10.0.0.5:5432"></textarea></label>
+              <label>Block <span class="muted">(hosts or IP addresses; wins over everything else)</span>
                 <textarea name="deny" rows="4" spellcheck="false" placeholder="pastebin.com"></textarea></label>
             </div>
           </section>
