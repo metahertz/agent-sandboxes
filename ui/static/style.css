@@ -192,6 +192,7 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 
 /* settings */
 #ca-fp { overflow-wrap: anywhere; }
+#md-text { width: 100%; resize: vertical; }
 .card h3 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
 .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .three label, #mon-form .card > label:not(.check) { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; font-weight: 550; }

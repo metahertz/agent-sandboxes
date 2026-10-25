@@ -50,6 +50,9 @@ WS_ROOT = ROOT / "workspaces"
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
 CLAUDE_IN = ROOT / "bin" / "claude-in"
 MCP_TEMPLATE = ROOT / "mcp.json.template"
+CLAUDE_MD_DEFAULT = ROOT / "ui" / "claude-md-additions.md"   # sandbox notes for workspaces' CLAUDE.md
+CLAUDE_MD_CUSTOM = ROOT / "state" / "claude-md-additions.md"  # the Settings page's edited copy
+CONTAINER_WORKSPACE = "/home/gem/workspace"                     # the project inside the AIO container
 STATIC = ROOT / "ui" / "static"
 TOKEN_FILE = ROOT / "ui" / "token"
 TLS_DIR = ROOT / "ui" / "tls"
@@ -573,7 +576,7 @@ TOKEN_SERVICES = {
     "gemini": {"label": "Gemini API", "upstream": "https://generativelanguage.googleapis.com",
                "inject_header": "x-goog-api-key", "credential_format": "{}", "env_var": "GEMINI_API_KEY"},
 }
-DEFAULT_POLICY = {"ssh_keys": [], "tokens": [],
+DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False,
                   "network": {"mode": "claude-code", "allow": [], "deny": []},
                   "limits": {"memory": "", "pids": 0}}
 
@@ -621,6 +624,7 @@ def load_policy(name: str) -> dict:
             i if k == "ssh_keys" else f"{i}.json").is_file()]
     pol["network"].update(saved.get("network", {}))
     pol["limits"].update(saved.get("limits", {}))
+    pol["claude_md"] = saved.get("claude_md") is True
     return pol
 
 
@@ -725,6 +729,7 @@ def validate_policy(body: dict) -> dict:
     if not 0 <= pids <= 100000 or 0 < pids < 32:
         raise ValueError("Max processes: 0 (no limit) or 32–100000")
     pol["limits"] = {"memory": mem, "pids": pids}
+    pol["claude_md"] = body.get("claude_md") is True
     return pol
 
 
@@ -1029,7 +1034,132 @@ async def prepare(name: str, aux: bool = False) -> dict:
     write_ssh_config(name)
     target = aux_profile_path(name) if aux else profile_path(name)
     private_write(target, profile_text(ws))
-    return {"profile": str(target), **load_policy(name)["limits"]}
+    prompt = ""
+    if not aux:
+        try:
+            sync_claude_md(ws)
+        except (OSError, ValueError) as e:
+            print(f"CLAUDE.md not updated: {e}", file=sys.stderr)
+        prompt = session_prompt(ws, load_policy(name))
+    return {"profile": str(target), "prompt": prompt, **load_policy(name)["limits"]}
+
+
+# ---- sandbox notes for Claude: CLAUDE.md block (opt-in per workspace) and,
+# always when it has tokens, an --append-system-prompt naming their base URLs
+
+MD_BEGIN = "<!-- agent-sandboxes:begin (managed: edit under Settings in the web UI; changes here are replaced) -->"
+MD_END = "<!-- agent-sandboxes:end -->"
+MD_TAG = "This is running agent-sandboxes from github.com/metahertz/agent-sandboxes"   # always first in the block
+
+
+def claude_md_template() -> tuple[str, bool]:
+    try:
+        return CLAUDE_MD_CUSTOM.read_text(), True
+    except OSError:
+        return CLAUDE_MD_DEFAULT.read_text(), False
+
+
+def base_url_var(tid: str) -> str:
+    """The variable nono sets for the token's route (service pool_<id>)."""
+    return f"POOL_{tid.replace('-', '_').upper()}_BASE_URL"
+
+
+def token_lines(pol: dict) -> str:
+    out = []
+    for tid in pol["tokens"]:
+        if not (meta := token_meta(tid)):
+            continue
+        env, var = meta["env_var"], base_url_var(tid)
+        header = f"{meta['inject_header']}: {meta['credential_format'].replace('{}', '$' + env)}"
+        if meta["upstream"].startswith("http://"):
+            how = (f"call **`${var}`** plus the path, never `{meta['upstream']}` itself "
+                   "(plain HTTP: the real token is only added on that route)")
+        else:
+            how = f"call `{meta['upstream']}` or `${var}`, plus the path"
+        out.append(f"- `${env}` ({tid}) for {meta['upstream']}: {how}, with the header `{header}`.")
+    return "\n".join(out) or "- No API tokens are assigned to this workspace."
+
+
+def network_summary(pol: dict) -> str:
+    net = pol["network"]
+    if net["mode"] == "open":
+        text = "the whole internet"
+    else:
+        text = NET_MODES[net["mode"]].removesuffix(" (default)")
+        if net["allow"]:
+            text += ", plus " + ", ".join(f"`{x}`" for x in net["allow"])
+    if net["deny"]:
+        text += "; blocked: " + ", ".join(f"`{x}`" for x in net["deny"])
+    return text
+
+
+def render_claude_md(ws: dict[str, str], pol: dict) -> str:
+    values = {"workspace": ws["WS_NAME"], "project_dir": ws["WS_DIR"], "container_dir": CONTAINER_WORKSPACE,
+              "network": network_summary(pol), "tokens": token_lines(pol)}
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m[1], m[0]), claude_md_template()[0])
+
+
+def session_prompt(ws: dict[str, str], pol: dict) -> str:
+    if not pol["tokens"]:
+        return ""
+    return (f"This session runs in the agent-sandboxes workspace {ws['WS_NAME']}, inside a nono sandbox. "
+            "API token variables hold placeholders; nono's proxy swaps in the real token only on requests "
+            "that carry the placeholder, and for plain-HTTP APIs only via the base URL variable. "
+            "Never ask the user for a real token.\n" + token_lines(pol))
+
+
+def sync_claude_md(ws: dict[str, str]):
+    """Add, refresh or remove the managed block at the end of the project's CLAUDE.md."""
+    path = Path(ws["WS_DIR"]) / "CLAUDE.md"
+    if path.is_symlink():
+        raise ValueError(f"{path} is a symlink; not writing through it")
+    try:
+        old = path.read_text()
+    except FileNotFoundError:
+        old = None
+    rest = re.sub(rf"\n*{re.escape(MD_BEGIN)}.*?{re.escape(MD_END)}\n?", "\n", old or "", flags=re.S).rstrip()
+    pol = load_policy(ws["WS_NAME"])
+    if pol["claude_md"]:
+        block = f"{MD_BEGIN}\n{MD_TAG}\n\n{render_claude_md(ws, pol).strip()}\n{MD_END}\n"
+        new = f"{rest}\n\n{block}" if rest else block
+    else:
+        new = f"{rest}\n" if rest else ""
+    if new == (old or ""):
+        return
+    if not new and old is not None and MD_BEGIN in old:
+        path.unlink()      # only our block was in it
+    elif new:
+        path.write_text(new)
+
+
+async def claude_md_api(req: Request, w):
+    if req.method == "PUT":
+        try:
+            text = str(json.loads(req.body or b"{}").get("text", ""))
+        except json.JSONDecodeError:
+            return await send_json(w, {"error": "Bad JSON"}, 400)
+        if len(text) > 32768 or "\0" in text:
+            return await send_json(w, {"error": "At most 32 KB of text"}, 400)
+        if MD_BEGIN in text or MD_END in text:
+            return await send_json(w, {"error": "The text can't contain the agent-sandboxes markers"}, 400)
+        CLAUDE_MD_CUSTOM.parent.mkdir(exist_ok=True)
+        CLAUDE_MD_CUSTOM.write_text(text.replace("\r\n", "\n").rstrip() + "\n")
+    elif req.method == "DELETE":
+        CLAUDE_MD_CUSTOM.unlink(missing_ok=True)
+    elif req.method != "GET":
+        return await respond(w, 405, "Method not allowed\n")
+    enabled, errors = [], []
+    for ws in all_ws():
+        if load_policy(ws["WS_NAME"])["claude_md"]:
+            enabled.append(ws["WS_NAME"])
+            if req.method != "GET":
+                try:
+                    sync_claude_md(ws)
+                except (OSError, ValueError) as e:
+                    errors.append(f"{ws['WS_NAME']}: {e}")
+    text, custom = claude_md_template()
+    return await send_json(w, {"text": text, "custom": custom, "default": CLAUDE_MD_DEFAULT.read_text(),
+                               "enabled": enabled, "errors": errors})
 
 
 def policy_pending(ws: dict[str, str]) -> bool:
@@ -1051,6 +1181,10 @@ async def policy_api(ws: dict[str, str], req: Request, w):
         save_policy(name, pol)
         if old["ssh_keys"] != pol["ssh_keys"]:
             await sync_agent(name)
+        try:
+            sync_claude_md(ws)
+        except (OSError, ValueError) as e:
+            return await send_json(w, {"error": f"Saved, but CLAUDE.md: {e}"}, 500)
     rc, out, _ = await run(*TMUX, "list-panes", "-t", f"cl-{name}", "-F", "#{pane_dead}")
     running = rc == 0 and "0" in out.split()
     return await send_json(w, {"policy": load_policy(name), "pending": running and policy_pending(ws)})
@@ -1552,6 +1686,8 @@ async def settings_api(req: Request, parts: list[str], w):
         log = (out + err).strip()[-6000:]
         return await send_json(w, {**await monitoring_status(), "ok": rc == 0, "log": log},
                                200 if rc == 0 else 500)
+    if parts == ["claude-md"]:
+        return await claude_md_api(req, w)
     if parts == ["monitoring", "password"] and m == "GET":
         try:
             return await send_json(w, {"password": (SECRETS / "grafana-admin-password").read_text().strip()})
@@ -2164,6 +2300,7 @@ def cli_prepare(name: str, aux: bool = False):
     print(f"WS_PROFILE={shlex.quote(info['profile'])}")
     print(f"WS_MEMORY={shlex.quote(info['memory'])}")
     print(f"WS_PIDS={int(info['pids'])}")
+    print(f"WS_PROMPT={shlex.quote(info['prompt'])}")
 
 
 if __name__ == "__main__":

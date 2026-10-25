@@ -29,7 +29,7 @@ fi
 
 # Loads the agent's SSH keys and writes workspaces/<name>.profile.json
 # (.aux-profile.json for --shell / --exec);
-# sets WS_PROFILE, WS_MEMORY, WS_PIDS.
+# sets WS_PROFILE, WS_MEMORY, WS_PIDS, and WS_PROMPT (how to use its API tokens).
 aux=(); [[ $mode == claude ]] || aux=(--aux)   # don't overwrite what Claude started with
 eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${aux[@]}")"
 
@@ -38,7 +38,7 @@ cmd=(nono run --profile "$WS_PROFILE" --allow-cwd)
 [[ -n "$WS_MEMORY" ]] && cmd+=(--memory "$WS_MEMORY")
 [[ "$WS_PIDS" != 0 ]] && cmd+=(--max-processes "$WS_PIDS")
 case $mode in
-  claude) cmd+=(-- claude "$@"); unit="claude-$name-$$" ;;
+  claude) cmd+=(-- claude ${WS_PROMPT:+--append-system-prompt "$WS_PROMPT"} "$@"); unit="claude-$name-$$" ;;
   shell)  cmd+=(-- bash -l); unit="shell-$name-$$" ;;
   exec)   cmd+=(-- sh -c "${1:?--exec needs a command}"); unit="exec-$name-$$" ;;
 esac

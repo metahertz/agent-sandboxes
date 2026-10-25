@@ -131,6 +131,13 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   calls it via `$POOL_<NAME>_BASE_URL`; the token crosses the network unencrypted. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+- **Notes for Claude:** Claude is started with `--append-system-prompt` naming each of the
+  workspace's API tokens and how to call it (for `http://` APIs: `$POOL_<NAME>_BASE_URL`
+  only). Ticking *Notes for Claude* (*Access* tab) also keeps a marked block at the end of
+  the project's `CLAUDE.md`, rendered from `ui/claude-md-additions.md` (edited copy under
+  *Settings*, saved to `state/claude-md-additions.md`): what nono allows, how the
+  aio-sandbox MCP container differs (other paths, unfiltered network, no keys), with
+  the workspace's allowlist and tokens filled in. Refreshed at every Claude start.
 - **Network allowlist** (*Access* tab): domains, `*.domain` wildcards and IP addresses
   (IPv4, or IPv6 in canonical form; no CIDR ranges: nono's proxy matches hosts only).
   An allowed host is reachable on every port. `host:port` or `host:lo-hi` (`[v6]:port`)

@@ -180,6 +180,11 @@
             </div>
           </section>
           <section class="card">
+            <h2>Notes for Claude</h2>
+            <label class="check"><input type="checkbox" name="claude_md"> <span>Keep the sandbox notes in this project's <code>CLAUDE.md</code> <span class="muted">(edit them under Settings)</span></span></label>
+            <p class="hint">A marked block at the end of the file, refreshed whenever Claude starts and removed when you untick this; the rest of the file is left alone. It's part of the project, so it shows up in git. Whether or not this is on, Claude is told at startup how to call this workspace's API tokens.</p>
+          </section>
+          <section class="card">
             <h2>Remote terminal (SSH)</h2>
             <p class="hint">Keys added here log in to this workspace only: its Claude session, or a shell and file transfer inside the same nono sandbox as Claude. They apply immediately. Use a key that isn't already allowed to log in to this host.</p>
             <div class="keylist" id="acc-ssh-access"></div>
@@ -380,6 +385,21 @@
           <p class="form-msg" id="mon-msg" role="status"></p>
         </div>
         <details class="mon-log" id="mon-log-wrap" hidden><summary>Output</summary><pre id="mon-log"></pre></details>
+      </form>
+
+      <form id="md-form" class="pool-body access">
+        <section class="card">
+          <div class="card-head"><h2>Sandbox notes for CLAUDE.md</h2>
+            <span class="pill" id="md-state"></span></div>
+          <p class="hint">Explains the nono sandbox and the aio-sandbox MCP container to Claude. Workspaces with <em>Notes for Claude</em> ticked (Access tab) get this as a block at the end of their <code>CLAUDE.md</code>, after the line “This is running agent-sandboxes from github.com/metahertz/agent-sandboxes”; saving updates them all. Placeholders filled in per workspace: <code>{{workspace}}</code> <code>{{project_dir}}</code> <code>{{container_dir}}</code> <code>{{network}}</code> (its allowlist) <code>{{tokens}}</code> (its tokens and how to call them).</p>
+          <textarea name="text" id="md-text" rows="22" spellcheck="false"></textarea>
+          <p class="hint" id="md-enabled"></p>
+        </section>
+        <div class="row">
+          <button class="btn primary" type="submit">Save</button>
+          <button class="btn ghost" type="button" id="md-reset">Reset to default</button>
+          <p class="form-msg" id="md-msg" role="status"></p>
+        </div>
       </form>
     </section>
   </main>

@@ -545,6 +545,7 @@ async function loadAccess() {
     form.elements.deny.value = policy.network.deny.join("\n");
     form.elements.memory.value = policy.limits.memory;
     form.elements.pids.value = policy.limits.pids || "";
+    form.elements.claude_md.checked = policy.claude_md;
     $("#acc-restart").hidden = w.claude === "stopped";
     loadWsSshAccess(w);
   } catch (e) {
@@ -563,6 +564,7 @@ async function saveAccess(restart) {
     tokens: $$('input[name="token"]:checked', form).map((i) => i.value),
     network: { mode: form.elements.mode?.value || "claude-code", allow: lines(form.elements.allow.value), deny: lines(form.elements.deny.value) },
     limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0) },
+    claude_md: form.elements.claude_md.checked,
   };
   out.textContent = "Saving…";
   try {
@@ -900,6 +902,7 @@ function fillMonForm(st) {
 async function loadSettings() {
   try {
     const st = await api("GET", "settings/monitoring");
+    loadClaudeMd();
     renderMonStatus(st);
     fillMonForm(st);
     $("#ca-card").hidden = !st.caFingerprint;
@@ -908,6 +911,37 @@ async function loadSettings() {
     monMsg(e.message, true);
   }
 }
+
+// sandbox notes appended to workspaces' CLAUDE.md
+function showClaudeMd(res, msg) {
+  $("#md-text").value = res.text;
+  $("#md-state").textContent = res.custom ? "edited" : "default";
+  $("#md-reset").disabled = !res.custom;
+  $("#md-enabled").textContent = res.enabled.length
+    ? `In the CLAUDE.md of: ${res.enabled.join(", ")}.` : "No workspace has Notes for Claude ticked yet.";
+  $("#md-msg").textContent = res.errors?.length ? `${msg} Not updated: ${res.errors.join("; ")}` : msg;
+  $("#md-msg").classList.toggle("err", !!res.errors?.length);
+}
+
+async function loadClaudeMd() {
+  try { showClaudeMd(await api("GET", "settings/claude-md"), ""); } catch (e) { $("#md-msg").textContent = e.message; }
+}
+
+async function saveClaudeMd(reset) {
+  if (reset && !confirm("Replace your edited notes with the default?")) return;
+  $("#md-msg").classList.remove("err");
+  $("#md-msg").textContent = "Saving…";
+  try {
+    const res = reset ? await api("DELETE", "settings/claude-md")
+      : await api("PUT", "settings/claude-md", { text: $("#md-text").value });
+    showClaudeMd(res, res.enabled.length ? "Saved; those workspaces' CLAUDE.md updated." : "Saved.");
+  } catch (e) {
+    $("#md-msg").textContent = e.message;
+    $("#md-msg").classList.add("err");
+  }
+}
+$("#md-form").addEventListener("submit", (ev) => { ev.preventDefault(); saveClaudeMd(false); });
+$("#md-reset").addEventListener("click", () => saveClaudeMd(true));
 
 function monValues() {
   const f = $("#mon-form").elements;
