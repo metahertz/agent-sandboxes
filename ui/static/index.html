@@ -317,10 +317,16 @@
     <section id="settings" class="pool" hidden>
       <header class="detail-head"><div class="title">
         <h1>Settings</h1>
-        <p class="meta">Stored in ~/agent-sandboxes/monitoring/.env, which <code>bin/monitoring</code> uses too.</p>
+        <p class="meta">Monitoring settings are stored in ~/agent-sandboxes/monitoring/.env, which <code>bin/monitoring</code> uses too.</p>
       </div></header>
 
       <form id="mon-form" class="pool-body access">
+        <section class="card" id="ca-card" hidden>
+          <div class="card-head"><h2>HTTPS certificate</h2>
+            <a class="btn" href="/ca.crt" download="agent-sandboxes-ca.crt">Download CA certificate</a></div>
+          <p class="hint">This UI and the local Grafana use a certificate from this host's own CA. Add it to your browser's or system's trusted roots to stop the warnings. Before trusting it, check its SHA-256 fingerprint: <code id="ca-fp"></code></p>
+        </section>
+
         <section class="card">
           <div class="card-head"><h2>Monitoring</h2>
             <a class="btn" id="mon-open" target="_blank" rel="noopener noreferrer" hidden>Open dashboards ↗</a></div>

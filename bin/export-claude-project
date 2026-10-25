@@ -134,7 +134,10 @@ def build_history(project, paths, staging, args):
 def rsync(src, dest, args, extra=()):
     ssh = ["ssh"]
     if args.identity:
-        ssh += ["-i", args.identity]
+        # only this key: otherwise ssh offers the agent's / default keys first, and one
+        # that is a normal login on the host wins (the upload lands in ~ not the inbox)
+        key = args.identity[:-4] if args.identity.endswith(".pub") else args.identity
+        ssh += ["-i", key, "-o", "IdentitiesOnly=yes"]
     if args.port:
         ssh += ["-p", str(args.port)]
     cmd = ["rsync", "-a", "--partial", "-e", " ".join(ssh)] + list(extra) + [src, dest]

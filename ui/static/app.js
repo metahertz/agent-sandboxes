@@ -898,6 +898,8 @@ async function loadSettings() {
     const st = await api("GET", "settings/monitoring");
     renderMonStatus(st);
     fillMonForm(st);
+    $("#ca-card").hidden = !st.caFingerprint;
+    $("#ca-fp").textContent = st.caFingerprint || "";
   } catch (e) {
     monMsg(e.message, true);
   }

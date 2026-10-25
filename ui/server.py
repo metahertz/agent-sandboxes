@@ -79,6 +79,7 @@ UI_HOSTNAMES = {"localhost", "127.0.0.1"}   # extended at startup with bind IPs 
 BIND: list[str] = []
 TLS_CTX: ssl.SSLContext | None = None        # set at startup unless AIO_UI_TLS=0
 SCHEME, WS_SCHEME = "http", "ws"
+CA_FINGERPRINT = ""                          # SHA-256 of ui/tls/ca.crt, when TLS is on
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HEAD = 64 * 1024
 MAX_BODY = 1024 * 1024
@@ -1457,7 +1458,8 @@ async def monitoring_status() -> dict:
     except OSError:
         age = None
     return {"configured": MONITORING_ENV.is_file(), "services": services, "exporterAge": age,
-            "settings": monitoring_settings(), "telemetry": telemetry_enabled()}
+            "settings": monitoring_settings(), "telemetry": telemetry_enabled(),
+            "caFingerprint": CA_FINGERPRINT}
 
 
 async def settings_api(req: Request, parts: list[str], w):
@@ -1859,7 +1861,7 @@ def make_tls_context() -> ssl.SSLContext:
 
 
 async def main():
-    global TOKEN, BIND, TLS_CTX, SCHEME, WS_SCHEME
+    global TOKEN, BIND, TLS_CTX, SCHEME, WS_SCHEME, CA_FINGERPRINT
     TOKEN = TOKEN_FILE.read_text().strip()
     ensure_dirs()
     BIND = await resolve_bind()
@@ -1876,6 +1878,7 @@ async def main():
         SCHEME, WS_SCHEME = "https", "wss"
         fp = (await run("openssl", "x509", "-in", str(TLS_DIR / "ca.crt"), "-noout",
                         "-fingerprint", "-sha256"))[1].strip()
+        CA_FINGERPRINT = fp.partition("=")[2]
         print(f"TLS on; CA {TLS_DIR / 'ca.crt'} ({fp})", flush=True)
 
     servers = [await asyncio.start_server(handle, addr, LISTEN_PORT, limit=MAX_HEAD, ssl=TLS_CTX,

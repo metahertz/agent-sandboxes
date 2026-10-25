@@ -191,6 +191,7 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--sunken); color: var(--muted); word-break: break-all; }
 
 /* settings */
+#ca-fp { overflow-wrap: anywhere; }
 .card h3 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
 .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .three label, #mon-form .card > label:not(.check) { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; font-weight: 550; }
