@@ -5,6 +5,8 @@ project folder, a Claude Code session confined by [nono](https://github.com/nola
 and its own [AIO Sandbox](https://github.com/agent-infra/sandbox) container (Chromium,
 VNC, VS Code, shell, MCP) that only that session can reach. A web UI manages it all.
 
+![The web UI: a workspace's Claude tab, with Claude Code running sandboxed in the project](docs/screenshots/workspace-claude.png)
+
 ## Architecture
 
 ```mermaid
