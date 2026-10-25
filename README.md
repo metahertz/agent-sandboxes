@@ -118,27 +118,38 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
 
 ## Usage
 
+Screenshots are from a demo setup (made-up workspaces, keys and tokens).
+
+### Workspaces
+
 - **New workspace** in the sidebar: name + optional folder (default `~/projects/<name>`).
   Creates the folder, `.mcp.json`, key and port, and starts the container.
 - **Tabs:** *Claude* (sandboxed session, survives closing the tab) · *Browser* (live VNC,
   shared with Claude) · *VS Code* and *Terminal* (inside the container) · *Access* (SSH
   keys, API tokens, network allowlist, memory/process limits) · *Files* (browse/download
   from the container) · *Logs*.
-- **Keys & tokens** (sidebar): generate or import SSH keys (copy the public key into
-  GitHub etc.), add API tokens (GitHub, GitLab, OpenAI, Gemini, or any HTTP(S) API), and tick
-  which workspaces get each. nono only injects tokens into plain HTTP on loopback, so an
-  `http://` API's route goes to the UI server's bridge on `127.0.0.2:7100`, which relays to
-  the real host (one request per connection, so nono's keep-alive can't mix tokens). Claude
-  calls it via `$POOL_<NAME>_BASE_URL`; the token crosses the network unencrypted. Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
-  SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
-  Network, token and limit changes need a Claude restart; the header says when.
-- **Notes for Claude:** Claude is started with `--append-system-prompt` naming each of the
-  workspace's API tokens and how to call it (for `http://` APIs: `$POOL_<NAME>_BASE_URL`
-  only). Ticking *Notes for Claude* (*Access* tab) also keeps a marked block at the end of
-  the project's `CLAUDE.md`, rendered from `ui/claude-md-additions.md` (edited copy under
-  *Settings*, saved to `state/claude-md-additions.md`): what nono allows, how the
-  aio-sandbox MCP container differs (other paths, its network, no SSH keys), with
-  the workspace's allowlist and tokens filled in. Refreshed at every Claude start.
+
+![A workspace's Browser tab: the sandbox's Chromium over VNC](docs/screenshots/workspace-browser.png)
+
+![The VS Code tab: code-server in the container, on the project folder](docs/screenshots/workspace-vscode.png)
+
+### Access tab
+
+Per workspace: which pool keys and tokens it gets, its network allowlist and the
+container's network, resource limits, the CLAUDE.md notes, and workspace-only SSH keys.
+
+![The Access tab: SSH keys, API tokens, network allowlist, container network, limits, notes and remote terminal](docs/screenshots/workspace-access.png)
+
+- **Network allowlist** (*Access* tab): domains, `*.domain` wildcards and IP addresses
+  (IPv4, or IPv6 in canonical form; no CIDR ranges: nono's proxy matches hosts only).
+  An allowed host is reachable on every port. `host:port` or `host:lo-hi` (`[v6]:port`)
+  limits it to those ports: nono can't filter ports, so a workspace with such entries
+  gets the UI server's port filter (`127.0.0.1:<sandbox port − 1000>`) as nono's
+  `upstream_proxy`. nono checks the host first and the filter then checks the port, and
+  port changes apply without a restart. While the UI server is down, such workspaces
+  have no outbound network. Loopback, `0.0.0.0` and link-local addresses are refused,
+  including names that resolve to them. Only programs that use `HTTPS_PROXY` (or, for
+  SSH, `ssh-proxy-connect`) get out; raw TCP clients such as `psql` stay blocked.
 - **Container network** (*Access* tab): *Same as Claude* gives the AIO container the
   workspace's allowlist and API tokens. `compose()` adds a generated override
   (`workspaces/<name>.compose-filtered.yaml`): an internal Docker network
@@ -159,23 +170,51 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   gets a managed `CACertificates` policy; `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`
   and `PIP_CERT` cover Node and Python, and `NODE_USE_ENV_PROXY=1` makes Node's `fetch`
   use the proxy. Tested with curl, Python requests, Node fetch and Chromium.
-- **Network allowlist** (*Access* tab): domains, `*.domain` wildcards and IP addresses
-  (IPv4, or IPv6 in canonical form; no CIDR ranges: nono's proxy matches hosts only).
-  An allowed host is reachable on every port. `host:port` or `host:lo-hi` (`[v6]:port`)
-  limits it to those ports: nono can't filter ports, so a workspace with such entries
-  gets the UI server's port filter (`127.0.0.1:<sandbox port − 1000>`) as nono's
-  `upstream_proxy`. nono checks the host first and the filter then checks the port, and
-  port changes apply without a restart. While the UI server is down, such workspaces
-  have no outbound network. Loopback, `0.0.0.0` and link-local addresses are refused,
-  including names that resolve to them. Only programs that use `HTTPS_PROXY` (or, for
-  SSH, `ssh-proxy-connect`) get out; raw TCP clients such as `psql` stay blocked.
-- **Import** (sidebar): projects from other machines, with their Claude Code history.
-  See [Importing projects](#importing-projects).
+- **Notes for Claude:** Claude is started with `--append-system-prompt` naming each of the
+  workspace's API tokens and how to call it (for `http://` APIs: `$POOL_<NAME>_BASE_URL`
+  only). Ticking *Notes for Claude* (*Access* tab) also keeps a marked block at the end of
+  the project's `CLAUDE.md`, rendered from `ui/claude-md-additions.md` (edited copy under
+  *Settings*, saved to `state/claude-md-additions.md`): what nono allows, how the
+  aio-sandbox MCP container differs (other paths, its network, no SSH keys), with
+  the workspace's allowlist and tokens filled in. Refreshed at every Claude start.
 - **Remote terminal** (*Access* tab): SSH keys that reach one workspace only. See
   [SSH into a workspace](#ssh-into-a-workspace).
+
+### Keys & tokens
+
+![Keys & tokens: the SSH key and API token pool, ticked per workspace](docs/screenshots/keys-tokens.png)
+
+- **Keys & tokens** (sidebar): generate or import SSH keys (copy the public key into
+  GitHub etc.), add API tokens (GitHub, GitLab, OpenAI, Gemini, or any HTTP(S) API), and tick
+  which workspaces get each. nono only injects tokens into plain HTTP on loopback, so an
+  `http://` API's route goes to the UI server's bridge on `127.0.0.2:7100`, which relays to
+  the real host (one request per connection, so nono's keep-alive can't mix tokens). Claude
+  calls it via `$POOL_<NAME>_BASE_URL`; the token crosses the network unencrypted.
+  Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
+  SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
+  Network, token and limit changes need a Claude restart; the header says when.
+
+### Import
+
+![Import: an uploaded project waiting in the inbox, with its Claude sessions](docs/screenshots/import.png)
+
+- **Import** (sidebar): projects from other machines, with their Claude Code history.
+  See [Importing projects](#importing-projects).
+
+### Settings
+
+![Settings: HTTPS CA download, monitoring, local Grafana, telemetry, and the CLAUDE.md notes editor](docs/screenshots/settings.png)
+
 - **Settings** (sidebar): monitoring — dashboards link, local or external Prometheus /
   Loki, local Grafana address and retention, Claude Code telemetry — with *Save & apply*
   and *Stop monitoring*. See [Monitoring](#monitoring).
+- **HTTPS certificate** (*Settings*): download the UI's CA (`/ca.crt`) with its SHA-256
+  fingerprint, to trust it in your browser or system.
+- **Sandbox notes** (*Settings*): edit the CLAUDE.md block described above; *Reset to
+  default* goes back to `ui/claude-md-additions.md`.
+
+### From the shell
+
 - **Shell access:** `bin/claude-in <name>` runs a workspace's Claude directly;
   `tmux -L agent-sandboxes attach -t cl-<name>` attaches to a UI-started session.
 - **Service:** `sudo systemctl restart agent-sandboxes-ui` after editing `ui/server.py`;
