@@ -332,7 +332,8 @@
         <p class="meta">Monitoring settings are stored in ~/agent-sandboxes/monitoring/.env, which <code>bin/monitoring</code> uses too.</p>
       </div></header>
 
-      <form id="mon-form" class="pool-body access">
+      <div class="pool-body">
+      <form id="mon-form" class="settings-form">
         <section class="card" id="ca-card" hidden>
           <div class="card-head"><h2>HTTPS certificate</h2>
             <a class="btn" href="/ca.crt" download="agent-sandboxes-ca.crt">Download CA certificate</a></div>
@@ -393,7 +394,7 @@
         <details class="mon-log" id="mon-log-wrap" hidden><summary>Output</summary><pre id="mon-log"></pre></details>
       </form>
 
-      <form id="md-form" class="pool-body access">
+      <form id="md-form" class="settings-form">
         <section class="card">
           <div class="card-head"><h2>Sandbox notes for CLAUDE.md</h2>
             <span class="pill" id="md-state"></span></div>
@@ -407,6 +408,7 @@
           <p class="form-msg" id="md-msg" role="status"></p>
         </div>
       </form>
+      </div>
     </section>
   </main>
 </div>

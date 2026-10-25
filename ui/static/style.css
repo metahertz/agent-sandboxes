@@ -144,6 +144,7 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .sidebar-foot { margin-top: auto; border-top: 1px solid var(--line); padding-top: 10px; }
 .pool { display: flex; flex-direction: column; height: 100vh; min-height: 0; }
 .pool-body, .access { flex: 1; overflow: auto; padding: 8px 20px 20px; display: flex; flex-direction: column; gap: 14px; }
+.settings-form { display: flex; flex-direction: column; gap: 14px; }   /* both share the page's one scroll area */
 .card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; }
 .card h2 { margin: 0 0 4px; font-size: 14.5px; }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }

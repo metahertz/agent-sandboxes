@@ -36,6 +36,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -149,7 +150,8 @@ def load_ws(name: str) -> dict[str, str] | None:
 
 
 def all_ws() -> list[dict[str, str]]:
-    return [read_env(p) for p in sorted(WS_ROOT.glob("*.env"))]
+    # <name>.env only (not e.g. <name>.container.env)
+    return [read_env(p) for p in sorted(WS_ROOT.glob("*.env")) if NAME_RE.match(p.stem)]
 
 
 def container(name: str) -> str:
@@ -2404,6 +2406,12 @@ def write_container_files(ws: dict[str, str]) -> bool:
     return True
 
 
+def die_with_parent():
+    """preexec_fn: a proxy left running after the UI server dies would keep
+    enforcing a stale policy and block the next one's port."""
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)    # PR_SET_PDEATHSIG
+
+
 async def supervise_container_proxy(ws: dict[str, str]):
     """Keep the container's nono proxy running while the policy says filtered.
     It can only bind once Docker has created the network, so it retries."""
@@ -2419,7 +2427,7 @@ async def supervise_container_proxy(ws: dict[str, str]):
             "--proxy-ca-cert", str(ca_crt), "--proxy-ca-key", str(ca_key),
             env={**os.environ, "NONO_PROXY_PASS": container_password(name)},
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE)
+            stderr=asyncio.subprocess.PIPE, preexec_fn=die_with_parent)
         container_proxy_procs[name] = proc
         started = time.monotonic()
         while line := await proc.stderr.readline():
