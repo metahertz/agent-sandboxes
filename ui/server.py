@@ -39,6 +39,7 @@ import shutil
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import termios
 import time
@@ -74,6 +75,13 @@ EGRESS_PORT_OFFSET = -1000        # and its port filter (host:port allow entries
 # nono only injects tokens into plain-HTTP upstreams on loopback: HTTP API
 # tokens go to this bridge (127.0.0.2: loopback, but not in nono's NO_PROXY)
 HTTP_BRIDGE = ("127.0.0.2", 7100)
+# Container network "filtered": the AIO container sits on an internal Docker
+# network (10.231.<port-8100>.0/24, no route out) and reaches the world only
+# through its own nono proxy on the gateway, with the workspace's profile.
+CONTAINER_NET = os.environ.get("AIO_CONTAINER_NET", "10.231")
+CONTAINER_PROXY_PORT = 3128
+CONTAINER_CA_MOUNT = "/usr/local/share/ca-certificates/agent-sandboxes-proxy.crt"   # in the container
+CONTAINER_PROXY_SECRETS = SECRETS / "container-proxy"   # per-workspace proxy password (= token placeholder there)
 
 TMUX = ["tmux", "-L", "agent-sandboxes", "-f", str(TMUX_CONF)]
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
@@ -149,9 +157,13 @@ def container(name: str) -> str:
 
 
 def compose(ws: dict[str, str], *args: str) -> list[str]:
+    """With the filtered-network override when the policy asks for it (its
+    files are rewritten first, so they always match the policy)."""
+    files = ["-f", str(COMPOSE_FILE)]
+    if write_container_files(ws):
+        files += ["-f", str(container_override_path(ws["WS_NAME"]))]
     return ["docker", "compose", "-p", container(ws["WS_NAME"]),
-            "--env-file", str(WS_ROOT / f"{ws['WS_NAME']}.env"),
-            "-f", str(COMPOSE_FILE), *args]
+            "--env-file", str(WS_ROOT / f"{ws['WS_NAME']}.env"), *files, *args]
 
 
 def port_free(port: int) -> bool:
@@ -382,8 +394,12 @@ async def api(req: Request, w):
         (WS_ROOT / f"{name}.env").unlink()
         kill_agent(name)
         remove_access(lambda scope, _: scope == name)
-        for p in (policy_path(name), profile_path(name), aux_profile_path(name)):
+        for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_override_path(name),
+                  container_env_path(name), container_profile_path(name), *container_ca_files(name),
+                  *(CONTAINER_PROXY_SECRETS / f"{name}{x}" for x in ("", ".ca.crt", ".ca.key"))):
             p.unlink(missing_ok=True)
+        # `down` only removes the network of the current mode; the other one may be left over
+        await run("docker", "network", "rm", f"{container(name)}_ws", f"{container(name)}_default")
         shutil.rmtree(STATE_ROOT / name, ignore_errors=True)
         shutil.rmtree(RUNTIME / name, ignore_errors=True)
         close_sandbox_listener(name)
@@ -577,7 +593,7 @@ TOKEN_SERVICES = {
                "inject_header": "x-goog-api-key", "credential_format": "{}", "env_var": "GEMINI_API_KEY"},
 }
 DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False,
-                  "network": {"mode": "claude-code", "allow": [], "deny": []},
+                  "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open"},
                   "limits": {"memory": "", "pids": 0}}
 
 
@@ -715,7 +731,9 @@ def validate_policy(body: dict) -> dict:
     net = body.get("network", {}) or {}
     if net.get("mode", "claude-code") not in NET_MODES:
         raise ValueError("Unknown network mode")
-    pol["network"] = {"mode": net.get("mode", "claude-code"),
+    if net.get("container", "open") not in ("open", "filtered"):
+        raise ValueError("Container network: open or filtered")
+    pol["network"] = {"mode": net.get("mode", "claude-code"), "container": net.get("container", "open"),
                       "allow": clean_net_list(net.get("allow", []), "Allowed hosts", ports_ok=True),
                       "deny": clean_net_list(net.get("deny", []), "Blocked hosts", ports_ok=False)}
     lim = body.get("limits", {}) or {}
@@ -1093,9 +1111,21 @@ def network_summary(pol: dict) -> str:
     return text
 
 
+def container_network_lines(pol: dict) -> str:
+    if pol["network"]["container"] == "filtered":
+        return ("- **Same network rules as you:** it goes out only through its own nono proxy, with this\n"
+                "  workspace's allowlist; DNS and raw TCP don't work there. The same token variables are\n"
+                "  set, and its `$POOL_<NAME>_BASE_URL` values point at that proxy (HTTPS token APIs also\n"
+                "  work at their real URL there). No SSH keys there.")
+    return ("- **No SSH keys or API tokens there.** Don't copy secrets or token placeholders into it.\n"
+            "- **Its network is not covered by this workspace's allowlist.** Don't use it to reach\n"
+            "  hosts the allowlist blocks.")
+
+
 def render_claude_md(ws: dict[str, str], pol: dict) -> str:
     values = {"workspace": ws["WS_NAME"], "project_dir": ws["WS_DIR"], "container_dir": CONTAINER_WORKSPACE,
-              "network": network_summary(pol), "tokens": token_lines(pol)}
+              "network": network_summary(pol), "tokens": token_lines(pol),
+              "container_network": container_network_lines(pol)}
     return re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m[1], m[0]), claude_md_template()[0])
 
 
@@ -1185,9 +1215,13 @@ async def policy_api(ws: dict[str, str], req: Request, w):
             sync_claude_md(ws)
         except (OSError, ValueError) as e:
             return await send_json(w, {"error": f"Saved, but CLAUDE.md: {e}"}, 500)
+        notes = await apply_container_network(ws, old)
+    else:
+        notes = []
     rc, out, _ = await run(*TMUX, "list-panes", "-t", f"cl-{name}", "-F", "#{pane_dead}")
     running = rc == 0 and "0" in out.split()
-    return await send_json(w, {"policy": load_policy(name), "pending": running and policy_pending(ws)})
+    return await send_json(w, {"policy": load_policy(name), "pending": running and policy_pending(ws),
+                               "notes": notes})
 
 
 async def pool_api(req: Request, parts: list[str], w):
@@ -2005,6 +2039,9 @@ async def open_sandbox_listener(ws: dict[str, str]) -> str | None:
     name = ws["WS_NAME"]
     port = int(ws["WS_PORT"]) + PROXY_PORT_OFFSET
     egress_err = await open_egress_filter(ws)
+    if container_filtered(name):
+        egress_err = await open_container_forwarder(ws) or egress_err
+        ensure_container_proxy(ws)
     servers = []
     try:
         for addr in BIND:
@@ -2026,6 +2063,8 @@ def close_sandbox_listener(name: str):
         s.close()
     if s := egress_listeners.pop(name, None):
         s.close()
+    close_container_forwarder(name)
+    stop_container_proxy(name)
 
 
 # --------------------------------------------------------------- egress port filter
@@ -2207,6 +2246,298 @@ async def handle_bridge(reader, w):
         if up_w:
             up_w.close()
         w.close()
+
+
+# --------------------------------------------------------------- container network
+# Access tab -> Container network "filtered": the AIO container gets the same
+# allowlist and API tokens as Claude. compose() adds a generated override:
+# an internal network (no route out, no published port) with the container
+# at .2, and an env file pointing everything (GOST for Chromium via
+# PROXY_SERVER, shells via HTTP(S)_PROXY) at a nono proxy we run on the
+# gateway .1 with the workspace's profile. Its password is also the token
+# placeholder there. 127.0.0.1:<sandbox port> is forwarded to .2:8080, so MCP
+# and the UI reach the container as before.
+
+container_proxies: dict[str, asyncio.Task] = {}
+container_proxy_procs: dict[str, asyncio.subprocess.Process] = {}
+container_forwarders: dict[str, asyncio.Server] = {}
+
+
+def container_filtered(name: str) -> bool:
+    return load_policy(name)["network"]["container"] == "filtered"
+
+
+def container_net(ws: dict[str, str]) -> tuple[str, str, str]:
+    """(subnet, gateway = proxy address, container address)."""
+    n = int(ws["WS_PORT"]) - SANDBOX_PORTS.start + 1
+    return f"{CONTAINER_NET}.{n}.0/24", f"{CONTAINER_NET}.{n}.1", f"{CONTAINER_NET}.{n}.2"
+
+
+def container_override_path(name: str) -> Path:
+    return WS_ROOT / f"{name}.compose-filtered.yaml"
+
+
+def container_env_path(name: str) -> Path:
+    return WS_ROOT / f"{name}.container.env"
+
+
+def container_profile_path(name: str) -> Path:
+    return WS_ROOT / f"{name}.container-profile.json"
+
+
+def container_ca(name: str) -> tuple[Path, Path]:
+    """The workspace's persistent CA for its container proxy's TLS interception
+    (token routes at their real HTTPS URL). Key stays in secrets/; the
+    container only gets the certificate."""
+    crt, key = CONTAINER_PROXY_SECRETS / f"{name}.ca.crt", CONTAINER_PROXY_SECRETS / f"{name}.ca.key"
+    if not (crt.is_file() and key.is_file()):
+        CONTAINER_PROXY_SECRETS.mkdir(mode=0o700, parents=True, exist_ok=True)
+        old = os.umask(0o077)
+        try:
+            subprocess.run(["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
+                            "-out", str(key)], check=True, capture_output=True)
+            subprocess.run(["openssl", "req", "-x509", "-new", "-key", str(key), "-out", str(crt), "-days", "3650",
+                            "-subj", f"/CN=agent-sandboxes {name} container proxy CA",
+                            "-addext", "basicConstraints=critical,CA:TRUE",
+                            "-addext", "keyUsage=critical,keyCertSign,cRLSign"], check=True, capture_output=True)
+        finally:
+            os.umask(old)
+    return crt, key
+
+
+def container_ca_files(name: str) -> tuple[Path, Path]:
+    """Public copies the container mounts: the PEM (system store) and a
+    Chromium managed policy trusting it (Chromium ignores the system store)."""
+    return WS_ROOT / f"{name}.container-ca.crt", WS_ROOT / f"{name}.container-ca-policy.json"
+
+
+def container_password(name: str) -> str:
+    path = CONTAINER_PROXY_SECRETS / name
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        CONTAINER_PROXY_SECRETS.mkdir(mode=0o700, parents=True, exist_ok=True)
+        pw = secrets.token_hex(32)
+        private_write(path, pw)
+        return pw
+
+
+def container_env_text(ws: dict[str, str], pol: dict) -> str:
+    _, gw, _ = container_net(ws)
+    pw = container_password(ws["WS_NAME"])
+    proxy = f"http://nono:{pw}@{gw}:{CONTAINER_PROXY_PORT}"
+    no_proxy = f"localhost,127.0.0.1,{gw}"     # the token routes are plain requests to the proxy
+    bundle = "/etc/ssl/certs/ca-certificates.crt"      # with the proxy CA, after the init hook
+    env = {"PROXY_SERVER": f"nono:{pw}@{gw}:{CONTAINER_PROXY_PORT}",   # AIO's GOST -> Chromium
+           "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "https_proxy": proxy,
+           "NO_PROXY": no_proxy, "no_proxy": no_proxy,
+           # AIO runs this as root at every start: add the mounted proxy CA to the system store
+           "RUN_HOOK_INIT": "update-ca-certificates",
+           "NODE_EXTRA_CA_CERTS": CONTAINER_CA_MOUNT, "REQUESTS_CA_BUNDLE": bundle, "PIP_CERT": bundle,
+           "NODE_USE_ENV_PROXY": "1"}      # Node's own fetch honours HTTPS_PROXY (as nono sets for Claude)
+    for tid in pol["tokens"]:
+        if meta := token_meta(tid):
+            env[meta["env_var"]] = pw
+            env[base_url_var(tid)] = f"http://{gw}:{CONTAINER_PROXY_PORT}/pool_{tid.replace('-', '_')}"
+    return "# Generated by agent-sandboxes (Access tab -> Container network). Don't edit.\n" + \
+        "".join(f"{k}={v}\n" for k, v in env.items())
+
+
+def container_override_text(ws: dict[str, str]) -> str:
+    subnet, gw, ip = container_net(ws)
+    ca_crt, ca_policy = container_ca_files(ws["WS_NAME"])
+    return f"""# Generated by agent-sandboxes (Access tab -> Container network: filtered). Don't edit.
+# No route out and no published port: the container reaches the world only
+# through its nono proxy on {gw}:{CONTAINER_PROXY_PORT}; the web UI forwards 127.0.0.1:{ws['WS_PORT']} to it.
+services:
+  sandbox:
+    ports: !reset []
+    networks:
+      ws:
+        ipv4_address: {ip}
+    env_file:
+      - {container_env_path(ws['WS_NAME'])}
+    volumes:
+      - {ca_crt}:{CONTAINER_CA_MOUNT}:ro
+      - {ca_policy}:/etc/chromium/policies/managed/agent-sandboxes-proxy-ca.json:ro
+networks:
+  ws:
+    internal: true
+    ipam:
+      config:
+        - subnet: {subnet}
+          gateway: {gw}
+"""
+
+
+def write_if_changed(path: Path, text: str) -> bool:
+    try:
+        if path.read_text() == text:
+            return False
+    except OSError:
+        pass
+    private_write(path, text)
+    return True
+
+
+def write_container_files(ws: dict[str, str]) -> bool:
+    """Bring the override, env file and proxy profile in line with the
+    policy. Returns whether the container is filtered."""
+    name = ws["WS_NAME"]
+    pol = load_policy(name)
+    if pol["network"]["container"] != "filtered":
+        for p in (container_override_path(name), container_env_path(name), container_profile_path(name),
+                  *container_ca_files(name)):
+            p.unlink(missing_ok=True)
+        return False
+    crt, _ = container_ca(name)
+    pem = crt.read_text()
+    der = ssl.PEM_cert_to_DER_cert(pem)
+    ca_crt, ca_policy = container_ca_files(name)
+    write_if_changed(ca_crt, pem)
+    write_if_changed(ca_policy, json.dumps({"CACertificates": [base64.b64encode(der).decode()]}) + "\n")
+    for p in (ca_crt, ca_policy):
+        p.chmod(0o644)       # public; read by the container's root and Chromium
+    write_if_changed(container_env_path(name), container_env_text(ws, pol))
+    write_if_changed(container_override_path(name), container_override_text(ws))
+    write_if_changed(container_profile_path(name), profile_text(ws))
+    return True
+
+
+async def supervise_container_proxy(ws: dict[str, str]):
+    """Keep the container's nono proxy running while the policy says filtered.
+    It can only bind once Docker has created the network, so it retries."""
+    name = ws["WS_NAME"]
+    _, gw, _ = container_net(ws)
+    last_err = None
+    while load_ws(name) and container_filtered(name):
+        write_container_files(ws)
+        ca_crt, ca_key = container_ca(name)
+        proc = await asyncio.create_subprocess_exec(
+            "nono", "proxy", "--silent", "--profile", str(container_profile_path(name)),
+            "--listen", gw, "--port", str(CONTAINER_PROXY_PORT),
+            "--proxy-ca-cert", str(ca_crt), "--proxy-ca-key", str(ca_key),
+            env={**os.environ, "NONO_PROXY_PASS": container_password(name)},
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
+        container_proxy_procs[name] = proc
+        started = time.monotonic()
+        while line := await proc.stderr.readline():
+            msg = re.sub(r"\x1b\[[0-9;]*m", "", line.decode(errors="replace")).strip()
+            if msg and msg != last_err:
+                print(f"container-proxy {name}: {msg[:300]}", flush=True)
+                last_err = msg
+        await proc.wait()
+        container_proxy_procs.pop(name, None)
+        if time.monotonic() - started > 30:
+            last_err = None      # it ran fine for a while: report the next failure again
+        await asyncio.sleep(3)
+    container_proxies.pop(name, None)
+
+
+def ensure_container_proxy(ws: dict[str, str]):
+    name = ws["WS_NAME"]
+    if container_filtered(name) and name not in container_proxies:
+        container_proxies[name] = asyncio.create_task(supervise_container_proxy(ws))
+    elif not container_filtered(name):
+        restart_container_proxy(name)      # the supervisor sees the policy and stops
+
+
+def restart_container_proxy(name: str):
+    """The supervisor starts it again with the current profile."""
+    if proc := container_proxy_procs.get(name):
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+
+
+def stop_container_proxy(name: str):
+    if task := container_proxies.pop(name, None):
+        task.cancel()
+    restart_container_proxy(name)
+
+
+async def splice(r1, w1, r2, w2):
+    async def pump(src, dst):
+        try:
+            while data := await src.read(65536):
+                dst.write(data)
+                await dst.drain()
+            if dst.can_write_eof():
+                dst.write_eof()
+        except OSError:
+            pass
+    try:
+        await asyncio.gather(pump(r1, w2), pump(r2, w1))
+    finally:
+        w1.close()
+        w2.close()
+
+
+async def open_container_forwarder(ws: dict[str, str]) -> str | None:
+    """127.0.0.1:<sandbox port> -> the filtered container, as Docker's
+    published port would (internal networks can't publish)."""
+    name, port = ws["WS_NAME"], int(ws["WS_PORT"])
+    if name in container_forwarders:
+        return None
+    _, _, ip = container_net(ws)
+
+    async def forward(reader, writer):
+        try:
+            up_r, up_w = await asyncio.wait_for(asyncio.open_connection(ip, 8080), 10)
+        except (OSError, asyncio.TimeoutError):
+            writer.close()
+            return
+        await splice(reader, writer, up_r, up_w)
+
+    try:
+        container_forwarders[name] = await asyncio.start_server(forward, "127.0.0.1", port)
+    except OSError as e:
+        msg = f"Can't forward 127.0.0.1:{port} to '{name}''s container: {e.strerror}"
+        print(msg, flush=True)
+        return msg
+    return None
+
+
+def close_container_forwarder(name: str):
+    if s := container_forwarders.pop(name, None):
+        s.close()
+
+
+async def container_running(name: str) -> bool:
+    rc, out, _ = await run("docker", "inspect", "-f", "{{.State.Running}}", container(name))
+    return rc == 0 and out.strip() == "true"
+
+
+async def apply_container_network(ws: dict[str, str], old: dict) -> list[str]:
+    """After a policy save: recreate the container if its network or env
+    changed (it's running), restart its proxy if only the profile did."""
+    name = ws["WS_NAME"]
+    was = old["network"]["container"] == "filtered"
+    now = container_filtered(name)
+    notes = []
+    if not was and not now:
+        return notes
+    old_env = container_env_path(name).read_text() if container_env_path(name).exists() else None
+    running = await container_running(name)
+    if was and not now:
+        stop_container_proxy(name)
+        close_container_forwarder(name)       # Docker publishes the port again
+    files = compose(ws, "up", "-d", "--remove-orphans")     # rewrites the files
+    env_changed = now and container_env_path(name).read_text() != old_env
+    if running and (was != now or env_changed):
+        rc, out, err = await run(*files, timeout=600)
+        notes.append("Container recreated with the new network settings." if rc == 0
+                     else f"Recreating the container failed: {(err or out).strip()[-300:]}")
+    if now:
+        if err := await open_container_forwarder(ws):
+            notes.append(err)
+        if name in container_proxies:
+            restart_container_proxy(name)
+        else:
+            ensure_container_proxy(ws)
+    return notes
 
 
 async def open_egress_filter(ws: dict[str, str]) -> str | None:

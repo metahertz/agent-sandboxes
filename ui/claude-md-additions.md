@@ -31,8 +31,6 @@ one; a 64-character hex value is the expected placeholder.
 
 - **It's a different machine:** the project is mounted at `{{container_dir}}` there, not
   at `{{project_dir}}`. Translate paths between the two.
-- **No SSH keys or API tokens there.** Don't copy secrets or token placeholders into it.
-- **Its network is not covered by this workspace's allowlist.** Don't use it to reach
-  hosts the allowlist blocks.
+{{container_network}}
 - Use it for browsing, screenshots, and anything that needs a desktop or a full Linux
   userland (system packages, GUI apps).

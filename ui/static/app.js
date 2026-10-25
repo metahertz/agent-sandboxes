@@ -546,6 +546,7 @@ async function loadAccess() {
     form.elements.memory.value = policy.limits.memory;
     form.elements.pids.value = policy.limits.pids || "";
     form.elements.claude_md.checked = policy.claude_md;
+    form.elements.container.value = policy.network.container;
     $("#acc-restart").hidden = w.claude === "stopped";
     loadWsSshAccess(w);
   } catch (e) {
@@ -562,7 +563,8 @@ async function saveAccess(restart) {
   const body = {
     ssh_keys: $$('input[name="ssh"]:checked', form).map((i) => i.value),
     tokens: $$('input[name="token"]:checked', form).map((i) => i.value),
-    network: { mode: form.elements.mode?.value || "claude-code", allow: lines(form.elements.allow.value), deny: lines(form.elements.deny.value) },
+    network: { mode: form.elements.mode?.value || "claude-code", allow: lines(form.elements.allow.value), deny: lines(form.elements.deny.value),
+      container: form.elements.container.value || "open" },
     limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0) },
     claude_md: form.elements.claude_md.checked,
   };
@@ -570,14 +572,15 @@ async function saveAccess(restart) {
   try {
     const res = await api("PUT", wsPath(w.name, "/policy"), body);
     if (restart) {
-      out.textContent = "Saved. Restarting Claude…";
+      out.textContent = `Saved.${res.notes?.length ? ` ${res.notes.join(" ")}` : ""} Restarting Claude…`;
       await api("POST", wsPath(w.name, "/claude/restart"));
       disconnectTerm();
       out.textContent = "Saved and Claude restarted with the new policy.";
     } else {
-      out.textContent = res.pending
+      out.textContent = (res.pending
         ? "Saved. SSH key changes are live; restart Claude for the rest."
-        : w.claude === "stopped" ? "Saved. Applies when Claude starts." : "Saved and applied.";
+        : w.claude === "stopped" ? "Saved. Applies when Claude starts." : "Saved and applied.")
+        + (res.notes?.length ? ` ${res.notes.join(" ")}` : "");
     }
   } catch (e) {
     out.textContent = e.message;

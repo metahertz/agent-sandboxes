@@ -37,7 +37,7 @@ flowchart LR
   claude -- "socket only" --> agent
   ui -- "loads assigned keys" --> agent
   pool -. "read by UI / nono proxy only" .-> agent
-  aio -- "unfiltered" --> net
+  aio -- "unfiltered, or via its own nono proxy<br/>(Container network: Same as Claude)" --> net
 ```
 
 - **Claude (nono):** reads/writes its project folder; reaches only its own sandbox port
@@ -50,7 +50,8 @@ flowchart LR
   proxy: Claude sees a placeholder, the proxy injects the real token only towards that
   service.
 - **Container:** sees only its project folder; its API key is enforced, held by the
-  UI and injected into Claude via a nono hook. Never in the repo.
+  UI and injected into Claude via a nono hook. Never in the repo. Its network is
+  unfiltered unless *Container network* is *Same as Claude* (see Usage).
 - **Monitoring (optional):** Alloy → Prometheus + Loki → Grafana, see below.
 - **UI:** token login, same-origin API, per-workspace capability URLs for sandbox views.
   Runs as your user with only `CAP_NET_BIND_SERVICE`, which it clears from the
@@ -136,8 +137,28 @@ and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
   only). Ticking *Notes for Claude* (*Access* tab) also keeps a marked block at the end of
   the project's `CLAUDE.md`, rendered from `ui/claude-md-additions.md` (edited copy under
   *Settings*, saved to `state/claude-md-additions.md`): what nono allows, how the
-  aio-sandbox MCP container differs (other paths, unfiltered network, no keys), with
+  aio-sandbox MCP container differs (other paths, its network, no SSH keys), with
   the workspace's allowlist and tokens filled in. Refreshed at every Claude start.
+- **Container network** (*Access* tab): *Same as Claude* gives the AIO container the
+  workspace's allowlist and API tokens. `compose()` adds a generated override
+  (`workspaces/<name>.compose-filtered.yaml`): an internal Docker network
+  `10.231.<port−8100>.0/24` (no route out, no DNS, no published port; `AIO_CONTAINER_NET`
+  changes the prefix), the container at `.2`, and an env file pointing AIO's GOST relay
+  (so Chromium), `HTTP(S)_PROXY`, and each token variable / `$POOL_<NAME>_BASE_URL` at a
+  `nono proxy` the UI server runs on the gateway `.1:3128` with the workspace's profile
+  and its own password (`secrets/container-proxy/<name>`, also the token placeholder
+  there). The UI server forwards `127.0.0.1:<sandbox port>` to `.2:8080`, so MCP, the UI
+  and VNC work as before. Allowlist changes restart only that proxy; switching, or
+  changing tokens, recreates the container. While the UI server is down such containers
+  are offline.
+  Token hosts also work at their real HTTPS URL: nono intercepts TLS for them (only
+  them) with a persistent per-workspace CA (`secrets/container-proxy/<name>.ca.{crt,key}`;
+  the key never enters the container). The container mounts the certificate into
+  `/usr/local/share/ca-certificates/`, and AIO's `RUN_HOOK_INIT` runs
+  `update-ca-certificates` at every start; Chromium, which ignores the system store,
+  gets a managed `CACertificates` policy; `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`
+  and `PIP_CERT` cover Node and Python, and `NODE_USE_ENV_PROXY=1` makes Node's `fetch`
+  use the proxy. Tested with curl, Python requests, Node fetch and Chromium.
 - **Network allowlist** (*Access* tab): domains, `*.domain` wildcards and IP addresses
   (IPv4, or IPv6 in canonical form; no CIDR ranges: nono's proxy matches hosts only).
   An allowed host is reachable on every port. `host:port` or `host:lo-hi` (`[v6]:port`)
@@ -244,7 +265,8 @@ Claude always runs in a `systemd --user` scope (`claude-<name>-<pid>`, for resou
 limits and its metrics), which needs lingering (`sudo loginctl enable-linger <user>`).
 
 **Known gaps:** every workspace's Claude shares `~/.claude` (settings, credentials,
-transcripts) and `/tmp/claude-$UID`; container egress is unfiltered; SSH host keys are
+transcripts) and `/tmp/claude-$UID`; container egress is unfiltered unless *Container
+network* is *Same as Claude*; SSH host keys are
 trust-on-first-use per workspace; pool secrets are unencrypted at rest (like `~/.ssh`);
 telemetry's `workspace` label is set by the sandbox, so a workspace could mislabel its
 own Claude metrics (nono and container data are labelled outside it); Alloy has the

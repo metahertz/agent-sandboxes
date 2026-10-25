@@ -170,6 +170,12 @@
               <label>Block <span class="muted">(hosts or IP addresses; wins over everything else)</span>
                 <textarea name="deny" rows="4" spellcheck="false" placeholder="pastebin.com"></textarea></label>
             </div>
+            <h3>Container network <span class="muted">(the sandbox's browser, VS Code and terminal)</span></h3>
+            <div class="radios">
+              <label><input type="radio" name="container" value="open"> <span><strong>Unfiltered</strong> — the container reaches the internet directly; no API tokens there</span></label>
+              <label><input type="radio" name="container" value="filtered"> <span><strong>Same as Claude</strong> — only this allowlist, through the workspace's own nono proxy, with the same API tokens (HTTPS APIs at their own URL or <code>$POOL_&lt;NAME&gt;_BASE_URL</code>, HTTP ones via the latter; the container trusts the workspace's proxy CA)</span></label>
+            </div>
+            <p class="hint">“Same as Claude” puts the container on a network with no route out; its browser and shell tools use the proxy, and the rest (DNS, raw TCP) can't connect. Allowlist changes apply to the container at once; switching this, or changing its tokens, recreates the container (its browser session restarts). VS Code extensions need <code>open-vsx.org</code> allowed.</p>
           </section>
           <section class="card">
             <h2>Resource limits</h2>
@@ -391,7 +397,7 @@
         <section class="card">
           <div class="card-head"><h2>Sandbox notes for CLAUDE.md</h2>
             <span class="pill" id="md-state"></span></div>
-          <p class="hint">Explains the nono sandbox and the aio-sandbox MCP container to Claude. Workspaces with <em>Notes for Claude</em> ticked (Access tab) get this as a block at the end of their <code>CLAUDE.md</code>, after the line “This is running agent-sandboxes from github.com/metahertz/agent-sandboxes”; saving updates them all. Placeholders filled in per workspace: <code>{{workspace}}</code> <code>{{project_dir}}</code> <code>{{container_dir}}</code> <code>{{network}}</code> (its allowlist) <code>{{tokens}}</code> (its tokens and how to call them).</p>
+          <p class="hint">Explains the nono sandbox and the aio-sandbox MCP container to Claude. Workspaces with <em>Notes for Claude</em> ticked (Access tab) get this as a block at the end of their <code>CLAUDE.md</code>, after the line “This is running agent-sandboxes from github.com/metahertz/agent-sandboxes”; saving updates them all. Placeholders filled in per workspace: <code>{{workspace}}</code> <code>{{project_dir}}</code> <code>{{container_dir}}</code> <code>{{network}}</code> (its allowlist) <code>{{tokens}}</code> (its tokens and how to call them) <code>{{container_network}}</code> (what the container can reach, per its Container network setting).</p>
           <textarea name="text" id="md-text" rows="22" spellcheck="false"></textarea>
           <p class="hint" id="md-enabled"></p>
         </section>
