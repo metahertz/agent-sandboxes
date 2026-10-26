@@ -321,11 +321,13 @@ sudo ufw allow from <your-subnet> to any port 3000 proto tcp
 Grafana is at `https://<host>:3000/` (same certificate as the UI), with two dashboards
 in *Agent Sandboxes*: **overview** (every workspace's sandbox / Claude / policy state,
 CPU and memory, tokens and cost, network denials, host) and **workspace** (one
-workspace in detail, with its logs). What's collected:
+workspace in detail, with its logs). The overview's *Backup* row shows the NAS backups' health. What's collected:
 
 | Source | Into | What |
 |---|---|---|
 | `ui/exporter.py` (every 15 s) | Prometheus `aio_*` | Container up/healthy, Claude running, policy pending, keys/tokens, limits, project size; Claude scope CPU / memory / processes / OOM kills |
+| Backup status (via the exporter) | Prometheus `aio_backup_*` | Health (ok / overdue / last run failed / manual only), last good backup and its size, next run, this host's total on the NAS and the share's free space |
+| UI server journal | Loki `{source="journal", unit="agent-sandboxes-ui.service"}` | One logfmt line per backup run (`backup trigger=… result=… bytes=… seconds=… warnings=… pruned=…`) |
 | nono audit trail (via the exporter) | Loki `{source="nono"}`, `aio_nono_*` | Session start/end, every connection allowed or denied, with workspace |
 | Claude Code OpenTelemetry | Loki `{service_name="claude-code"}`, Prometheus `claude_code_*` | API requests (tokens, cost, model), tool use and decisions, errors; prompt and response text stays redacted |
 | cAdvisor (in Alloy) | Prometheus `container_*{workspace=…}` | Sandbox container CPU, memory, network |

@@ -221,6 +221,61 @@ async def disk_usage(wss: list[dict[str, str]]) -> dict[str, int]:
     return sizes
 
 
+BACKUP_GRACE = 2 * 3600            # a scheduled backup this late counts as overdue
+
+
+def backup_metrics(m: Metrics):
+    """From the backup settings and run history the UI server keeps in secrets/."""
+    cfg, st = server.load_backup_conf(), server.load_backup_status()
+    runs = st.get("runs", [])
+    good = [r for r in runs if r.get("ok")]
+    nxt = server.next_backup(cfg, st)
+    if not server.backup_configured(cfg):
+        state = 0
+    elif runs and not runs[-1].get("ok"):
+        state = 3
+    elif nxt is not None and time.time() > nxt + BACKUP_GRACE:
+        state = 2                    # the slot passed and nothing ran (UI down, or stuck)
+    elif cfg["schedule"] == "off":
+        state = 4
+    else:
+        state = 1
+    m.add("aio_backup_state", "gauge",
+          "Backup health: 0 not set up, 1 ok, 2 overdue, 3 last run failed, 4 manual only.", state)
+    m.add("aio_backup_schedule_info", "gauge", "Backup schedule (always 1) as labels.", 1,
+          schedule=cfg["schedule"], time=cfg["time"], weekday=cfg["weekday"],
+          projects=int(cfg["include"]["projects"]), config=int(cfg["include"]["config"]),
+          claude=int(cfg["include"]["claude"]))
+    m.add("aio_backup_keep_days", "gauge", "Days backups are kept on the NAS (0 = all).", cfg["keep_days"])
+    if nxt is not None:
+        m.add("aio_backup_next_run_timestamp_seconds", "gauge", "When the next scheduled backup is due.",
+              int(nxt))
+    if runs:
+        r = runs[-1]
+        m.add("aio_backup_last_run_timestamp_seconds", "gauge", "When the last backup finished.",
+              int(r["finished"]))
+        m.add("aio_backup_last_run_ok", "gauge", "Whether the last backup succeeded.", int(bool(r.get("ok"))))
+        m.add("aio_backup_last_run_duration_seconds", "gauge", "How long the last backup took.",
+              round(r["finished"] - r["started"], 1))
+        m.add("aio_backup_last_run_warnings", "gauge", "Files the last backup couldn't read in full.",
+              len(r.get("warnings", [])))
+    if good:
+        m.add("aio_backup_last_success_timestamp_seconds", "gauge", "When the last good backup finished.",
+              int(good[-1]["finished"]))
+        m.add("aio_backup_last_success_bytes", "gauge", "Size of the last good backup's tarball.",
+              good[-1].get("size", 0))
+    nas = st.get("remote")
+    if nas:
+        m.add("aio_backup_nas_backups", "gauge", "This host's backups on the NAS, at the last listing.",
+              nas["count"])
+        m.add("aio_backup_nas_bytes", "gauge", "Space this host's backups use on the NAS.", nas["bytes"])
+        if nas.get("free") is not None:
+            m.add("aio_backup_nas_free_bytes", "gauge", "Free space on the NAS share.", nas["free"])
+            m.add("aio_backup_nas_size_bytes", "gauge", "Size of the NAS share.", nas["total"])
+        m.add("aio_backup_nas_listed_timestamp_seconds", "gauge", "When the NAS folder was last listed.",
+              int(nas["at"]))
+
+
 async def collect(audit: Audit, du: dict[str, int]) -> str:
     m = Metrics()
     t0 = time.monotonic()
@@ -279,6 +334,7 @@ async def collect(audit: Audit, du: dict[str, int]) -> str:
     for ws, v in sorted(audit.sessions.items()):
         m.add("aio_nono_sessions_total", "counter", "nono sandbox sessions started.", v,
               workspace=ws)
+    backup_metrics(m)
     m.add("aio_exporter_scrape_duration_seconds", "gauge", "Time taken to collect.",
           round(time.monotonic() - t0, 3))
     m.add("aio_exporter_last_run_timestamp_seconds", "gauge", "When metrics were last written.",

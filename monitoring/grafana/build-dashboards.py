@@ -25,6 +25,12 @@ RUNNING = [{"type": "value", "options": {
 PENDING = [{"type": "value", "options": {
     "0": {"text": "✓ applied", "color": "green", "index": 0},
     "1": {"text": "⚠ restart Claude", "color": "orange", "index": 1}}}]
+BACKUP = [{"type": "value", "options": {
+    "0": {"text": "– not set up", "color": "text", "index": 0},
+    "1": {"text": "✓ ok", "color": "green", "index": 1},
+    "2": {"text": "⚠ overdue", "color": "orange", "index": 2},
+    "3": {"text": "✗ last run failed", "color": "red", "index": 3},
+    "4": {"text": "● manual only", "color": "blue", "index": 4}}}]
 HEALTHY = [{"type": "value", "options": {
     "0": {"text": "✗ unhealthy", "color": "orange", "index": 0},
     "1": {"text": "✓ healthy", "color": "green", "index": 1}}}]
@@ -71,11 +77,13 @@ def loki(expr: str, ref: str = "A", instant=False, legend: str = "") -> dict:
 
 
 def stat(title, targets, unit="none", mappings=None, thresholds=None, desc="", text_mode="value",
-         color_mode="value", decimals=None):
+         color_mode="value", decimals=None, no_value=None):
     d = {"unit": unit, "mappings": mappings or [], "color": {"mode": "thresholds"},
          "thresholds": {"mode": "absolute", "steps": thresholds or [{"color": "text", "value": None}]}}
     if decimals is not None:
         d["decimals"] = decimals
+    if no_value is not None:
+        d["noValue"] = no_value
     return {"type": "stat", "title": title, "description": desc, "targets": targets,
             "datasource": targets[0]["datasource"],
             "fieldConfig": {"defaults": d, "overrides": []},
@@ -267,6 +275,24 @@ def overview() -> dict:
           12, 8)
     b.add(logs("Recent denials", ('%s | %s' % (DENY_HOSTS.replace('decision="deny"', 'decision="deny", %s' % T), NONO_LINE))),
           24, 9)
+
+    b.row("Backup")
+    b.add(stat("Backup", [prom("aio_backup_state", instant=True)], mappings=BACKUP,
+               desc="Settings → Backup in the web UI. Overdue: a scheduled run is over 2 h late"), 4, 4)
+    b.add(stat("Last good backup", [prom("aio_backup_last_success_timestamp_seconds * 1000", instant=True)],
+               unit="dateTimeFromNow", no_value="never"), 4, 4)
+    b.add(stat("Next backup", [prom("aio_backup_next_run_timestamp_seconds * 1000", instant=True)],
+               unit="dateTimeFromNow", no_value="not scheduled"), 4, 4)
+    b.add(stat("Last size", [prom("aio_backup_last_success_bytes", instant=True)], unit="bytes", no_value="–",
+               desc="Compressed tarball of the last good backup"), 4, 4)
+    b.add(stat("On the NAS", [prom("aio_backup_nas_bytes", instant=True)], unit="bytes", no_value="–",
+               desc="This host's backups on the share, as of the last backup or listing"), 4, 4)
+    b.add(stat("NAS free", [prom("aio_backup_nas_free_bytes", instant=True)], unit="bytes", no_value="–"), 4, 4)
+    b.add(ts("Backup size", [prom("aio_backup_last_success_bytes", "last backup"),
+                             prom("aio_backup_nas_bytes", "all on the NAS", ref="B")], "bytes",
+             desc="Tarball size and this host's total on the share"), 12, 8)
+    b.add(logs("Backup runs", '{source="journal", unit="agent-sandboxes-ui.service"} |= "backup trigger="',
+               desc="One line per run, from the UI server's journal"), 12, 8)
 
     b.row("Host")
     exporter = stat("Exporter age", [prom("time() - aio_exporter_last_run_timestamp_seconds", instant=True)],

@@ -1938,6 +1938,15 @@ async def prune_backups(cfg: dict) -> list[str]:
     return gone
 
 
+def remember_listing(listing: dict):
+    """Keep the NAS totals for the metrics exporter (it doesn't talk to the NAS)."""
+    mine = [f for f in listing["files"] if f["mine"] and not f["partial"]]
+    st = load_backup_status()
+    st["remote"] = {"count": len(mine), "bytes": sum(f["size"] for f in mine),
+                    "free": listing["free"], "total": listing["total"], "at": time.time()}
+    save_backup_status(st)
+
+
 def backup_sources(cfg: dict) -> dict[str, list[str]]:
     inc, home = cfg["include"], Path.home()
     src = {"projects": [ws["WS_DIR"] for ws in all_ws()] if inc["projects"] else [],
@@ -2009,6 +2018,7 @@ async def run_backup(trigger: str):
         backup_phase = "pruning old backups"
         try:
             rec["pruned"] = await prune_backups(cfg)
+            remember_listing(parse_listing(await smb(cfg, "ls")))
         except BackupError as e:
             rec["warnings"] = rec.get("warnings", []) + [f"Pruning failed: {e}"]
     except BackupError as e:
@@ -2022,7 +2032,11 @@ async def run_backup(trigger: str):
         st = load_backup_status()
         st["runs"].append(rec)
         save_backup_status(st)
-        print(f"backup ({trigger}): " + ("ok " + name if rec["ok"] else "failed: " + rec["error"]), flush=True)
+        # logfmt, for the Backup panel in Grafana (the journal goes to Loki)
+        print(f'backup trigger={trigger} result={"ok" if rec["ok"] else "failed"} file={name} '
+              f'bytes={rec.get("size", 0)} seconds={rec["finished"] - rec["started"]:.0f} '
+              f'warnings={len(rec.get("warnings", []))} pruned={len(rec.get("pruned", []))}'
+              + ("" if rec["ok"] else " error=" + json.dumps(rec["error"])), flush=True)
 
 
 def start_backup(trigger: str) -> bool:
@@ -2069,6 +2083,7 @@ async def backup_api(req: Request, parts: list[str], w):
             return await send_json(w, {"error": "Set up and save the NAS first"}, 400)
         if parts == ["test"] and m == "POST":
             listing = parse_listing(await smb_ensure_dir(cfg))
+            remember_listing(listing)
             return await send_json(w, {"ok": True, **listing})
         if parts == ["run"] and m == "POST":
             if not start_backup("manual"):
@@ -2076,17 +2091,23 @@ async def backup_api(req: Request, parts: list[str], w):
             await asyncio.sleep(0.2)
             return await send_json(w, backup_state())
         if parts == ["remote"] and m == "GET":
-            return await send_json(w, parse_listing(await smb(cfg, "ls")))
+            listing = parse_listing(await smb(cfg, "ls"))
+            remember_listing(listing)
+            return await send_json(w, listing)
         if len(parts) == 2 and parts[0] == "remote" and m == "DELETE":
             if not BACKUP_RE.match(parts[1]):
                 return await send_json(w, {"error": "Not a backup file"}, 400)
             await smb(cfg, f'del "{parts[1]}"')
-            return await send_json(w, parse_listing(await smb(cfg, "ls")))
+            listing = parse_listing(await smb(cfg, "ls"))
+            remember_listing(listing)
+            return await send_json(w, listing)
         if parts == ["prune"] and m == "POST":
             if backup_phase:
                 return await send_json(w, {"error": "A backup is running; it prunes when it's done"}, 409)
             gone = await prune_backups(cfg)
-            return await send_json(w, {"pruned": gone, **parse_listing(await smb(cfg, "ls"))})
+            listing = parse_listing(await smb(cfg, "ls"))
+            remember_listing(listing)
+            return await send_json(w, {"pruned": gone, **listing})
     except BackupError as e:
         return await send_json(w, {"error": str(e)}, 502)
     await respond(w, 404, "Not found\n")
