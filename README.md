@@ -89,13 +89,14 @@ flowchart LR
 | `monitoring/alloy/`, `prometheus/`, `loki/` | Collector and storage config |
 | `monitoring/grafana/build-dashboards.py` → `dashboards/*.json` | Provisioned dashboards (edit the script, re-run) |
 | `monitoring/.env` ✱, `monitoring/data/` ✱, `secrets/grafana-admin-password` ✱ | Monitoring settings, exporter output, Grafana data |
+| `secrets/backup.json` ✱, `secrets/backup-status.json` ✱ | Backup settings (NAS password included) and recent runs |
 
 ✱ created at runtime, git-ignored.
 
 ## Setup
 
 Requires Linux with Landlock, Docker + compose, nono, tmux, python3 (3.11+), openssl and
-Claude Code. Paths assume a clone at `~/agent-sandboxes` and the unit's user `metahertz`
+Claude Code; `smbclient` and `zstd` for backups. Paths assume a clone at `~/agent-sandboxes` and the unit's user `metahertz`
 (uid 1000); edit the unit and `nono/claude-browser.jsonc` hook path otherwise.
 
 ```bash
@@ -214,6 +215,9 @@ container's network, resource limits, the CLAUDE.md notes, and workspace-only SS
   fingerprint, to trust it in your browser or system.
 - **Sandbox notes** (*Settings*): edit the CLAUDE.md block described above; *Reset to
   default* goes back to `ui/claude-md-additions.md`.
+- **Backup** (*Settings*): tarballs of the workspace folders, this app's settings and
+  secrets, and Claude Code's config, copied to an SMB share on a schedule, with old ones
+  pruned. See [Backup](#backup).
 
 ### From the shell
 
@@ -262,6 +266,47 @@ forwarding. tmux is configured so attached clients (SSH or the web terminal) can
 detach (`C-b d`) and scroll (`C-b [`), not open windows or switch sessions. Use a key per
 workspace, and not one that already logs in to the account unrestricted (sshd would use
 that line first; the UI refuses such keys).
+
+## Backup
+
+**Settings → Backup to a NAS** packs a tarball and copies it to an SMB (CIFS) share. It
+uses `smbclient` (`sudo apt install smbclient`), so nothing is mounted and the service
+needs no root.
+
+- **NAS:** server (optionally `:port`), share, folder on the share (created if missing),
+  username, password and optional domain. They're saved in `secrets/backup.json` (0600,
+  never readable inside nono), and the password is never sent back to the browser.
+  *Save & test connection* checks the login and folder and shows the free space.
+- **What goes in:** any of the workspace folders; this app's settings and secrets
+  (`workspaces/`, `state/`, `secrets/`, `ui/token`, `ui/tls/`, `ui/extra-hostnames`,
+  `monitoring/.env`); and Claude Code's config (`~/.claude`, `~/.claude.json`: sessions,
+  memory, settings, login). `node_modules`, `.venv` and `__pycache__` are left out
+  unless you untick that. The NAS password itself isn't included.
+- **Schedule:** off, daily or weekly at a time in the host's local time. A run missed
+  while the host was down starts once the UI is back. *Back up now* runs one at any time.
+- **Retention:** after each backup, this host's backups older than *Keep backups for*
+  days are deleted, but never the newest one. Uploads that didn't finish are deleted
+  after a day. *Backups on the NAS* lists the folder, with *Delete* per file and
+  *Prune now*. Files are named `agent-sandboxes-<host>-<UTC time>.tar.zst`, so several
+  hosts can share a folder; each prunes only its own.
+
+The tarball is built under `secrets/backup-staging/`, so the disk needs room for one
+compressed copy. It's uploaded as `<name>.part` and renamed once complete. Files that
+can't be read, or that change while being read, are reported as warnings on that run;
+they don't fail it. The tarball is **not encrypted**: with the second and third options
+ticked it holds private SSH keys, API tokens and Claude's login, so keep the share
+private to you.
+
+To restore, copy a tarball back, then:
+
+```bash
+tar -tf agent-sandboxes-<host>-<time>.tar.zst                    # look first
+tar -xOf agent-sandboxes-<host>-<time>.tar.zst BACKUP-MANIFEST.json   # what's inside
+tar -xf agent-sandboxes-<host>-<time>.tar.zst -C ~/restore       # into a scratch folder, or
+sudo systemctl stop agent-sandboxes-ui; tar -xf agent-sandboxes-<host>-<time>.tar.zst -C /   # in place
+```
+
+Paths are stored relative to `/`. Stop Claude in the workspaces before restoring in place.
 
 ## Monitoring
 

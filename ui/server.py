@@ -22,7 +22,9 @@ sandbox API key injected here, so the key never reaches a browser.
 
 import asyncio
 import base64
+import contextlib
 import ctypes
+import datetime
 import fcntl
 import hashlib
 import hmac
@@ -121,10 +123,10 @@ def sandbox_prefix(name: str) -> str:
     return "/__s/" + session_value(f"sbx:{name}:{CAP_SALT}")[:40]
 
 
-async def run(*cmd: str, timeout: float = 120) -> tuple[int, str, str]:
+async def run(*cmd: str, timeout: float = 120, preexec_fn=None) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, preexec_fn=preexec_fn)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
     except TimeoutError:
@@ -1724,11 +1726,369 @@ async def settings_api(req: Request, parts: list[str], w):
                                200 if rc == 0 else 500)
     if parts == ["claude-md"]:
         return await claude_md_api(req, w)
+    if parts[:1] == ["backup"]:
+        return await backup_api(req, parts[1:], w)
     if parts == ["monitoring", "password"] and m == "GET":
         try:
             return await send_json(w, {"password": (SECRETS / "grafana-admin-password").read_text().strip()})
         except OSError:
             return await send_json(w, {"error": "No local Grafana password yet: apply first"}, 404)
+    await respond(w, 404, "Not found\n")
+
+
+# ---- settings: backup (tarballs to an SMB share via smbclient: no mount, so no root needed)
+
+BACKUP_CONF = SECRETS / "backup.json"              # NAS details, password included (0600)
+BACKUP_STATUS = SECRETS / "backup-status.json"     # recent runs, for the Settings page
+BACKUP_STAGING = SECRETS / "backup-staging"        # the tarball while it's built and uploaded
+BACKUP_RE = re.compile(r"^agent-sandboxes-([a-z0-9-]{1,63})-(\d{8}T\d{6}Z)\.tar\.(zst|gz)(\.part)?$")
+REBUILDABLE = ["node_modules", ".venv", "__pycache__"]
+BACKUP_DEFAULT = {"server": "", "share": "", "dir": "agent-sandboxes", "username": "", "password": "",
+                  "domain": "", "include": {"projects": True, "config": True, "claude": True},
+                  "skip_rebuildable": True, "schedule": "off", "time": "03:00", "weekday": 6,
+                  "keep_days": 14, "schedule_since": 0}
+SMB_ERRORS = {   # smbclient's NT_STATUS codes, said plainly
+    "NT_STATUS_LOGON_FAILURE": "The NAS rejected the username or password",
+    "NT_STATUS_ACCESS_DENIED": "The NAS denied access (check the user's rights on the share and folder)",
+    "NT_STATUS_BAD_NETWORK_NAME": "The NAS has no share by that name",
+    "NT_STATUS_OBJECT_NAME_NOT_FOUND": "That folder doesn't exist on the share",
+    "NT_STATUS_OBJECT_PATH_NOT_FOUND": "That folder doesn't exist on the share",
+    "NT_STATUS_CONNECTION_REFUSED": "The NAS refused the connection (is SMB enabled on it?)",
+    "NT_STATUS_IO_TIMEOUT": "Couldn't reach the NAS (timed out)",
+    "NT_STATUS_HOST_UNREACHABLE": "Couldn't reach the NAS (host unreachable)",
+    "NT_STATUS_UNSUCCESSFUL": "Couldn't reach the NAS (name not found or no route)",
+    "NT_STATUS_DISK_FULL": "The share is full",
+}
+backup_task: asyncio.Task | None = None
+backup_phase = ""
+
+
+class BackupError(Exception):
+    pass
+
+
+def host_tag() -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", socket.gethostname().lower()).strip("-")[:63] or "host"
+
+
+def load_backup_conf() -> dict:
+    try:
+        saved = json.loads(BACKUP_CONF.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    cfg = {**BACKUP_DEFAULT, **{k: v for k, v in saved.items() if k in BACKUP_DEFAULT}}
+    cfg["include"] = {**BACKUP_DEFAULT["include"], **cfg["include"]}
+    return cfg
+
+
+def load_backup_status() -> dict:
+    try:
+        return json.loads(BACKUP_STATUS.read_text())
+    except (OSError, ValueError):
+        return {"runs": [], "last_attempt": 0}
+
+
+def save_backup_status(st: dict):
+    st["runs"] = st["runs"][-20:]
+    private_write(BACKUP_STATUS, json.dumps(st, indent=2))
+
+
+def backup_configured(cfg: dict) -> bool:
+    return bool(cfg["server"] and cfg["share"] and cfg["username"])
+
+
+def validate_backup(body: dict, cur: dict) -> dict:
+    cfg = dict(cur)
+    for k in ("server", "share", "dir", "username", "domain", "time", "schedule"):
+        if k in body:
+            cfg[k] = str(body[k]).strip()
+    cfg["dir"] = cfg["dir"].strip("/")
+    if not re.fullmatch(r"([A-Za-z0-9.-]{1,253}(:[1-9][0-9]{0,4})?)?", cfg["server"]):
+        raise ValueError("Server: a hostname or IP address, optionally with :port")
+    if not re.fullmatch(r"([A-Za-z0-9 ._$-]{1,80})?", cfg["share"]):
+        raise ValueError("Share: just the share's name (letters, digits, spaces, . _ - $)")
+    if cfg["dir"] and any(seg in (".", "..") or not re.fullmatch(r"[A-Za-z0-9 ._()-]{1,100}", seg)
+                          for seg in cfg["dir"].split("/")):
+        raise ValueError("Folder: a path on the share like backups/agent-sandboxes (letters, digits, spaces, . _ - ( ))")
+    if not re.fullmatch(r"[A-Za-z0-9._@+-]{0,104}", cfg["username"]):
+        raise ValueError("Username: letters, digits and . _ @ + - (put the domain in its own field)")
+    if not re.fullmatch(r"[A-Za-z0-9.-]{0,64}", cfg["domain"]):
+        raise ValueError("Domain / workgroup: letters, digits, dots and dashes")
+    if body.get("forget_password"):
+        cfg["password"] = ""
+    elif isinstance(body.get("password"), str) and body["password"]:
+        if re.search(r"[\r\n\0]", body["password"]) or len(body["password"]) > 256:
+            raise ValueError("Password can't contain line breaks")
+        cfg["password"] = body["password"]
+    if cfg["server"] and not (cfg["share"] and cfg["username"]):
+        raise ValueError("A NAS needs a share and a username")
+    inc = body.get("include", {})
+    cfg["include"] = {k: bool(inc.get(k, v)) for k, v in cur["include"].items()}
+    cfg["skip_rebuildable"] = bool(body.get("skip_rebuildable", cur["skip_rebuildable"]))
+    if cfg["schedule"] not in ("off", "daily", "weekly"):
+        raise ValueError("Schedule: off, daily or weekly")
+    if not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", cfg["time"]):
+        raise ValueError("Time: HH:MM")
+    try:
+        cfg["weekday"] = int(body.get("weekday", cur["weekday"]))
+        cfg["keep_days"] = int(body.get("keep_days", cur["keep_days"]))
+    except (TypeError, ValueError):
+        raise ValueError("Day and days to keep must be numbers") from None
+    if not 0 <= cfg["weekday"] <= 6 or not 0 <= cfg["keep_days"] <= 3650:
+        raise ValueError("Keep backups for 0-3650 days (0 keeps them all)")
+    if cfg["schedule"] != "off" and not backup_configured(cfg):
+        raise ValueError("Set up the NAS before scheduling backups")
+    if any(cfg[k] != cur[k] for k in ("schedule", "time", "weekday")):
+        cfg["schedule_since"] = time.time()   # the first run is the next slot from now, not a missed one
+    return cfg
+
+
+def next_backup(cfg: dict, st: dict) -> float | None:
+    """The first schedule slot after the last run (or after the schedule was
+    set): a slot missed while the server was down runs as soon as it's back."""
+    if cfg["schedule"] == "off" or not backup_configured(cfg):
+        return None
+    base = datetime.datetime.fromtimestamp(max(st.get("last_attempt", 0), cfg["schedule_since"]))
+    h, m = map(int, cfg["time"].split(":"))
+    t = base.replace(hour=h, minute=m, second=0, microsecond=0)
+    if t <= base:
+        t += datetime.timedelta(days=1)
+    while cfg["schedule"] == "weekly" and t.weekday() != cfg["weekday"]:
+        t += datetime.timedelta(days=1)
+    return t.timestamp()
+
+
+def smbclient_path() -> str | None:
+    return os.environ.get("AIO_SMBCLIENT") or shutil.which("smbclient")
+
+
+def smb_error(text: str) -> str:
+    for code, plain in SMB_ERRORS.items():
+        if code in text:
+            return f"{plain} ({code})"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return next((ln for ln in lines if "NT_STATUS" in ln), lines[-1] if lines else "smbclient failed")
+
+
+async def smb(cfg: dict, command: str, cd: bool = True, timeout: float = 120) -> str:
+    """One smbclient command (it ignores errors in a ;-separated list and still
+    exits 0, so never chain ones that matter). The password goes in a 0600
+    auth file, not on the command line."""
+    exe = smbclient_path()
+    if not exe:
+        raise BackupError("smbclient isn't installed on this host: sudo apt install smbclient")
+    auth = RUNTIME / f"smb-auth-{secrets.token_hex(6)}"
+    private_write(auth, f"username = {cfg['username']}\npassword = {cfg['password']}\n"
+                        + (f"domain = {cfg['domain']}\n" if cfg["domain"] else ""))
+    host, _, port = cfg["server"].partition(":")
+    args = [exe, f"//{host}/{cfg['share']}", "-A", str(auth), "-c", command]
+    if port:
+        args += ["-p", port]
+    if cd and cfg["dir"]:
+        args += ["-D", cfg["dir"].replace("/", "\\")]
+    try:
+        rc, out, err = await run(*args, timeout=timeout, preexec_fn=die_with_parent)
+    finally:
+        auth.unlink(missing_ok=True)
+    if rc != 0:
+        raise BackupError(smb_error(out + err))
+    return out
+
+
+async def smb_ensure_dir(cfg: dict) -> str:
+    """Create the folder (and its parents) if needed; returns its listing."""
+    if cfg["dir"]:
+        segs = cfg["dir"].split("/")
+        mk = "; ".join('mkdir "{}"'.format("\\".join(segs[:i])) for i in range(1, len(segs) + 1))
+        await smb(cfg, mk, cd=False)     # "already exists" errors are fine; the ls below checks
+    return await smb(cfg, "ls")
+
+
+def parse_listing(out: str) -> dict:
+    files = []
+    for line in out.splitlines():
+        m = re.match(r"^  (.+?)\s+([A-Z]*)\s+(\d+)\s+\w{3} \w{3} [ \d]\d \d\d:\d\d:\d\d \d{4}$", line)
+        if not m or "D" in m.group(2):
+            continue
+        b = BACKUP_RE.match(m.group(1))
+        if b:
+            at = datetime.datetime.strptime(b.group(2), "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+            files.append({"name": m.group(1), "host": b.group(1), "at": at.timestamp(),
+                          "size": int(m.group(3)), "partial": bool(b.group(4)), "mine": b.group(1) == host_tag()})
+    files.sort(key=lambda f: f["at"], reverse=True)
+    free = re.search(r"(\d+) blocks of size (\d+)\. (\d+) blocks available", out)
+    return {"files": files, "free": int(free.group(3)) * int(free.group(2)) if free else None,
+            "total": int(free.group(1)) * int(free.group(2)) if free else None}
+
+
+async def prune_backups(cfg: dict) -> list[str]:
+    """Delete this host's backups older than keep_days (never its newest
+    complete one), and uploads that never finished."""
+    listing = parse_listing(await smb(cfg, "ls"))
+    mine = [f for f in listing["files"] if f["mine"]]
+    complete = [f for f in mine if not f["partial"]]
+    doomed = [f for f in mine if f["partial"] and f["at"] < time.time() - 86400]
+    if cfg["keep_days"]:
+        cutoff = time.time() - cfg["keep_days"] * 86400
+        doomed += [f for f in complete[1:] if f["at"] < cutoff]
+    gone = []
+    for f in doomed:
+        await smb(cfg, f'del "{f["name"]}"')
+        gone.append(f["name"])
+    return gone
+
+
+def backup_sources(cfg: dict) -> dict[str, list[str]]:
+    inc, home = cfg["include"], Path.home()
+    src = {"projects": [ws["WS_DIR"] for ws in all_ws()] if inc["projects"] else [],
+           "config": [str(p) for p in (WS_ROOT, STATE_ROOT, SECRETS, TOKEN_FILE, TLS_DIR,
+                                       ROOT / "ui" / "extra-hostnames", MONITORING_ENV)] if inc["config"] else [],
+           "claude": [str(CLAUDE_HOME), str(home / ".claude.json")] if inc["claude"] else []}
+    return {k: [p for p in v if os.path.lexists(p)] for k, v in src.items()}
+
+
+async def make_tarball(cfg: dict, name: str) -> tuple[Path, list[str]]:
+    src = backup_sources(cfg)
+    paths = list(dict.fromkeys(p for v in src.values() for p in v))
+    if not paths:
+        raise BackupError("Nothing to back up: tick at least one of the What to back up options")
+    if BACKUP_STAGING.exists():
+        shutil.rmtree(BACKUP_STAGING)    # leftovers of a run the server didn't finish
+    BACKUP_STAGING.mkdir(mode=0o700)
+    meta = BACKUP_STAGING / "meta"
+    meta.mkdir()
+    (meta / "BACKUP-MANIFEST.json").write_text(json.dumps({
+        "format": 1, "tool": "agent-sandboxes", "host": socket.gethostname(),
+        "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "sources": src, "workspaces": {ws["WS_NAME"]: ws["WS_DIR"] for ws in all_ws()},
+        "restore": "Paths are stored relative to /. Look first with tar -tf, then extract "
+                   "into a scratch folder (tar -xf FILE -C DIR) or in place (-C /).",
+    }, indent=2) + "\n")
+    out = BACKUP_STAGING / name
+    excludes = [str(p).lstrip("/") for p in (BACKUP_STAGING, BACKUP_CONF)]
+    if cfg["skip_rebuildable"]:
+        excludes += REBUILDABLE
+    cmd = ["tar", "--create", "--file", str(out), "--zstd" if name.endswith(".zst") else "--gzip",
+           "--ignore-failed-read", "--warning=no-file-changed", "--warning=no-file-removed",
+           *(f"--exclude={x}" for x in excludes),
+           "-C", str(meta), "BACKUP-MANIFEST.json", "-C", "/", *(p.lstrip("/") for p in paths)]
+    if shutil.which("ionice"):
+        cmd = ["ionice", "-c", "3", *cmd]
+    rc, _, err = await run("nice", "-n", "10", *cmd, timeout=6 * 3600, preexec_fn=die_with_parent)
+    warnings = [ln for ln in err.splitlines() if ln.strip()]
+    if rc > 1 or not out.is_file():           # 1: a file changed while it was read
+        raise BackupError("tar failed: " + "; ".join(warnings[-3:]) if warnings else f"tar exited {rc}")
+    return out, warnings[:20]
+
+
+async def run_backup(trigger: str):
+    global backup_phase
+    cfg, st = load_backup_conf(), load_backup_status()
+    st["last_attempt"] = time.time()
+    save_backup_status(st)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name = f"agent-sandboxes-{host_tag()}-{stamp}.tar." + ("zst" if shutil.which("zstd") else "gz")
+    rec = {"started": st["last_attempt"], "trigger": trigger, "file": name, "ok": False}
+    try:
+        if not backup_configured(cfg):
+            raise BackupError("No NAS set up")
+        backup_phase = "checking the NAS"
+        await smb_ensure_dir(cfg)
+        backup_phase = "archiving"
+        tarball, rec["warnings"] = await make_tarball(cfg, name)
+        rec["size"] = tarball.stat().st_size
+        backup_phase = "uploading"
+        try:
+            await smb(cfg, f'put "{tarball}" "{name}.part"', timeout=12 * 3600)
+            await smb(cfg, f'rename "{name}.part" "{name}"')
+        except BackupError:
+            with contextlib.suppress(BackupError):
+                await smb(cfg, f'del "{name}.part"')
+            raise
+        rec["ok"] = True
+        backup_phase = "pruning old backups"
+        try:
+            rec["pruned"] = await prune_backups(cfg)
+        except BackupError as e:
+            rec["warnings"] = rec.get("warnings", []) + [f"Pruning failed: {e}"]
+    except BackupError as e:
+        rec["error"] = str(e)
+    except Exception as e:      # keep the scheduler alive; show it on the page
+        rec["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        shutil.rmtree(BACKUP_STAGING, ignore_errors=True)
+        backup_phase = ""
+        rec["finished"] = time.time()
+        st = load_backup_status()
+        st["runs"].append(rec)
+        save_backup_status(st)
+        print(f"backup ({trigger}): " + ("ok " + name if rec["ok"] else "failed: " + rec["error"]), flush=True)
+
+
+def start_backup(trigger: str) -> bool:
+    global backup_task
+    if backup_task and not backup_task.done():
+        return False
+    backup_task = asyncio.create_task(run_backup(trigger))
+    return True
+
+
+async def backup_scheduler():
+    await asyncio.sleep(60)          # let the UI and sandboxes come up first
+    while True:
+        due = next_backup(load_backup_conf(), load_backup_status())
+        if due is not None and time.time() >= due:
+            start_backup("schedule")
+        await asyncio.sleep(30)
+
+
+def backup_state() -> dict:
+    cfg, st = load_backup_conf(), load_backup_status()
+    public = {k: v for k, v in cfg.items() if k not in ("password", "schedule_since")}
+    return {"config": {**public, "password_set": bool(cfg["password"])},
+            "smbclient": bool(smbclient_path()), "running": backup_phase or None,
+            "runs": st["runs"][-10:][::-1], "next": next_backup(cfg, st), "host": host_tag(),
+            "tz": time.strftime("%Z, UTC%z"), "home": str(Path.home()),
+            "sources": backup_sources({**cfg, "include": {k: True for k in cfg["include"]}})}
+
+
+async def backup_api(req: Request, parts: list[str], w):
+    m = req.method
+    try:
+        if parts == [] and m == "GET":
+            return await send_json(w, backup_state())
+        if parts == [] and m == "PUT":
+            try:
+                cfg = validate_backup(json.loads(req.body or b"{}"), load_backup_conf())
+            except (ValueError, json.JSONDecodeError) as e:
+                return await send_json(w, {"error": str(e)}, 400)
+            private_write(BACKUP_CONF, json.dumps(cfg, indent=2))
+            return await send_json(w, backup_state())
+        cfg = load_backup_conf()
+        if parts and not backup_configured(cfg):
+            return await send_json(w, {"error": "Set up and save the NAS first"}, 400)
+        if parts == ["test"] and m == "POST":
+            listing = parse_listing(await smb_ensure_dir(cfg))
+            return await send_json(w, {"ok": True, **listing})
+        if parts == ["run"] and m == "POST":
+            if not start_backup("manual"):
+                return await send_json(w, {"error": "A backup is already running"}, 409)
+            await asyncio.sleep(0.2)
+            return await send_json(w, backup_state())
+        if parts == ["remote"] and m == "GET":
+            return await send_json(w, parse_listing(await smb(cfg, "ls")))
+        if len(parts) == 2 and parts[0] == "remote" and m == "DELETE":
+            if not BACKUP_RE.match(parts[1]):
+                return await send_json(w, {"error": "Not a backup file"}, 400)
+            await smb(cfg, f'del "{parts[1]}"')
+            return await send_json(w, parse_listing(await smb(cfg, "ls")))
+        if parts == ["prune"] and m == "POST":
+            if backup_phase:
+                return await send_json(w, {"error": "A backup is running; it prunes when it's done"}, 409)
+            gone = await prune_backups(cfg)
+            return await send_json(w, {"pruned": gone, **parse_listing(await smb(cfg, "ls"))})
+    except BackupError as e:
+        return await send_json(w, {"error": str(e)}, 502)
     await respond(w, 404, "Not found\n")
 
 
@@ -2630,7 +2990,7 @@ async def main():
     drop_ambient_caps()
     for addr in BIND:
         print(f"Agent Sandboxes UI on {SCHEME}://{addr}:{LISTEN_PORT}/", flush=True)
-    await asyncio.gather(renew_daily(), *(s.serve_forever() for s in servers))
+    await asyncio.gather(renew_daily(), backup_scheduler(), *(s.serve_forever() for s in servers))
 
 
 def cli_prepare(name: str, aux: bool = False):

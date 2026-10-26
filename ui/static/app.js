@@ -906,6 +906,7 @@ async function loadSettings() {
   try {
     const st = await api("GET", "settings/monitoring");
     loadClaudeMd();
+    loadBackup(true);
     renderMonStatus(st);
     fillMonForm(st);
     $("#ca-card").hidden = !st.caFingerprint;
@@ -997,6 +998,193 @@ $("#mon-pw").addEventListener("click", async () => {
   } catch (e) {
     monMsg(e.message, true);
   }
+});
+
+// ------------------------------------------------------------------ settings (backup)
+
+let bkPoll = null;
+
+function bkMsg(text, isErr = false) {
+  $("#bk-msg").textContent = text;
+  $("#bk-msg").classList.toggle("err", isErr);
+}
+
+function syncSchedFields() {
+  const v = $("#bk-form").elements.schedule.value;
+  $$("[data-when-sched]").forEach((n) => (n.hidden = !n.dataset.whenSched.split(" ").includes(v)));
+}
+
+function renderBackupStatus(st) {
+  const box = $("#bk-status");
+  box.replaceChildren();
+  if (!st.smbclient) box.append(el("span", { className: "pill bad", textContent: "smbclient not installed — sudo apt install smbclient" }));
+  if (st.running) box.append(el("span", { className: "pill warn", textContent: `backing up: ${st.running}…` }));
+  const last = st.runs[0];
+  if (last) {
+    box.append(el("span", { className: `pill ${last.ok ? "ok" : "bad"}`, title: last.error || "",
+      textContent: `last backup ${last.ok ? "ok" : "failed"} ${fmtTime(last.finished)}` }));
+  }
+  box.append(el("span", { className: `pill ${st.next ? "ok" : ""}`,
+    textContent: st.next ? `next ${fmtTime(st.next)}` : "not scheduled" }));
+  $("#bk-run").disabled = !!st.running;
+
+  const runs = $("#bk-runs");
+  runs.replaceChildren();
+  if (!st.runs.length) {
+    runs.append(el("tr", {}, el("td", { className: "note muted", textContent: "No backups yet." })));
+  } else {
+    runs.append(el("tr", {}, ...["Started", "", "Size", "Result"].map((t) => el("th", { textContent: t }))));
+    for (const r of st.runs) {
+      const notes = [r.ok ? `uploaded ${r.file}` : r.error];
+      if (r.pruned?.length) notes.push(`pruned ${r.pruned.length}`);
+      if (r.warnings?.length) notes.push(`${r.warnings.length} warning${r.warnings.length === 1 ? "" : "s"}`);
+      runs.append(el("tr", { title: (r.warnings || []).join("\n") },
+        el("td", { textContent: fmtTime(r.started) }),
+        el("td", { className: "muted", textContent: r.trigger }),
+        el("td", { className: "num", textContent: fmtBytes(r.size) }),
+        el("td", {}, el("span", { className: `pill ${r.ok ? "ok" : "bad"}`, textContent: r.ok ? "ok" : "failed" }),
+          " ", el("span", { className: "muted", textContent: notes.join(" · ") }))));
+    }
+  }
+  clearInterval(bkPoll);
+  bkPoll = st.running ? setInterval(async () => {
+    if (state.view !== "settings") return clearInterval(bkPoll);
+    try {
+      const s2 = await api("GET", "settings/backup");
+      renderBackupStatus(s2);
+      if (!s2.running) {
+        const r = s2.runs[0];
+        if (r) bkMsg(r.ok ? `Backed up ${fmtBytes(r.size)} as ${r.file}.` : `Backup failed: ${r.error}`, !r.ok);
+        loadRemote();
+      }
+    } catch (e) { /* keep polling */ }
+  }, 2000) : null;
+}
+
+function fillBackupForm(st) {
+  const f = $("#bk-form").elements, c = st.config;
+  for (const k of ["server", "share", "dir", "domain", "username", "time", "keep_days"]) f[k].value = c[k];
+  f.password.value = "";
+  f.password.placeholder = c.password_set ? "saved — type to change" : "";
+  $("#bk-forget").hidden = !c.password_set;
+  for (const k of ["projects", "config", "claude"]) f[`inc-${k}`].checked = c.include[k];
+  f.skip_rebuildable.checked = c.skip_rebuildable;
+  f.schedule.value = c.schedule;
+  f.weekday.value = String(c.weekday);
+  const src = st.sources;
+  const tilde = (ps) => ps.map((p) => p.replace(st.home, "~")).join(", ");
+  $("#bk-src-projects").textContent = src.projects.length ? `(${src.projects.length}: ${tilde(src.projects)})` : "(none yet)";
+  $("#bk-src-config").textContent = `(${tilde(src.config)})`;
+  $("#bk-src-claude").textContent = `(${tilde(src.claude)})`;
+  $("#bk-tz").textContent = ` (${st.tz})`;
+  syncSchedFields();
+}
+
+async function loadBackup(fill) {
+  try {
+    const st = await api("GET", "settings/backup");
+    if (fill) fillBackupForm(st);
+    renderBackupStatus(st);
+    if (st.config.server) loadRemote();
+    else $("#bk-files").replaceChildren(el("tr", {}, el("td", { className: "note muted", textContent: "Set up the NAS above first." })));
+  } catch (e) {
+    bkMsg(e.message, true);
+  }
+}
+
+function renderRemote(r) {
+  $("#bk-free").textContent = r.free == null ? "" : `${fmtBytes(r.free)} free of ${fmtBytes(r.total)} on the share.`;
+  const t = $("#bk-files");
+  t.replaceChildren();
+  if (!r.files.length) {
+    t.append(el("tr", {}, el("td", { className: "note muted", textContent: "No backups in this folder yet." })));
+    return;
+  }
+  t.append(el("tr", {}, ...["Backup", "Host", "Taken", "Size", ""].map((x) => el("th", { textContent: x }))));
+  for (const f of r.files) {
+    const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Delete" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Delete ${f.name} from the NAS? This can't be undone.`)) return;
+      try { renderRemote(await api("DELETE", `settings/backup/remote/${encodeURIComponent(f.name)}`)); bkMsg(`Deleted ${f.name}.`); }
+      catch (e) { bkMsg(e.message, true); }
+    });
+    t.append(el("tr", {},
+      el("td", { className: "item" }, el("span", { className: "mono", textContent: f.name }),
+        ...(f.partial ? [" ", el("span", { className: "pill warn", textContent: "incomplete" })] : [])),
+      el("td", { className: f.mine ? "" : "muted", textContent: f.host }),
+      el("td", { textContent: fmtTime(f.at) }),
+      el("td", { className: "num", textContent: fmtBytes(f.size) }),
+      el("td", { className: "acts" }, del)));
+  }
+}
+
+async function loadRemote() {
+  $("#bk-free").textContent = "Listing the NAS folder…";
+  try { renderRemote(await api("GET", "settings/backup/remote")); }
+  catch (e) {
+    $("#bk-free").textContent = "";
+    $("#bk-files").replaceChildren(el("tr", {}, el("td", { className: "note err", textContent: e.message })));
+  }
+}
+
+function backupValues() {
+  const f = $("#bk-form").elements;
+  const out = { include: {} };
+  for (const k of ["server", "share", "dir", "domain", "username", "time", "schedule"]) out[k] = f[k].value.trim();
+  if (f.password.value) out.password = f.password.value;
+  for (const k of ["projects", "config", "claude"]) out.include[k] = f[`inc-${k}`].checked;
+  out.skip_rebuildable = f.skip_rebuildable.checked;
+  out.weekday = Number(f.weekday.value);
+  out.keep_days = Number(f.keep_days.value);
+  return out;
+}
+
+async function saveBackup(extra = {}) {
+  const st = await api("PUT", "settings/backup", { ...backupValues(), ...extra });
+  fillBackupForm(st);
+  renderBackupStatus(st);
+  return st;
+}
+
+async function backupAction(kind) {
+  const buttons = $$("#bk-form .sticky-save .btn");
+  buttons.forEach((b) => (b.disabled = true));
+  bkMsg("Saving…");
+  try {
+    await saveBackup();
+    if (kind === "save") bkMsg("Saved.");
+    if (kind === "test") {
+      bkMsg("Connecting to the NAS…");
+      const r = await api("POST", "settings/backup/test");
+      bkMsg(`Connected; the folder is ready${r.free == null ? "" : ` (${fmtBytes(r.free)} free)`}.`);
+      renderRemote(r);
+    }
+    if (kind === "run") {
+      renderBackupStatus(await api("POST", "settings/backup/run"));
+      bkMsg("Backing up… you can leave this page; it carries on.");
+    }
+  } catch (e) {
+    bkMsg(e.message, true);
+  }
+  buttons.forEach((b) => (b.disabled = false));
+  loadBackup(false);
+}
+
+$("#bk-form").addEventListener("submit", (ev) => { ev.preventDefault(); backupAction("save"); });
+$("#bk-test").addEventListener("click", () => backupAction("test"));
+$("#bk-run").addEventListener("click", () => backupAction("run"));
+$("#bk-form").addEventListener("change", (ev) => { if (ev.target.name === "schedule") syncSchedFields(); });
+$("#bk-list").addEventListener("click", loadRemote);
+$("#bk-forget").addEventListener("click", async () => {
+  if (!confirm("Forget the saved NAS password?")) return;
+  try { await saveBackup({ forget_password: true }); bkMsg("Password forgotten."); } catch (e) { bkMsg(e.message, true); }
+});
+$("#bk-prune").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "settings/backup/prune");
+    renderRemote(r);
+    bkMsg(r.pruned.length ? `Deleted ${r.pruned.length}: ${r.pruned.join(", ")}.` : "Nothing old enough to prune.");
+  } catch (e) { bkMsg(e.message, true); }
 });
 
 // ------------------------------------------------------------------ boot

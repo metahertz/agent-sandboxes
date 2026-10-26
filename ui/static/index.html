@@ -44,7 +44,7 @@
         <span class="n">Import</span><span class="sub">Projects and Claude history from other machines</span>
       </button>
       <button id="settings-btn" class="ws-item pool-item" type="button" aria-current="false">
-        <span class="n">Settings</span><span class="sub">Monitoring, dashboards and telemetry</span>
+        <span class="n">Settings</span><span class="sub">Monitoring, backups and sandbox notes</span>
       </button>
     </div>
   </aside>
@@ -408,6 +408,80 @@
           <p class="form-msg" id="md-msg" role="status"></p>
         </div>
       </form>
+
+      <form id="bk-form" class="settings-form" autocomplete="off">
+        <section class="card">
+          <div class="card-head"><h2>Backup to a NAS</h2></div>
+          <p class="hint">Packs what you choose below into one tarball and copies it to an SMB (CIFS) share with <code>smbclient</code>, so nothing is mounted. Settings, including the password, are kept in <code>secrets/backup.json</code>, which Claude can't read.</p>
+          <div class="mon-status" id="bk-status"></div>
+          <div class="two">
+            <label><span>Server <span class="muted">(hostname or IP, optionally :port)</span></span>
+              <input name="server" placeholder="nas.local" autocomplete="off"></label>
+            <label>Share <input name="share" placeholder="backups" autocomplete="off"></label>
+          </div>
+          <div class="two">
+            <label><span>Folder on the share <span class="muted">(created if missing)</span></span>
+              <input name="dir" placeholder="agent-sandboxes" autocomplete="off"></label>
+            <label><span>Domain / workgroup <span class="muted">(optional)</span></span>
+              <input name="domain" placeholder="WORKGROUP" autocomplete="off"></label>
+          </div>
+          <div class="two">
+            <label>Username <input name="username" autocomplete="off"></label>
+            <label><span>Password <button class="linkish" type="button" id="bk-forget" hidden>forget saved password</button></span>
+              <input name="password" type="password" autocomplete="new-password"></label>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>What to back up</h2>
+          <div class="checks">
+            <label class="check"><input type="checkbox" name="inc-projects"> <span>Workspace folders <span class="muted" id="bk-src-projects"></span></span></label>
+            <label class="check"><input type="checkbox" name="inc-config"> <span>Agent Sandboxes settings and secrets: workspaces, access policies, the SSH key and API token pool, the HTTPS CA, the login token <span class="muted" id="bk-src-config"></span></span></label>
+            <label class="check"><input type="checkbox" name="inc-claude"> <span>Claude Code's config: sessions, memory, settings, plugins and its login <span class="muted" id="bk-src-claude"></span></span></label>
+            <label class="check"><input type="checkbox" name="skip_rebuildable"> <span>Leave out folders that can be rebuilt <span class="muted">(node_modules, .venv, __pycache__)</span></span></label>
+          </div>
+          <p class="hint" style="margin-top:10px">The tarball isn't encrypted, and with the last two ticked it holds private SSH keys, API tokens and Claude's login. Keep the share private to you.</p>
+        </section>
+
+        <section class="card">
+          <h2>Schedule and retention</h2>
+          <div class="radios inline">
+            <label class="check"><input type="radio" name="schedule" value="off"> <span>Only when I click Back up now</span></label>
+            <label class="check"><input type="radio" name="schedule" value="daily"> <span>Daily</span></label>
+            <label class="check"><input type="radio" name="schedule" value="weekly"> <span>Weekly</span></label>
+          </div>
+          <div class="three" style="margin-top:12px">
+            <label data-when-sched="daily weekly">Time <input name="time" type="time" required></label>
+            <label data-when-sched="weekly">Day <select name="weekday">
+              <option value="0">Monday</option><option value="1">Tuesday</option><option value="2">Wednesday</option>
+              <option value="3">Thursday</option><option value="4">Friday</option><option value="5">Saturday</option>
+              <option value="6">Sunday</option></select></label>
+            <label><span>Keep backups for <span class="muted">(days; 0 keeps all)</span></span>
+              <input name="keep_days" type="number" min="0" max="3650" required></label>
+          </div>
+          <p class="hint" style="margin-top:10px">Times are this host's local time<span id="bk-tz"></span>. A run missed while the host was off starts when the UI is back. After each backup, this host's backups older than the limit are deleted from the share, apart from the newest. Backups from other hosts in the same folder are left alone.</p>
+        </section>
+
+        <div class="row sticky-save">
+          <button class="btn primary" type="submit">Save</button>
+          <button class="btn" type="button" id="bk-test">Save &amp; test connection</button>
+          <button class="btn" type="button" id="bk-run">Back up now</button>
+          <p class="form-msg" id="bk-msg" role="status"></p>
+        </div>
+      </form>
+
+      <div class="settings-form">
+        <section class="card">
+          <div class="card-head"><h2>Backups on the NAS</h2>
+            <div class="row"><button class="btn" type="button" id="bk-list">Refresh</button>
+              <button class="btn" type="button" id="bk-prune">Prune now</button></div></div>
+          <p class="hint" id="bk-free"></p>
+          <div class="matrix-wrap"><table class="matrix" id="bk-files"></table></div>
+          <p class="hint" style="margin-top:10px">To restore, copy a tarball back, look inside with <code>tar -tf FILE</code>, then extract to a scratch folder (<code>tar -xf FILE -C DIR</code>) or in place (<code>-C /</code>; stop the UI and Claude first). Paths are stored relative to <code>/</code>, and <code>BACKUP-MANIFEST.json</code> lists what's inside.</p>
+          <h3>Recent runs</h3>
+          <div class="matrix-wrap"><table class="matrix" id="bk-runs"></table></div>
+        </section>
+      </div>
       </div>
     </section>
   </main>
