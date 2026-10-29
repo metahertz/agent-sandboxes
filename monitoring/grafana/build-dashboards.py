@@ -25,6 +25,9 @@ RUNNING = [{"type": "value", "options": {
 PENDING = [{"type": "value", "options": {
     "0": {"text": "✓ applied", "color": "green", "index": 0},
     "1": {"text": "⚠ restart Claude", "color": "orange", "index": 1}}}]
+CODE = [{"type": "value", "options": {
+    "0": {"text": "⚠ restart pending", "color": "orange", "index": 0},
+    "1": {"text": "✓ current", "color": "green", "index": 1}}}]
 BACKUP = [{"type": "value", "options": {
     "0": {"text": "– not set up", "color": "text", "index": 0},
     "1": {"text": "✓ ok", "color": "green", "index": 1},
@@ -191,6 +194,7 @@ def tokens(sel: str, by: str = "", rng: str = "$__interval") -> str:
 
 CPU = 'sum by (workspace) (rate(container_cpu_usage_seconds_total{workspace!=""}[$__rate_interval]))'
 MEM = 'sum by (workspace) (container_memory_working_set_bytes{workspace!=""})'
+PORT_FILTER = '{source="journal", unit="agent-sandboxes-proxy.service"} |= "port-filter " | logfmt'
 DENY_HOSTS = '{source="nono", decision="deny"} | json | target !~ "unix:.*"'
 DENY_SOCKS = '{source="nono", decision="deny"} | json | target =~ "unix:.*"'
 NONO_LINE = ('line_format "{{.workspace}}  {{.decision | upper}}  {{.target}}'
@@ -207,9 +211,10 @@ def overview() -> dict:
         stat("Pending", [prom("sum(aio_workspace_policy_pending{%s})" % T, instant=True)],
              thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}],
              desc="Workspaces whose saved access policy needs a Claude restart to apply"),
-        stat("Denials", [prom('sum(increase(aio_nono_network_events_total{decision="deny",%s}[$__range]))' % T,
-                                      instant=True)], decimals=0,
-             desc="Connections nono refused in the selected time range"),
+        stat("Denials", [prom('(sum(increase(aio_nono_network_events_total{decision="deny",%s}[$__range])) or vector(0))'
+                              ' + (sum(increase(aio_port_filter_denied_total{%s}[$__range])) or vector(0))' % (T, T),
+                              instant=True)], decimals=0,
+             desc="Connections nono or a port filter refused in the selected time range"),
         stat("Tokens", [loki(tokens(T, rng="$__range"), instant=True)], unit="short", decimals=1,
              desc="All token types, selected time range"),
         stat("Cost", [loki(api(T, "cost_usd", rng="$__range"), instant=True)], unit="currencyUSD",
@@ -264,8 +269,11 @@ def overview() -> dict:
 
     b.row("Sandbox network policy (nono)")
     b.add(ts("Denied connections", [prom('sum by (workspace) (increase(aio_nono_network_events_total{decision="deny",%s}[$__interval]))' % T,
-                                         "{{workspace}}")], "short", bars=True, stack=True,
-             desc="Connections nono refused, per interval"), 12, 8)
+                                         "{{workspace}}"),
+                                    prom('sum by (workspace) (increase(aio_port_filter_denied_total{%s}[$__interval]))' % T,
+                                         "{{workspace}} (port)", ref="B")], "short", bars=True, stack=True,
+             desc="Connections refused per interval: by nono (host not allowed), or by the workspace's "
+                  "port filter, \"(port)\" (host allowed, port not in its host:port entries)"), 12, 8)
     b.add(table("Most denied hosts", [loki('topk(15, sum by (target, workspace) (count_over_time(%s [$__range])))'
                                            % DENY_HOSTS.replace('decision="deny"', 'decision="deny", %s' % T),
                                            instant=True)],
@@ -274,7 +282,10 @@ def overview() -> dict:
                 transforms_extra=[{"id": "sortBy", "options": {"sort": [{"field": "Count", "desc": True}]}}]),
           12, 8)
     b.add(logs("Recent denials", ('%s | %s' % (DENY_HOSTS.replace('decision="deny"', 'decision="deny", %s' % T), NONO_LINE))),
-          24, 9)
+          12, 9)
+    b.add(logs("Port filter denials", '%s | %s | line_format "{{.workspace}}  DENY  {{.host}}:{{.port}}"' % (PORT_FILTER, T),
+               desc="Host allowed by nono, port not in the workspace's host:port entries "
+                    "(from the proxy service's journal; nono logs these as allowed)"), 12, 9)
 
     b.row("Backup")
     b.add(stat("Backup", [prom("aio_backup_state", instant=True)], mappings=BACKUP,
@@ -293,6 +304,25 @@ def overview() -> dict:
              desc="Tarball size and this host's total on the share"), 12, 8)
     b.add(logs("Backup runs", '{source="journal", unit="agent-sandboxes-ui.service"} |= "backup trigger="',
                desc="One line per run, from the UI server's journal"), 12, 8)
+
+    b.row("Services")
+    b.add(stat("UI service", [prom('aio_service_up{service="ui"}', instant=True)], mappings=UP,
+               desc="System unit agent-sandboxes-ui: the web UI"), 4, 4)
+    b.add(stat("Proxy service", [prom('aio_service_up{service="proxy"}', instant=True)], mappings=UP,
+               desc="System unit agent-sandboxes-proxy: API bridge, port filters, container proxies. "
+                    "While it's down, workspaces with tokens for http:// APIs, host:port entries or "
+                    "Container network: Same as Claude lose that network access"), 4, 4)
+    b.add(stat("Proxy code", [prom("aio_proxy_code_current", instant=True)], mappings=CODE, no_value="–",
+               desc="Whether the proxy service runs ui/proxyd.py and ui/common.py as on disk. Restarting it "
+                    "(sudo systemctl restart agent-sandboxes-proxy) drops the connections open through it"), 4, 4)
+    b.add(stat("Proxy problems", [prom("aio_proxy_problems", instant=True)], no_value="–",
+               thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}],
+               desc="Port filters, forwarders or container proxies that can't run; see the log below"), 4, 4)
+    b.add(stat("HTTP API bridge", [prom("aio_proxy_bridge_up", instant=True)], mappings=UP, no_value="–"), 4, 4)
+    b.add(stat("Proxy up since", [prom("aio_proxy_start_timestamp_seconds * 1000", instant=True)],
+               unit="dateTimeFromNow", no_value="–"), 4, 4)
+    b.add(logs("Proxy service", '{source="journal", unit="agent-sandboxes-proxy.service"}',
+               desc="Start-up, problems, container proxy messages and port filter denials"), 24, 7)
 
     b.row("Host")
     exporter = stat("Exporter age", [prom("time() - aio_exporter_last_run_timestamp_seconds", instant=True)],

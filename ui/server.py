@@ -28,7 +28,6 @@ import datetime
 import fcntl
 import hashlib
 import hmac
-import ipaddress
 import json
 import mimetypes
 import os
@@ -38,7 +37,6 @@ import re
 import secrets
 import shlex
 import shutil
-import signal
 import socket
 import ssl
 import struct
@@ -49,8 +47,14 @@ import time
 import urllib.parse
 from pathlib import Path
 
-ROOT = Path(os.environ.get("AIO_ROOT", Path.home() / "agent-sandboxes"))
-WS_ROOT = ROOT / "workspaces"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLICY, DOMAIN_RE,  # noqa: E402
+                    HTTP_BRIDGE, ITEM_RE, MAX_HEAD, NAME_RE, PROXYD_SOCK, ROOT, RUNTIME, SANDBOX_PORTS,
+                    SECRETS, SSH_POOL, TOKEN_POOL, WS_ROOT, all_ws, container_ca_paths, container_filtered,
+                    container_net, container_password_path, container_profile_path, die_with_parent,
+                    egress_port, load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version,
+                    read_env, token_meta)
+
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
 CLAUDE_IN = ROOT / "bin" / "claude-in"
 MCP_TEMPLATE = ROOT / "mcp.json.template"
@@ -62,34 +66,16 @@ TOKEN_FILE = ROOT / "ui" / "token"
 TLS_DIR = ROOT / "ui" / "tls"
 CERT_TOOL = ROOT / "bin" / "sandbox-ui-cert"
 TMUX_CONF = ROOT / "ui" / "tmux.conf"
-SECRETS = ROOT / "secrets"              # key/token pool; never readable inside nono
-SSH_POOL = SECRETS / "ssh"
-TOKEN_POOL = SECRETS / "tokens"
 STATE_ROOT = ROOT / "state"             # per-workspace ssh_config / known_hosts (Claude-writable)
 LIBEXEC = ROOT / "libexec"              # helpers Claude may run (read-only)
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "agent-sandboxes"
 MONITORING_ENV = ROOT / "monitoring" / ".env"   # present once bin/monitoring has set it up
 OTLP_PORT = 4318                        # Alloy's OTLP/HTTP receiver (Claude Code telemetry)
 PROJECTS_BASE = Path(os.environ.get("AIO_PROJECTS", Path.home() / "projects"))
 LISTEN_PORT = int(os.environ.get("AIO_UI_PORT", "9000"))
-SANDBOX_PORTS = range(8101, 8200)
 PROXY_PORT_OFFSET = 1000          # sandbox 8101 is served to browsers on 9101
-EGRESS_PORT_OFFSET = -1000        # and its port filter (host:port allow entries) is on 7101
-# nono only injects tokens into plain-HTTP upstreams on loopback: HTTP API
-# tokens go to this bridge (127.0.0.2: loopback, but not in nono's NO_PROXY)
-HTTP_BRIDGE = ("127.0.0.2", 7100)
-# Container network "filtered": the AIO container sits on an internal Docker
-# network (10.231.<port-8100>.0/24, no route out) and reaches the world only
-# through its own nono proxy on the gateway, with the workspace's profile.
-CONTAINER_NET = os.environ.get("AIO_CONTAINER_NET", "10.231")
-CONTAINER_PROXY_PORT = 3128
 CONTAINER_CA_MOUNT = "/usr/local/share/ca-certificates/agent-sandboxes-proxy.crt"   # in the container
-CONTAINER_PROXY_SECRETS = SECRETS / "container-proxy"   # per-workspace proxy password (= token placeholder there)
 
 TMUX = ["tmux", "-L", "agent-sandboxes", "-f", str(TMUX_CONF)]
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
-ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")          # pool key / token ids
-DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 MEM_RE = re.compile(r"^[1-9][0-9]{0,5}[MG]$")
@@ -100,14 +86,12 @@ TLS_CTX: ssl.SSLContext | None = None        # set at startup unless AIO_UI_TLS=
 SCHEME, WS_SCHEME = "http", "ws"
 CA_FINGERPRINT = ""                          # SHA-256 of ui/tls/ca.crt, when TLS is on
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-MAX_HEAD = 64 * 1024
 MAX_BODY = 1024 * 1024
 
 USER_GID = pwd.getpwuid(os.getuid()).pw_gid
 TOKEN = ""
 CAP_SALT = secrets.token_hex(16)   # sandbox links stop working when the server restarts
 sandbox_listeners: dict[str, list[asyncio.Server]] = {}
-egress_listeners: dict[str, asyncio.Server] = {}
 
 
 # --------------------------------------------------------------- helpers
@@ -133,27 +117,6 @@ async def run(*cmd: str, timeout: float = 120, preexec_fn=None) -> tuple[int, st
         proc.kill()
         return 124, "", f"timed out after {timeout:.0f}s"
     return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
-
-
-def read_env(path: Path) -> dict[str, str]:
-    env = {}
-    for line in path.read_text().splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            k, v = line.split("=", 1)
-            env[k.strip()] = v.strip()
-    return env
-
-
-def load_ws(name: str) -> dict[str, str] | None:
-    if not NAME_RE.match(name):
-        return None
-    path = WS_ROOT / f"{name}.env"
-    return read_env(path) if path.is_file() else None
-
-
-def all_ws() -> list[dict[str, str]]:
-    # <name>.env only (not e.g. <name>.container.env)
-    return [read_env(p) for p in sorted(WS_ROOT.glob("*.env")) if NAME_RE.match(p.stem)]
 
 
 def container(name: str) -> str:
@@ -407,6 +370,7 @@ async def api(req: Request, w):
         shutil.rmtree(STATE_ROOT / name, ignore_errors=True)
         shutil.rmtree(RUNTIME / name, ignore_errors=True)
         close_sandbox_listener(name)
+        await sync_proxies()
         await refresh_cert()
         return await send_json(w, {"ok": True, "kept": ws["WS_DIR"]})
 
@@ -546,6 +510,7 @@ async def provision_ws(name: str, d: str) -> dict:
     await refresh_cert()          # adds <name>.localhost to the certificate
     if err := await open_sandbox_listener(ws):
         notes.append(err)
+    notes += await sync_proxies(name)
     return {"ok": True, "name": name, "dir": d, "port": port, "notes": notes}
 
 
@@ -596,9 +561,6 @@ TOKEN_SERVICES = {
     "gemini": {"label": "Gemini API", "upstream": "https://generativelanguage.googleapis.com",
                "inject_header": "x-goog-api-key", "credential_format": "{}", "env_var": "GEMINI_API_KEY"},
 }
-DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False,
-                  "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open"},
-                  "limits": {"memory": "", "pids": 0}}
 
 
 def private_write(path: Path, data: str | bytes):
@@ -617,10 +579,6 @@ def ensure_dirs():
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
-def policy_path(name: str) -> Path:
-    return WS_ROOT / f"{name}.policy.json"
-
-
 def profile_path(name: str) -> Path:
     return WS_ROOT / f"{name}.profile.json"
 
@@ -631,21 +589,6 @@ def aux_profile_path(name: str) -> Path:
 
 def agent_sock(name: str) -> Path:
     return RUNTIME / name / "agent.sock"
-
-
-def load_policy(name: str) -> dict:
-    pol = json.loads(json.dumps(DEFAULT_POLICY))
-    try:
-        saved = json.loads(policy_path(name).read_text())
-    except (OSError, json.JSONDecodeError):
-        saved = {}
-    for k in ("ssh_keys", "tokens"):
-        pol[k] = [i for i in saved.get(k, []) if (SSH_POOL if k == "ssh_keys" else TOKEN_POOL).joinpath(
-            i if k == "ssh_keys" else f"{i}.json").is_file()]
-    pol["network"].update(saved.get("network", {}))
-    pol["limits"].update(saved.get("limits", {}))
-    pol["claude_md"] = saved.get("claude_md") is True
-    return pol
 
 
 def save_policy(name: str, pol: dict):
@@ -665,44 +608,6 @@ def clean_list(v, pattern: re.Pattern, what: str, limit: int = 100) -> list[str]
         if x not in out:
             out.append(x)
     return out
-
-
-def unsafe_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """This host (loopback / 0.0.0.0) or link-local (cloud metadata): never a
-    network destination. Loopback is open_port's job."""
-    ip = getattr(ip, "ipv4_mapped", None) or ip
-    return ip.is_loopback or ip.is_unspecified or ip.is_link_local or ip.is_multicast
-
-
-def parse_net_entry(x: str, what: str, ports_ok: bool) -> tuple[str, int, int]:
-    """'host', '*.host', an IPv4 / IPv6 address, each optionally ':port' or
-    ':lo-hi' (IPv6 then in brackets). Returns (host, lo, hi), ports 0 = any."""
-    x = x.strip().lower()
-    lo = hi = 0
-    if "://" in x:
-        raise ValueError(f"{what}: just the host, not a URL ({x!r})")
-    m = re.match(r"^\[([0-9a-f:.]+)\](?::(.*))?$", x) or (
-        re.match(r"^([^:]+):(.*)$", x) if x.count(":") == 1 else None)
-    host, port = (m[1], m[2]) if m else (x, None)
-    if port is not None:
-        if not ports_ok:
-            raise ValueError(f"{what}: no ports here, just the host ({x!r})")
-        pm = re.match(r"^([0-9]{1,5})(?:-([0-9]{1,5}))?$", port)
-        lo, hi = (int(pm[1]), int(pm[2] or pm[1])) if pm else (0, 0)
-        if not (pm and 1 <= lo <= hi <= 65535):
-            raise ValueError(f"{what}: bad port in {x!r} (a port, or a range like 8000-8100)")
-    if "/" in host:
-        raise ValueError(f"{what}: {x!r}: nono's proxy can't match address ranges; list each address")
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        if not DOMAIN_RE.match(host):
-            raise ValueError(f"{what}: invalid entry {x!r}") from None
-    else:
-        if unsafe_ip(ip):
-            raise ValueError(f"{what}: {x!r} is this host or link-local; use the workspace's own ports instead")
-        host = ip.compressed      # the proxy matches IPv6 in canonical form only
-    return host, lo, hi
 
 
 def format_net_entry(host: str, lo: int, hi: int) -> str:
@@ -756,14 +661,6 @@ def validate_policy(body: dict) -> dict:
 
 
 # ---- pool
-
-def token_meta(tid: str) -> dict | None:
-    if not ITEM_RE.match(tid):
-        return None
-    try:
-        return json.loads((TOKEN_POOL / f"{tid}.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
 
 
 async def ssh_key_info(kid: str) -> dict:
@@ -2421,10 +2318,6 @@ async def resolve_bind() -> list[str]:
 async def open_sandbox_listener(ws: dict[str, str]) -> str | None:
     name = ws["WS_NAME"]
     port = int(ws["WS_PORT"]) + PROXY_PORT_OFFSET
-    egress_err = await open_egress_filter(ws)
-    if container_filtered(name):
-        egress_err = await open_container_forwarder(ws) or egress_err
-        ensure_container_proxy(ws)
     servers = []
     try:
         for addr in BIND:
@@ -2438,197 +2331,71 @@ async def open_sandbox_listener(ws: dict[str, str]) -> str | None:
         print(msg, flush=True)
         return msg
     sandbox_listeners[name] = servers
-    return egress_err
+    return None
 
 
 def close_sandbox_listener(name: str):
     for s in sandbox_listeners.pop(name, []):
         s.close()
-    if s := egress_listeners.pop(name, None):
-        s.close()
-    close_container_forwarder(name)
-    stop_container_proxy(name)
 
 
-# --------------------------------------------------------------- egress port filter
-# nono's proxy allowlists hosts but not ports. When a workspace has host:port
-# allow entries its profile sets this as nono's upstream_proxy: nono checks
-# the host as usual, then sends us "CONNECT host:port" (plain HTTP too), and
-# we refuse ports those entries don't list. Only nono's proxy can reach this
-# listener: the sandbox may connect to its own open_port and the proxy alone.
+# --------------------------------------------------------------- the proxy service
+# The HTTP API bridge, the port filters and the container proxies / forwarders
+# run in ui/proxyd.py (unit agent-sandboxes-proxy), so a restart of this server
+# leaves sandbox connections alone. It follows the workspace files by itself;
+# we ask it to catch up at once after changing them.
 
-def egress_port(ws: dict[str, str]) -> int:
-    return int(ws["WS_PORT"]) + EGRESS_PORT_OFFSET
-
-
-def host_matches(pattern: str, host: str) -> bool:
-    return host == pattern or pattern.startswith("*.") and host.endswith(pattern[1:])
-
-
-def egress_allowed(name: str, host: str, port: int) -> bool:
-    """Entries naming this exact host decide, else wildcard ones; one without
-    a port allows any (nono already allowed the host itself)."""
-    entries = [parse_net_entry(x, "", True) for x in load_policy(name)["network"]["allow"]]
-    hits = [e for e in entries if e[0] == host] or [e for e in entries if host_matches(e[0], host)]
-    return not hits or any(not lo or lo <= port <= hi for _, lo, hi in hits)
-
-
-async def egress_connect(host: str, port: int):
-    """Like nono, never this host or link-local, also when a name resolves there."""
-    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    addrs = [i for i in infos if not unsafe_ip(ipaddress.ip_address(i[4][0].split("%")[0]))]
-    if not addrs:
-        raise OSError(f"{host} resolves to this host or link-local only")
-    err = None
-    for family, _, _, _, sockaddr in addrs:
-        try:
-            return await asyncio.wait_for(asyncio.open_connection(sockaddr[0], port), 15)
-        except (OSError, asyncio.TimeoutError) as e:
-            err = e
-    raise OSError(str(err))
-
-
-async def handle_egress(reader, w, name: str):
+async def proxyd(req: dict, timeout: float = 30) -> dict:
+    """One request to the proxy service on its control socket."""
     try:
-        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
-        m = re.match(rb"CONNECT (\S+):([0-9]{1,5}) HTTP/1\.[01]\r\n", head)
-        if not m:
-            w.write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
-            return
-        host, port = m[1].decode("latin-1").strip("[]").lower(), int(m[2])
+        r, w = await asyncio.wait_for(asyncio.open_unix_connection(str(PROXYD_SOCK)), 5)
         try:
-            host = ipaddress.ip_address(host).compressed
-        except ValueError:
-            pass
-        if not egress_allowed(name, host, port):
-            print(f"egress: {name}: denied {host}:{port} (port not allowed)", flush=True)
-            w.write(f"HTTP/1.1 403 Forbidden: port {port} is not allowed for {host}\r\n\r\n".encode())
-            return
-        try:
-            up_r, up_w = await egress_connect(host, port)
-        except OSError as e:
-            w.write(f"HTTP/1.1 502 Bad Gateway: {e}\r\n\r\n".encode("latin-1", "replace"))
-            return
-        w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await w.drain()
-
-        async def pump(src, dst):
-            try:
-                while data := await src.read(65536):
-                    dst.write(data)
-                    await dst.drain()
-                if dst.can_write_eof():
-                    dst.write_eof()
-            except OSError:
-                pass
-
-        try:
-            await asyncio.gather(pump(reader, up_w), pump(up_r, w))
+            w.write(json.dumps(req).encode() + b"\n")
+            await w.drain()
+            return json.loads(await asyncio.wait_for(r.readline(), timeout))
         finally:
-            up_w.close()
-    except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
-        pass
-    finally:
-        w.close()
+            w.close()
+    except (OSError, ValueError, asyncio.TimeoutError) as e:
+        return {"error": f"The proxy service isn't answering ({getattr(e, 'strerror', None) or type(e).__name__}); "
+                         "see systemctl status agent-sandboxes-proxy"}
+
+
+async def sync_proxies(name: str | None = None, restart: bool = False) -> list[str]:
+    """Have the proxy service apply the workspace files now; `restart`
+    reloads `name`'s container proxy. Returns its problems (all, or name's)."""
+    res = await proxyd({"op": "sync", "restart": [name] if restart and name else []})
+    if "error" in res:
+        return [res["error"]]
+    errors = res.get("errors", {})
+    return errors.get(name, []) if name else [m for v in errors.values() for m in v]
+
+
+async def proxyd_startup():
+    """Bring the proxy service up to date with the files (they may have
+    changed while this server was down) and say if it runs older code."""
+    for attempt in range(30):
+        res = await proxyd({"op": "sync"})
+        if "error" not in res or attempt == 29:
+            break
+        await asyncio.sleep(2)
+    if "error" in res:
+        print(res["error"], flush=True)
+        return
+    for msg in (m for v in res.get("errors", {}).values() for m in v):
+        print(f"proxy service: {msg}", flush=True)
+    if res.get("version") != proxyd_source_version():
+        print("proxy service runs older code than ui/proxyd.py / ui/common.py: "
+              "sudo systemctl restart agent-sandboxes-proxy (drops open sandbox connections)", flush=True)
 
 
 # --------------------------------------------------------------- HTTP API bridge
-# A token for an http:// API gets the nono route http://127.0.0.2:7100/<id><path>;
-# nono adds the token and we relay to the real host. One request per
-# connection (Connection: close both ways), so nono's keep-alive can't carry a
-# request for one token on to another token's host. Only nono's proxy can
-# reach this: it's not one of the sandbox's ports.
+# Token routes for http:// APIs point at the proxy service's bridge (ui/proxyd.py).
 
 def bridge_upstream(tid: str, upstream: str) -> str:
     if not upstream.startswith("http://"):
         return upstream
     host, port = HTTP_BRIDGE
     return f"http://{host}:{port}/{tid}{urllib.parse.urlsplit(upstream).path}"
-
-
-HOP_HEADERS = {"host", "connection", "keep-alive", "proxy-connection", "expect", "upgrade", "te"}
-
-
-async def copy_body(reader, writer, headers: dict[str, str]):
-    """The request body, by Content-Length or chunked framing (and nothing after it)."""
-    if "chunked" in headers.get("transfer-encoding", "").lower():
-        while True:
-            line = await reader.readuntil(b"\r\n")
-            writer.write(line)
-            size = int(line.split(b";", 1)[0].strip() or b"0", 16)
-            if size == 0:
-                while (trailer := await reader.readuntil(b"\r\n")) != b"\r\n":
-                    writer.write(trailer)
-                writer.write(b"\r\n")
-                break
-            writer.write(await reader.readexactly(size + 2))
-            await writer.drain()
-    else:
-        left = int(headers.get("content-length") or 0)
-        while left > 0:
-            data = await reader.read(min(left, 65536))
-            if not data:
-                raise asyncio.IncompleteReadError(b"", left)
-            writer.write(data)
-            await writer.drain()
-            left -= len(data)
-    await writer.drain()
-
-
-async def handle_bridge(reader, w):
-    up_w = None
-    try:
-        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 30)
-        lines = head[:-4].decode("latin-1").split("\r\n")
-        m = re.match(r"^([A-Z]+) /([a-z0-9][a-z0-9-]{0,39})(/[^ ]*)? HTTP/1\.[01]$", lines[0])
-        meta = token_meta(m[2]) if m else None
-        if not meta or not meta.get("upstream", "").startswith("http://"):
-            w.write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            return
-        target = urllib.parse.urlsplit(meta["upstream"])
-        headers = {}
-        out = [f"{m[1]} {m[3] or '/'} HTTP/1.1", f"Host: {target.netloc}"]
-        for line in lines[1:]:
-            k, _, v = line.partition(":")
-            headers[k.strip().lower()] = v.strip()
-            if k.strip().lower() not in HOP_HEADERS:
-                out.append(line)
-        out.append("Connection: close")
-        try:
-            up_r, up_w = await egress_connect(target.hostname, target.port or 80)
-        except OSError as e:
-            w.write(f"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\nX-Bridge-Error: {e}\r\n\r\n"
-                    .encode("latin-1", "replace"))
-            return
-        if headers.get("expect", "").lower() == "100-continue":
-            w.write(b"HTTP/1.1 100 Continue\r\n\r\n")
-        up_w.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
-        await copy_body(reader, up_w, headers)
-        while True:     # skip interim 1xx responses, then rewrite the final head
-            resp = await asyncio.wait_for(up_r.readuntil(b"\r\n\r\n"), 300)
-            if not re.match(rb"HTTP/1\.[01] 1\d\d", resp):
-                break
-        rlines = resp[:-4].decode("latin-1").split("\r\n")
-        rheaders = {k.strip().lower(): v.strip() for k, _, v in (x.partition(":") for x in rlines[1:])}
-        rlines = [rlines[0]] + [x for x in rlines[1:] if x.partition(":")[0].strip().lower()
-                                not in ("connection", "keep-alive")] + ["Connection: close"]
-        w.write(("\r\n".join(rlines) + "\r\n\r\n").encode("latin-1"))
-        status = int(rlines[0].split()[1])
-        if m[1] == "HEAD" or status in (204, 304):
-            pass
-        elif "content-length" in rheaders or "chunked" in rheaders.get("transfer-encoding", "").lower():
-            await copy_body(up_r, w, rheaders)    # even if the server ignores Connection: close
-        else:
-            while data := await up_r.read(65536):
-                w.write(data)
-                await w.drain()
-        await w.drain()
-    except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
-        pass
-    finally:
-        if up_w:
-            up_w.close()
-        w.close()
 
 
 # --------------------------------------------------------------- container network
@@ -2641,20 +2408,6 @@ async def handle_bridge(reader, w):
 # placeholder there. 127.0.0.1:<sandbox port> is forwarded to .2:8080, so MCP
 # and the UI reach the container as before.
 
-container_proxies: dict[str, asyncio.Task] = {}
-container_proxy_procs: dict[str, asyncio.subprocess.Process] = {}
-container_forwarders: dict[str, asyncio.Server] = {}
-
-
-def container_filtered(name: str) -> bool:
-    return load_policy(name)["network"]["container"] == "filtered"
-
-
-def container_net(ws: dict[str, str]) -> tuple[str, str, str]:
-    """(subnet, gateway = proxy address, container address)."""
-    n = int(ws["WS_PORT"]) - SANDBOX_PORTS.start + 1
-    return f"{CONTAINER_NET}.{n}.0/24", f"{CONTAINER_NET}.{n}.1", f"{CONTAINER_NET}.{n}.2"
-
 
 def container_override_path(name: str) -> Path:
     return WS_ROOT / f"{name}.compose-filtered.yaml"
@@ -2664,15 +2417,11 @@ def container_env_path(name: str) -> Path:
     return WS_ROOT / f"{name}.container.env"
 
 
-def container_profile_path(name: str) -> Path:
-    return WS_ROOT / f"{name}.container-profile.json"
-
-
 def container_ca(name: str) -> tuple[Path, Path]:
     """The workspace's persistent CA for its container proxy's TLS interception
     (token routes at their real HTTPS URL). Key stays in secrets/; the
     container only gets the certificate."""
-    crt, key = CONTAINER_PROXY_SECRETS / f"{name}.ca.crt", CONTAINER_PROXY_SECRETS / f"{name}.ca.key"
+    crt, key = container_ca_paths(name)
     if not (crt.is_file() and key.is_file()):
         CONTAINER_PROXY_SECRETS.mkdir(mode=0o700, parents=True, exist_ok=True)
         old = os.umask(0o077)
@@ -2695,7 +2444,7 @@ def container_ca_files(name: str) -> tuple[Path, Path]:
 
 
 def container_password(name: str) -> str:
-    path = CONTAINER_PROXY_SECRETS / name
+    path = container_password_path(name)
     try:
         return path.read_text().strip()
     except FileNotFoundError:
@@ -2787,113 +2536,6 @@ def write_container_files(ws: dict[str, str]) -> bool:
     return True
 
 
-def die_with_parent():
-    """preexec_fn: a proxy left running after the UI server dies would keep
-    enforcing a stale policy and block the next one's port."""
-    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)    # PR_SET_PDEATHSIG
-
-
-async def supervise_container_proxy(ws: dict[str, str]):
-    """Keep the container's nono proxy running while the policy says filtered.
-    It can only bind once Docker has created the network, so it retries."""
-    name = ws["WS_NAME"]
-    _, gw, _ = container_net(ws)
-    last_err = None
-    while load_ws(name) and container_filtered(name):
-        write_container_files(ws)
-        ca_crt, ca_key = container_ca(name)
-        proc = await asyncio.create_subprocess_exec(
-            "nono", "proxy", "--silent", "--profile", str(container_profile_path(name)),
-            "--listen", gw, "--port", str(CONTAINER_PROXY_PORT),
-            "--proxy-ca-cert", str(ca_crt), "--proxy-ca-key", str(ca_key),
-            env={**os.environ, "NONO_PROXY_PASS": container_password(name)},
-            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE, preexec_fn=die_with_parent)
-        container_proxy_procs[name] = proc
-        started = time.monotonic()
-        while line := await proc.stderr.readline():
-            msg = re.sub(r"\x1b\[[0-9;]*m", "", line.decode(errors="replace")).strip()
-            if msg and msg != last_err:
-                print(f"container-proxy {name}: {msg[:300]}", flush=True)
-                last_err = msg
-        await proc.wait()
-        container_proxy_procs.pop(name, None)
-        if time.monotonic() - started > 30:
-            last_err = None      # it ran fine for a while: report the next failure again
-        await asyncio.sleep(3)
-    container_proxies.pop(name, None)
-
-
-def ensure_container_proxy(ws: dict[str, str]):
-    name = ws["WS_NAME"]
-    if container_filtered(name) and name not in container_proxies:
-        container_proxies[name] = asyncio.create_task(supervise_container_proxy(ws))
-    elif not container_filtered(name):
-        restart_container_proxy(name)      # the supervisor sees the policy and stops
-
-
-def restart_container_proxy(name: str):
-    """The supervisor starts it again with the current profile."""
-    if proc := container_proxy_procs.get(name):
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            pass
-
-
-def stop_container_proxy(name: str):
-    if task := container_proxies.pop(name, None):
-        task.cancel()
-    restart_container_proxy(name)
-
-
-async def splice(r1, w1, r2, w2):
-    async def pump(src, dst):
-        try:
-            while data := await src.read(65536):
-                dst.write(data)
-                await dst.drain()
-            if dst.can_write_eof():
-                dst.write_eof()
-        except OSError:
-            pass
-    try:
-        await asyncio.gather(pump(r1, w2), pump(r2, w1))
-    finally:
-        w1.close()
-        w2.close()
-
-
-async def open_container_forwarder(ws: dict[str, str]) -> str | None:
-    """127.0.0.1:<sandbox port> -> the filtered container, as Docker's
-    published port would (internal networks can't publish)."""
-    name, port = ws["WS_NAME"], int(ws["WS_PORT"])
-    if name in container_forwarders:
-        return None
-    _, _, ip = container_net(ws)
-
-    async def forward(reader, writer):
-        try:
-            up_r, up_w = await asyncio.wait_for(asyncio.open_connection(ip, 8080), 10)
-        except (OSError, asyncio.TimeoutError):
-            writer.close()
-            return
-        await splice(reader, writer, up_r, up_w)
-
-    try:
-        container_forwarders[name] = await asyncio.start_server(forward, "127.0.0.1", port)
-    except OSError as e:
-        msg = f"Can't forward 127.0.0.1:{port} to '{name}''s container: {e.strerror}"
-        print(msg, flush=True)
-        return msg
-    return None
-
-
-def close_container_forwarder(name: str):
-    if s := container_forwarders.pop(name, None):
-        s.close()
-
-
 async def container_running(name: str) -> bool:
     rc, out, _ = await run("docker", "inspect", "-f", "{{.State.Running}}", container(name))
     return rc == 0 and out.strip() == "true"
@@ -2911,8 +2553,7 @@ async def apply_container_network(ws: dict[str, str], old: dict) -> list[str]:
     old_env = container_env_path(name).read_text() if container_env_path(name).exists() else None
     running = await container_running(name)
     if was and not now:
-        stop_container_proxy(name)
-        close_container_forwarder(name)       # Docker publishes the port again
+        notes += await sync_proxies(name)     # forwarder gone: Docker publishes the port again
     files = compose(ws, "up", "-d", "--remove-orphans")     # rewrites the files
     env_changed = now and container_env_path(name).read_text() != old_env
     if running and (was != now or env_changed):
@@ -2920,25 +2561,8 @@ async def apply_container_network(ws: dict[str, str], old: dict) -> list[str]:
         notes.append("Container recreated with the new network settings." if rc == 0
                      else f"Recreating the container failed: {(err or out).strip()[-300:]}")
     if now:
-        if err := await open_container_forwarder(ws):
-            notes.append(err)
-        if name in container_proxies:
-            restart_container_proxy(name)
-        else:
-            ensure_container_proxy(ws)
+        notes += await sync_proxies(name, restart=True)
     return notes
-
-
-async def open_egress_filter(ws: dict[str, str]) -> str | None:
-    name, port = ws["WS_NAME"], egress_port(ws)
-    try:
-        egress_listeners[name] = await asyncio.start_server(
-            lambda r, w: handle_egress(r, w, name), "127.0.0.1", port, limit=MAX_HEAD)
-    except OSError as e:
-        msg = f"Can't run the port filter for '{name}' on 127.0.0.1:{port}: {e.strerror}"
-        print(msg, flush=True)
-        return msg
-    return None
 
 
 async def refresh_cert():
@@ -3003,15 +2627,13 @@ async def main():
                                           ssl_handshake_timeout=15 if TLS_CTX else None)
                for addr in BIND]
     for ws in all_ws():
+        write_container_files(ws)        # the container proxies' profiles, for the proxy service
         await open_sandbox_listener(ws)
-    try:
-        servers.append(await asyncio.start_server(handle_bridge, *HTTP_BRIDGE, limit=MAX_HEAD))
-    except OSError as e:
-        print(f"HTTP API bridge not running on {HTTP_BRIDGE[0]}:{HTTP_BRIDGE[1]}: {e.strerror}", flush=True)
     drop_ambient_caps()
     for addr in BIND:
         print(f"Agent Sandboxes UI on {SCHEME}://{addr}:{LISTEN_PORT}/", flush=True)
-    await asyncio.gather(renew_daily(), backup_scheduler(), *(s.serve_forever() for s in servers))
+    await asyncio.gather(renew_daily(), backup_scheduler(), proxyd_startup(),
+                         *(s.serve_forever() for s in servers))
 
 
 def cli_prepare(name: str, aux: bool = False):

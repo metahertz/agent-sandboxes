@@ -3,8 +3,10 @@
 [Unit]
 Description=Agent Sandboxes web UI (nono + AIO Sandbox workspaces)
 Documentation=file:///home/metahertz/agent-sandboxes/README.md
-Wants=network-online.target
-After=network-online.target docker.service user-runtime-dir@1000.service
+# The proxies run apart (agent-sandboxes-proxy) so restarting this leaves
+# sandbox connections alone; Wants, not Requires: the UI stays up without them.
+Wants=network-online.target agent-sandboxes-proxy.service
+After=network-online.target docker.service user-runtime-dir@1000.service agent-sandboxes-proxy.service
 
 [Service]
 Type=simple

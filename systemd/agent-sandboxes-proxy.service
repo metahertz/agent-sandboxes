@@ -1,0 +1,39 @@
+# System unit: the workspaces' network proxies (HTTP API bridge, port filters,
+# container proxies and forwarders), apart from the web UI so a UI restart
+# doesn't cut sandbox connections. Restarting this one does.
+# Install: sudo install -m 644 ~/agent-sandboxes/systemd/agent-sandboxes-proxy.service /etc/systemd/system/
+[Unit]
+Description=Agent Sandboxes network proxies (API bridge, port filters, container proxies)
+Documentation=file:///home/metahertz/agent-sandboxes/README.md
+Wants=network-online.target
+After=network-online.target docker.service user-runtime-dir@1000.service
+
+[Service]
+Type=simple
+User=metahertz
+Group=metahertz
+ExecStart=/usr/bin/python3 -I /home/metahertz/agent-sandboxes/ui/proxyd.py
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PATH=/home/metahertz/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=2
+
+# No privileges at all, and nearly everything read-only: it writes only its
+# control socket and nono's proxy session state.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/user/1000 -/home/metahertz/.local/state/nono
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

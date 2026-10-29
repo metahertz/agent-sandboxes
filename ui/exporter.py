@@ -9,7 +9,9 @@ Every INTERVAL seconds it
   - tails nono's audit trail (~/.local/state/nono/audit/<session>/
     audit-events.ndjson: sessions and every network allow / deny), tags each
     event with its workspace and appends it to nono-audit.ndjson in the same
-    directory, which Alloy ships to Loki. Event counts are exported too.
+    directory, which Alloy ships to Loki. Event counts are exported too;
+  - reports whether the UI and proxy services are up, and the proxy
+    service's own state (from its control socket).
 
 Stdlib only; reuses the UI server's workspace / policy code.
 """
@@ -276,6 +278,40 @@ def backup_metrics(m: Metrics):
               int(nas["at"]))
 
 
+SERVICES = {"ui": "agent-sandboxes-ui.service", "proxy": "agent-sandboxes-proxy.service"}
+
+
+async def service_metrics(m: Metrics):
+    """The two system units, and what the proxy service reports on its control socket."""
+    _, out, _ = await server.run("systemctl", "is-active", *SERVICES.values())
+    states = out.split()
+    for (svc, unit), state in zip(SERVICES.items(), states):
+        m.add("aio_service_up", "gauge", "Whether the system unit is active.", int(state == "active"),
+              service=svc, unit=unit, state=state)
+    st = await server.proxyd({"op": "status"}, timeout=5)
+    m.add("aio_proxy_responding", "gauge", "The proxy service answered on its control socket.",
+          int("error" not in st))
+    if "error" in st:
+        return
+    m.add("aio_proxy_code_current", "gauge",
+          "The proxy service runs the code on disk (0: restart agent-sandboxes-proxy to update it).",
+          int(st.get("version") == server.proxyd_source_version()))
+    m.add("aio_proxy_start_timestamp_seconds", "gauge", "When the proxy service started.", int(st["started"]))
+    m.add("aio_proxy_bridge_up", "gauge", "The HTTP API bridge is listening.", int(bool(st.get("bridge"))))
+    m.add("aio_proxy_problems", "gauge", "Proxies that can't run (see the proxy service's journal).",
+          len(st.get("problems", [])))
+    for n, v in sorted(st.get("port_filter_denied", {}).items()):
+        m.add("aio_port_filter_denied_total", "counter",
+              "Connections the port filter refused (host allowed by nono, port not listed).", v, workspace=n)
+    running = st.get("container_proxies", {})
+    for n in st.get("port_filters", []):
+        m.add("aio_proxy_port_filter_up", "gauge", "The workspace's port filter is listening.", 1, workspace=n)
+    for n, state in sorted(running.items()):
+        m.add("aio_proxy_container_proxy_up", "gauge",
+              "The container's nono proxy is running (Container network: Same as Claude).",
+              int(state == "running"), workspace=n)
+
+
 async def collect(audit: Audit, du: dict[str, int]) -> str:
     m = Metrics()
     t0 = time.monotonic()
@@ -335,6 +371,7 @@ async def collect(audit: Audit, du: dict[str, int]) -> str:
         m.add("aio_nono_sessions_total", "counter", "nono sandbox sessions started.", v,
               workspace=ws)
     backup_metrics(m)
+    await service_metrics(m)
     m.add("aio_exporter_scrape_duration_seconds", "gauge", "Time taken to collect.",
           round(time.monotonic() - t0, 3))
     m.add("aio_exporter_last_run_timestamp_seconds", "gauge", "When metrics were last written.",

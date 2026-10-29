@@ -15,6 +15,7 @@ flowchart LR
 
   subgraph host[Host]
     ui["sandbox-ui<br/>systemd · Python · TLS"]
+    proxyd["sandbox proxies<br/>systemd · Python<br/>API bridge · port filters"]
     tmux["tmux"]
     subgraph nono["nono sandbox (per workspace)"]
       claude["Claude Code"]
@@ -40,6 +41,8 @@ flowchart LR
   ui -- "loads assigned keys" --> agent
   pool -. "read by UI / nono proxy only" .-> agent
   aio -- "unfiltered, or via its own nono proxy<br/>(Container network: Same as Claude)" --> net
+  claude -. "http:// API tokens, host:port entries<br/>(nono proxy hands on)" .-> proxyd
+  proxyd -- "relays; runs the containers' nono proxies" --> net
 ```
 
 - **Claude (nono):** reads/writes its project folder; reaches only its own sandbox port
@@ -58,12 +61,21 @@ flowchart LR
 - **UI:** token login, same-origin API, per-workspace capability URLs for sandbox views.
   Runs as your user with only `CAP_NET_BIND_SERVICE`, which it clears from the
   inheritable set once 443 is bound.
+- **Proxies:** the parts of the sandboxes' network path that run outside nono — the HTTP
+  API bridge, the port filters, and the containers' nono proxies and forwarders (see
+  Usage) — run in their own service, `agent-sandboxes-proxy` (`ui/proxyd.py`), so
+  restarting the UI doesn't cut Claude's or a container's connections. It has no
+  privileges and a read-only view of the system, follows the workspace files the UI
+  writes (rescanning every 10 s, and at once when the UI asks on its control socket),
+  and the UI starts fine without it. Restarting it drops the connections open through it.
 
 ## Where things live
 
 | Path | What |
 |---|---|
 | `ui/server.py`, `ui/static/` | Web UI (stdlib Python; vanilla JS; xterm.js 5.5.0 vendored, MIT) |
+| `ui/proxyd.py` | Proxy service: HTTP API bridge, port filters, container proxies / forwarders |
+| `ui/common.py` | Paths, workspace / policy files and network helpers both services use |
 | `bin/sandbox-ui` | UI launcher (systemd `ExecStart`) |
 | `bin/sandbox-ui-cert` | Private, name-constrained CA + server cert in `ui/tls/` |
 | `bin/claude-in <name>` | Claude Code inside nono for one workspace (prepares agent + profile) |
@@ -71,7 +83,8 @@ flowchart LR
 | `compose.workspace.yaml` | Container template (compose project `aio-<name>`) |
 | `nono/claude-browser.jsonc` → `~/.config/nono/profiles/` | nono profile |
 | `nono/aio-env.sh` → `~/.config/nono/hooks/` | nono hook: gives Claude its sandbox port/key |
-| `systemd/agent-sandboxes-ui.service` → `/etc/systemd/system/` | Service unit |
+| `systemd/agent-sandboxes-ui.service`, `agent-sandboxes-proxy.service` → `/etc/systemd/system/` | Service units (the UI `Wants=` the proxies) |
+| `$XDG_RUNTIME_DIR/agent-sandboxes/proxyd.sock` ✱ | The proxy service's control socket (UI and exporter only) |
 | `mcp.json.template` → `<project>/.mcp.json` | Claude's MCP link to its sandbox |
 | `ui/tmux.conf` | tmux server for Claude sessions (`tmux -L agent-sandboxes`) |
 | `workspaces/<name>.env` ✱ | Per-workspace folder, port, API key |
@@ -110,8 +123,8 @@ docker pull ghcr.io/agent-infra/sandbox:1.11.0
 
 cp ui/extra-hostnames.example ui/extra-hostnames   # optional: add the host's DNS name
 
-sudo install -m 644 systemd/agent-sandboxes-ui.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now agent-sandboxes-ui
+sudo install -m 644 systemd/agent-sandboxes-{ui,proxy}.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now agent-sandboxes-proxy agent-sandboxes-ui
 sudo ufw allow from <your-subnet> to any port 443,9101:9199 proto tcp
 ```
 
@@ -147,10 +160,11 @@ container's network, resource limits, the CLAUDE.md notes, and workspace-only SS
   (IPv4, or IPv6 in canonical form; no CIDR ranges: nono's proxy matches hosts only).
   An allowed host is reachable on every port. `host:port` or `host:lo-hi` (`[v6]:port`)
   limits it to those ports: nono can't filter ports, so a workspace with such entries
-  gets the UI server's port filter (`127.0.0.1:<sandbox port − 1000>`) as nono's
+  gets the proxy service's port filter (`127.0.0.1:<sandbox port − 1000>`) as nono's
   `upstream_proxy`. nono checks the host first and the filter then checks the port, and
-  port changes apply without a restart. While the UI server is down, such workspaces
-  have no outbound network. Loopback, `0.0.0.0` and link-local addresses are refused,
+  port changes apply without a restart. nono hands it *all* the workspace's traffic,
+  Claude's own API calls included, so while the proxy service is down such workspaces
+  have no outbound network (a UI restart doesn't affect them). Loopback, `0.0.0.0` and link-local addresses are refused,
   including names that resolve to them. Only programs that use `HTTPS_PROXY` (or, for
   SSH, `ssh-proxy-connect`) get out; raw TCP clients such as `psql` stay blocked.
 - **Container network** (*Access* tab): *Same as Claude* gives the AIO container the
@@ -159,12 +173,13 @@ container's network, resource limits, the CLAUDE.md notes, and workspace-only SS
   `10.231.<port−8100>.0/24` (no route out, no DNS, no published port; `AIO_CONTAINER_NET`
   changes the prefix), the container at `.2`, and an env file pointing AIO's GOST relay
   (so Chromium), `HTTP(S)_PROXY`, and each token variable / `$POOL_<NAME>_BASE_URL` at a
-  `nono proxy` the UI server runs on the gateway `.1:3128` with the workspace's profile
+  `nono proxy` the proxy service runs on the gateway `.1:3128` with the workspace's profile
   and its own password (`secrets/container-proxy/<name>`, also the token placeholder
-  there). The UI server forwards `127.0.0.1:<sandbox port>` to `.2:8080`, so MCP, the UI
-  and VNC work as before. Allowlist changes restart only that proxy; switching, or
-  changing tokens, recreates the container. While the UI server is down such containers
-  are offline.
+  there). The proxy service forwards `127.0.0.1:<sandbox port>` to `.2:8080`, so MCP, the
+  UI and VNC work as before. Allowlist changes restart only that proxy; switching, or
+  changing tokens, recreates the container. The UI writes the proxy's profile, CA and
+  password; the proxy service only runs it. While the proxy service is down such
+  containers are offline and unreachable.
   Token hosts also work at their real HTTPS URL: nono intercepts TLS for them (only
   them) with a persistent per-workspace CA (`secrets/container-proxy/<name>.ca.{crt,key}`;
   the key never enters the container). The container mounts the certificate into
@@ -190,7 +205,7 @@ container's network, resource limits, the CLAUDE.md notes, and workspace-only SS
 - **Keys & tokens** (sidebar): generate or import SSH keys (copy the public key into
   GitHub etc.), add API tokens (GitHub, GitLab, OpenAI, Gemini, or any HTTP(S) API), and tick
   which workspaces get each. nono only injects tokens into plain HTTP on loopback, so an
-  `http://` API's route goes to the UI server's bridge on `127.0.0.2:7100`, which relays to
+  `http://` API's route goes to the proxy service's bridge on `127.0.0.2:7100`, which relays to
   the real host (one request per connection, so nono's keep-alive can't mix tokens). Claude
   calls it via `$POOL_<NAME>_BASE_URL`; the token crosses the network unencrypted.
   Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
@@ -223,8 +238,11 @@ container's network, resource limits, the CLAUDE.md notes, and workspace-only SS
 
 - **Shell access:** `bin/claude-in <name>` runs a workspace's Claude directly;
   `tmux -L agent-sandboxes attach -t cl-<name>` attaches to a UI-started session.
-- **Service:** `sudo systemctl restart agent-sandboxes-ui` after editing `ui/server.py`;
-  static files reload on browser refresh.
+- **Services:** `sudo systemctl restart agent-sandboxes-ui` after editing `ui/server.py`
+  (sandbox connections carry on); static files reload on browser refresh. After editing
+  `ui/proxyd.py` or `ui/common.py`, `sudo systemctl restart agent-sandboxes-proxy` too:
+  that drops the connections open through it (a Claude request in flight retries). The
+  UI's journal and the dashboard's *Proxy code* say when it runs older code.
 
 ## Importing projects
 
@@ -303,7 +321,7 @@ To restore, copy a tarball back, then:
 tar -tf agent-sandboxes-<host>-<time>.tar.zst                    # look first
 tar -xOf agent-sandboxes-<host>-<time>.tar.zst BACKUP-MANIFEST.json   # what's inside
 tar -xf agent-sandboxes-<host>-<time>.tar.zst -C ~/restore       # into a scratch folder, or
-sudo systemctl stop agent-sandboxes-ui; tar -xf agent-sandboxes-<host>-<time>.tar.zst -C /   # in place
+sudo systemctl stop agent-sandboxes-ui agent-sandboxes-proxy; tar -xf agent-sandboxes-<host>-<time>.tar.zst -C /   # in place
 ```
 
 Paths are stored relative to `/`. Stop Claude in the workspaces before restoring in place.
@@ -321,13 +339,16 @@ sudo ufw allow from <your-subnet> to any port 3000 proto tcp
 Grafana is at `https://<host>:3000/` (same certificate as the UI), with two dashboards
 in *Agent Sandboxes*: **overview** (every workspace's sandbox / Claude / policy state,
 CPU and memory, tokens and cost, network denials, host) and **workspace** (one
-workspace in detail, with its logs). The overview's *Backup* row shows the NAS backups' health. What's collected:
+workspace in detail, with its logs). The overview's *Backup* row shows the NAS backups' health,
+and *Services* whether the UI and proxy services are up (and the proxy's code current). What's collected:
 
 | Source | Into | What |
 |---|---|---|
 | `ui/exporter.py` (every 15 s) | Prometheus `aio_*` | Container up/healthy, Claude running, policy pending, keys/tokens, limits, project size; Claude scope CPU / memory / processes / OOM kills |
 | Backup status (via the exporter) | Prometheus `aio_backup_*` | Health (ok / overdue / last run failed / manual only), last good backup and its size, next run, this host's total on the NAS and the share's free space |
 | UI server journal | Loki `{source="journal", unit="agent-sandboxes-ui.service"}` | One logfmt line per backup run (`backup trigger=… result=… bytes=… seconds=… warnings=… pruned=…`) |
+| Services (via the exporter) | Prometheus `aio_service_up`, `aio_proxy_*`, `aio_port_filter_denied_total` | Both units active; the proxy service answering, its code current, bridge up, problems; port-filter denials per workspace |
+| Proxy service journal | Loki `{source="journal", unit="agent-sandboxes-proxy.service"}` | Start-up, problems, container proxy messages; one logfmt line per port-filter denial (`port-filter workspace=… decision=deny host=… port=…`), which nono's own log records as allowed |
 | nono audit trail (via the exporter) | Loki `{source="nono"}`, `aio_nono_*` | Session start/end, every connection allowed or denied, with workspace |
 | Claude Code OpenTelemetry | Loki `{service_name="claude-code"}`, Prometheus `claude_code_*` | API requests (tokens, cost, model), tool use and decisions, errors; prompt and response text stays redacted |
 | cAdvisor (in Alloy) | Prometheus `container_*{workspace=…}` | Sandbox container CPU, memory, network |

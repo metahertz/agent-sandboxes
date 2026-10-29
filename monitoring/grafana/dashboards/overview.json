@@ -244,7 +244,7 @@
     {
       "type": "stat",
       "title": "Denials",
-      "description": "Connections nono refused in the selected time range",
+      "description": "Connections nono or a port filter refused in the selected time range",
       "targets": [
         {
           "datasource": {
@@ -252,7 +252,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(increase(aio_nono_network_events_total{decision=\"deny\",workspace=~\"$workspace\"}[$__range]))",
+          "expr": "(sum(increase(aio_nono_network_events_total{decision=\"deny\",workspace=~\"$workspace\"}[$__range])) or vector(0)) + (sum(increase(aio_port_filter_denied_total{workspace=~\"$workspace\"}[$__range])) or vector(0))",
           "legendFormat": "__auto",
           "format": "time_series",
           "instant": true,
@@ -1245,7 +1245,7 @@
     {
       "type": "timeseries",
       "title": "Denied connections",
-      "description": "Connections nono refused, per interval",
+      "description": "Connections refused per interval: by nono (host not allowed), or by the workspace's port filter, \"(port)\" (host allowed, port not in its host:port entries)",
       "targets": [
         {
           "datasource": {
@@ -1255,6 +1255,16 @@
           "refId": "A",
           "expr": "sum by (workspace) (increase(aio_nono_network_events_total{decision=\"deny\",workspace=~\"$workspace\"}[$__interval]))",
           "legendFormat": "{{workspace}}",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "sum by (workspace) (increase(aio_port_filter_denied_total{workspace=~\"$workspace\"}[$__interval]))",
+          "legendFormat": "{{workspace}} (port)",
           "format": "time_series"
         }
       ],
@@ -1447,7 +1457,43 @@
       "gridPos": {
         "x": 0,
         "y": 46,
-        "w": 24,
+        "w": 12,
+        "h": 9
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Port filter denials",
+      "description": "Host allowed by nono, port not in the workspace's host:port entries (from the proxy service's journal; nono logs these as allowed)",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "refId": "A",
+          "expr": "{source=\"journal\", unit=\"agent-sandboxes-proxy.service\"} |= \"port-filter \" | logfmt | workspace=~\"$workspace\" | line_format \"{{.workspace}}  DENY  {{.host}}:{{.port}}\"",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "prettifyLogMessage": false,
+        "showLabels": false
+      },
+      "id": 20,
+      "gridPos": {
+        "x": 12,
+        "y": 46,
+        "w": 12,
         "h": 9
       }
     },
@@ -1456,7 +1502,7 @@
       "title": "Backup",
       "collapsed": false,
       "panels": [],
-      "id": 20,
+      "id": 21,
       "gridPos": {
         "x": 0,
         "y": 55,
@@ -1550,7 +1596,7 @@
         "justifyMode": "center",
         "wideLayout": true
       },
-      "id": 21,
+      "id": 22,
       "gridPos": {
         "x": 0,
         "y": 56,
@@ -1614,7 +1660,7 @@
         "justifyMode": "center",
         "wideLayout": true
       },
-      "id": 22,
+      "id": 23,
       "gridPos": {
         "x": 4,
         "y": 56,
@@ -1678,7 +1724,7 @@
         "justifyMode": "center",
         "wideLayout": true
       },
-      "id": 23,
+      "id": 24,
       "gridPos": {
         "x": 8,
         "y": 56,
@@ -1742,7 +1788,7 @@
         "justifyMode": "center",
         "wideLayout": true
       },
-      "id": 24,
+      "id": 25,
       "gridPos": {
         "x": 12,
         "y": 56,
@@ -1806,7 +1852,7 @@
         "justifyMode": "center",
         "wideLayout": true
       },
-      "id": 25,
+      "id": 26,
       "gridPos": {
         "x": 16,
         "y": 56,
@@ -1870,7 +1916,7 @@
         "justifyMode": "center",
         "wideLayout": true
       },
-      "id": 26,
+      "id": 27,
       "gridPos": {
         "x": 20,
         "y": 56,
@@ -1942,7 +1988,7 @@
           "sort": "desc"
         }
       },
-      "id": 27,
+      "id": 28,
       "gridPos": {
         "x": 0,
         "y": 60,
@@ -1978,7 +2024,7 @@
         "prettifyLogMessage": false,
         "showLabels": false
       },
-      "id": 28,
+      "id": 29,
       "gridPos": {
         "x": 12,
         "y": 60,
@@ -1988,13 +2034,512 @@
     },
     {
       "type": "row",
-      "title": "Host",
+      "title": "Services",
       "collapsed": false,
       "panels": [],
-      "id": 29,
+      "id": 30,
       "gridPos": {
         "x": 0,
         "y": 68,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "UI service",
+      "description": "System unit agent-sandboxes-ui: the web UI",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "aio_service_up{service=\"ui\"}",
+          "legendFormat": "__auto",
+          "format": "time_series",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "✗ down",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "✓ up",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "id": 31,
+      "gridPos": {
+        "x": 0,
+        "y": 69,
+        "w": 4,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Proxy service",
+      "description": "System unit agent-sandboxes-proxy: API bridge, port filters, container proxies. While it's down, workspaces with tokens for http:// APIs, host:port entries or Container network: Same as Claude lose that network access",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "aio_service_up{service=\"proxy\"}",
+          "legendFormat": "__auto",
+          "format": "time_series",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "✗ down",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "✓ up",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "id": 32,
+      "gridPos": {
+        "x": 4,
+        "y": 69,
+        "w": 4,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Proxy code",
+      "description": "Whether the proxy service runs ui/proxyd.py and ui/common.py as on disk. Restarting it (sudo systemctl restart agent-sandboxes-proxy) drops the connections open through it",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "aio_proxy_code_current",
+          "legendFormat": "__auto",
+          "format": "time_series",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "⚠ restart pending",
+                  "color": "orange",
+                  "index": 0
+                },
+                "1": {
+                  "text": "✓ current",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "–"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "id": 33,
+      "gridPos": {
+        "x": 8,
+        "y": 69,
+        "w": 4,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Proxy problems",
+      "description": "Port filters, forwarders or container proxies that can't run; see the log below",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "aio_proxy_problems",
+          "legendFormat": "__auto",
+          "format": "time_series",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "–"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "id": 34,
+      "gridPos": {
+        "x": 12,
+        "y": 69,
+        "w": 4,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "HTTP API bridge",
+      "description": "",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "aio_proxy_bridge_up",
+          "legendFormat": "__auto",
+          "format": "time_series",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "✗ down",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "✓ up",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "–"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "id": 35,
+      "gridPos": {
+        "x": 16,
+        "y": 69,
+        "w": 4,
+        "h": 4
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Proxy up since",
+      "description": "",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "aio_proxy_start_timestamp_seconds * 1000",
+          "legendFormat": "__auto",
+          "format": "time_series",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeFromNow",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "–"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "id": 36,
+      "gridPos": {
+        "x": 20,
+        "y": 69,
+        "w": 4,
+        "h": 4
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Proxy service",
+      "description": "Start-up, problems, container proxy messages and port filter denials",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "refId": "A",
+          "expr": "{source=\"journal\", unit=\"agent-sandboxes-proxy.service\"}",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "prettifyLogMessage": false,
+        "showLabels": false
+      },
+      "id": 37,
+      "gridPos": {
+        "x": 0,
+        "y": 73,
+        "w": 24,
+        "h": 7
+      }
+    },
+    {
+      "type": "row",
+      "title": "Host",
+      "collapsed": false,
+      "panels": [],
+      "id": 38,
+      "gridPos": {
+        "x": 0,
+        "y": 80,
         "w": 24,
         "h": 1
       }
@@ -2053,10 +2598,10 @@
           "sort": "desc"
         }
       },
-      "id": 30,
+      "id": 39,
       "gridPos": {
         "x": 0,
-        "y": 69,
+        "y": 81,
         "w": 5,
         "h": 7
       }
@@ -2159,10 +2704,10 @@
           "sort": "desc"
         }
       },
-      "id": 31,
+      "id": 40,
       "gridPos": {
         "x": 5,
-        "y": 69,
+        "y": 81,
         "w": 5,
         "h": 7
       }
@@ -2221,10 +2766,10 @@
           "sort": "desc"
         }
       },
-      "id": 32,
+      "id": 41,
       "gridPos": {
         "x": 10,
-        "y": 69,
+        "y": 81,
         "w": 5,
         "h": 7
       }
@@ -2293,10 +2838,10 @@
           "sort": "desc"
         }
       },
-      "id": 33,
+      "id": 42,
       "gridPos": {
         "x": 15,
-        "y": 69,
+        "y": 81,
         "w": 5,
         "h": 7
       }
@@ -2361,10 +2906,10 @@
         "justifyMode": "center",
         "wideLayout": true
       },
-      "id": 34,
+      "id": 43,
       "gridPos": {
         "x": 20,
-        "y": 69,
+        "y": 81,
         "w": 4,
         "h": 7
       }
