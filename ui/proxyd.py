@@ -34,7 +34,7 @@ import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import (CONTAINER_PROXY_PORT, HTTP_BRIDGE, MAX_HEAD, NAME_RE, PROXYD_SOCK, RUNTIME,  # noqa: E402
+from common import (CONTAINER_PROXY_PORT, HTTP_BRIDGE, MAX_HEAD, NAME_RE, NONO_LOGS, PROXYD_SOCK, RUNTIME,  # noqa: E402
                     all_ws, container_ca_paths, container_filtered, container_net, container_password_path,
                     container_profile_path, die_with_parent, egress_port, load_policy, load_ws, parse_net_entry,
                     proxyd_source_version, token_meta, unsafe_ip)
@@ -292,11 +292,20 @@ async def supervise_container_proxy(ws: dict[str, str]):
                 last_err = msg
             await asyncio.sleep(3)
             continue
+        # Standalone `nono proxy` keeps no audit trail; its log (every connection,
+        # and its warnings) goes where the metrics exporter ships nono's logs.
+        try:
+            NONO_LOGS.mkdir(mode=0o700, parents=True, exist_ok=True)
+            log = ["--log-file", str(NONO_LOGS / f"{name}.container.log")]
+        except OSError as e:
+            problem(name, "container-log", f"container-proxy {name}: no log file ({e.strerror}), logging to the journal")
+            log = []
         proc = await asyncio.create_subprocess_exec(
-            "nono", "proxy", "--silent", "--profile", str(container_profile_path(name)),
+            "nono", "proxy", *log, "--profile", str(container_profile_path(name)),
             "--listen", gw, "--port", str(CONTAINER_PROXY_PORT),
             "--proxy-ca-cert", str(ca_crt), "--proxy-ca-key", str(ca_key),
-            env={**os.environ, "NONO_PROXY_PASS": container_password_path(name).read_text().strip()},
+            env={**os.environ, "NONO_PROXY_PASS": container_password_path(name).read_text().strip(),
+                 "RUST_LOG": "warn,nono_proxy::audit=info", "NONO_NO_UPDATE_CHECK": "1"},
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE, preexec_fn=die_with_parent)
         container_proxy_procs[name] = proc

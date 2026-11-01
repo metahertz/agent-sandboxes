@@ -33,8 +33,26 @@ fi
 aux=(); [[ $mode == claude ]] || aux=(--aux)   # don't overwrite what Claude started with
 eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${aux[@]}")"
 
-cmd=(nono run --profile "$WS_PROFILE" --allow-cwd)
-[[ $mode == exec ]] && cmd+=(--silent)
+# AIO_NONO: another nono build (e.g. one from source, for testing);
+# AIO_NONO_LIVE_AUDIT=1 when it writes proxy events to its audit trail as they
+# happen (nono after 0.81, #2235).
+cmd=("${AIO_NONO:-nono}" run --profile "$WS_PROFILE" --allow-cwd)
+if [[ $mode == exec ]]; then
+  cmd+=(--silent)
+else
+  # nono's log goes to a file outside the sandbox, which the metrics exporter
+  # ships to Loki, and its warnings stay out of Claude's terminal. nono up to
+  # 0.81 keeps only 4096 proxy events for the audit trail, written at exit,
+  # so it also logs each one; the marker tells the exporter this session's
+  # proxy events come from the log.
+  logs="$ROOT/monitoring/data/nono-logs"
+  mkdir -p -m 700 "$logs"
+  if [[ "${AIO_NONO_LIVE_AUDIT:-0}" != 1 ]]; then
+    printf '%s AIO session-start mode=%s events=log\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)" "$mode" >> "$logs/$name.log"
+    export RUST_LOG="${RUST_LOG:-warn,nono_proxy::audit=info}"
+  fi
+  cmd+=(--log-file "$logs/$name.log")
+fi
 [[ -n "$WS_MEMORY" ]] && cmd+=(--memory "$WS_MEMORY")
 [[ "$WS_PIDS" != 0 ]] && cmd+=(--max-processes "$WS_PIDS")
 case $mode in

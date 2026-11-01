@@ -32,6 +32,7 @@ OUT = server.ROOT / "monitoring" / "data" / "exporter"
 PROM = OUT / "workspaces.prom"
 AUDIT_LOG = OUT / "nono-audit.ndjson"
 OFFSETS = OUT / "offsets.json"
+from common import NONO_LOGS  # noqa: E402
 NONO_STATE = Path.home() / ".local" / "state" / "nono"
 CGROUP_APP = Path(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/"
                   f"user@{os.getuid()}.service/app.slice")
@@ -39,6 +40,35 @@ SCOPE_RE = re.compile(r"^claude-(.+)-\d+\.scope$")
 INTERVAL = float(os.environ.get("AIO_EXPORTER_INTERVAL", "15"))
 DU_EVERY = 300                       # seconds between workspace disk-usage scans
 MAX_LOG = 20 * 1024 * 1024           # rotate nono-audit.ndjson (one old copy kept)
+# "<ts>  INFO proxy request allowed mode=external host=\"…\" port=443 …", and claude-in's markers
+LOG_LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\S+Z)\s+(TRACE|DEBUG|INFO|WARN|ERROR|AIO)\s+(.*)$")
+# nono 0.80 writes key="value" fields after the message, 0.81 key=value in it (reason may
+# have spaces): a value runs to the next of these keys
+LOG_KEY = re.compile(r"\s(mode|host|port|method|decision|reason|denial_category|target|path|status|"
+                     r"endpoint_policy_action|endpoint_policy_rule|route_id|credential|action)=")
+LOG_EVENTS = {"proxy request allowed": "allow", "proxy request denied": "deny",
+              "l7 proxy response": "allow", "l7 endpoint policy decision": None}   # None: its decision=
+
+
+def parse_ts(s: str) -> float | None:
+    """RFC 3339 with up to nanoseconds, as nono writes it."""
+    m = re.match(r"^(\S+?T\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$", s)
+    if not m:
+        return None
+    frac = (m[2] or ".0")[:7]
+    try:
+        return datetime.fromisoformat(m[1] + frac + ("+00:00" if m[3] == "Z" else m[3])).timestamp()
+    except ValueError:
+        return None
+
+
+def unquote(v: str) -> str:
+    if v.startswith('"'):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v.strip('"')
+    return v
 
 
 def esc(v) -> str:
@@ -115,11 +145,18 @@ class Audit:
         # counters persist so restarts don't look like resets to Prometheus
         self.net: dict[str, int] = st.get("net", {})          # "ws\tdecision\tcategory"
         self.sessions: dict[str, int] = st.get("sessions", {})  # ws
+        self.overflow: dict[str, int] = st.get("overflow", {})  # ws: events past nono's buffer
+        # nono's own log (bin/claude-in): offsets per file, and when claude-in
+        # started sessions that log every proxy event there (recent ones)
+        self.log_offsets: dict[str, int] = st.get("log_offsets", {})
+        self.log_starts: dict[str, list[float]] = st.get("log_starts", {})
+        self.sess: dict[str, list] = st.get("sess", {})         # sid: [started epoch, command]
 
     def save(self):
         server.private_write(OFFSETS, json.dumps(
             {"offsets": self.offsets, "ws_of": self.ws_of, "net": self.net,
-             "sessions": self.sessions}))
+             "sessions": self.sessions, "overflow": self.overflow, "log_offsets": self.log_offsets,
+             "log_starts": self.log_starts, "sess": self.sess}))
 
     def workspace(self, sid: str, wss: list[dict[str, str]]) -> str:
         if sid in self.ws_of:
@@ -151,7 +188,8 @@ class Audit:
         for gone in set(self.offsets) - set(dirs):
             self.offsets.pop(gone, None)
             self.ws_of.pop(gone, None)
-        out = []
+            self.sess.pop(gone, None)
+        out = self.poll_logs()
         for sid, f in dirs.items():
             off = self.offsets.get(sid, 0)
             try:
@@ -189,11 +227,96 @@ class Audit:
         self.save()
         return len(out)
 
+    def poll_logs(self) -> list[dict]:
+        """New lines of nono's per-workspace logs, as records like record()'s."""
+        out = []
+        try:
+            files = {f.stem: f for f in NONO_LOGS.glob("*.log")}
+        except OSError:
+            return out
+        for stem, f in files.items():
+            ws, _, kind = stem.partition(".")      # <ws>.log: Claude; <ws>.container.log: its container
+            off = self.log_offsets.get(stem, 0)
+            try:
+                size = f.stat().st_size
+                if size < off:          # truncated (rotated below)
+                    off = 0
+                if size == off:
+                    continue
+                with f.open("rb") as fh:
+                    fh.seek(off)
+                    chunk = fh.read(size - off)
+            except OSError:
+                continue
+            end = chunk.rfind(b"\n") + 1
+            if not end:
+                continue
+            self.log_offsets[stem] = off + end
+            for raw in chunk[:end].decode("utf-8", "replace").splitlines():
+                if rec := self.log_record(ws, raw, kind):
+                    out.append(rec)
+            # nono keeps the file open in append mode, so it carries on at 0
+            if off + end == size > MAX_LOG:
+                try:
+                    if f.stat().st_size == size:
+                        os.truncate(f, 0)
+                        self.log_offsets[stem] = 0
+                except OSError:
+                    pass
+        return out
+
+    def log_record(self, ws: str, line: str, kind: str = "") -> dict | None:
+        m = LOG_LINE.match(line)
+        if not m:
+            return None
+        ts, level, text = m.groups()
+        if level == "AIO" and not kind:
+            if text.startswith("session-start") and "events=log" in text and (t := parse_ts(ts)):
+                self.log_starts[ws] = (self.log_starts.get(ws, []) + [t])[-50:]
+            return None
+        keys = list(LOG_KEY.finditer(text))
+        msg = text[:keys[0].start()].strip() if keys else text.strip()
+        f = {k.group(1): unquote(text[k.end():nxt.start() if nxt else len(text)].strip())
+             for k, nxt in zip(keys, keys[1:] + [None])}
+        rec = {"workspace": ws, "session": "log", "ts": ts, "via": "log"}
+        if kind:
+            rec["proxy"] = kind
+        if level == "INFO" and msg in LOG_EVENTS:
+            decision = LOG_EVENTS[msg] or str(f.get("decision", "")).lower()
+            if msg == "l7 endpoint policy decision" and decision == "allow":
+                return None     # its "l7 proxy response" line follows, with the status
+            rec.update(type="network", decision=decision, target=f.get("host") or f.get("target"))
+            for k in ("mode", "port", "method", "path", "status", "reason"):
+                if f.get(k) not in (None, ""):
+                    rec[k] = int(f[k]) if k in ("port", "status") and str(f[k]).isdigit() else f[k]
+            cat = f.get("denial_category") or (
+                "host_denied" if "not in the allowlist" in str(f.get("reason", "")) else "")   # 0.80
+            if cat:
+                rec["denial_category"] = cat
+            key = f"{ws}\t{decision}\t{cat}"
+            self.net[key] = self.net.get(key, 0) + 1
+            return rec
+        if "audit buffer full" in msg:
+            self.overflow[ws] = self.overflow.get(ws, 0) + 1
+            return None
+        if level in ("WARN", "ERROR"):
+            rec.update(type="nono_log", level=level.lower(), message=text[:1000])
+            return rec
+        return None
+
+    def covered(self, sid: str, ws: str) -> bool:
+        """Whether this session's proxy events already came from nono's log."""
+        started, _ = self.sess.get(sid, (None, ""))
+        # claude-in writes the marker just before nono starts the session
+        return started is not None and any(started - 60 <= t <= started for t in self.log_starts.get(ws, []))
+
     def record(self, sid: str, ws: str, ev: dict) -> dict | None:
         t = ev.get("type")
         rec = {"workspace": ws, "session": sid, "type": t}
         if t == "network":
             n = ev.get("event") or {}
+            if n.get("mode") != "connect" and self.covered(sid, ws):
+                return None     # nono's proxy; "connect" ones are syscall denials, not in the log
             ms = n.get("timestamp_unix_ms") or time.time() * 1000
             rec["ts"] = datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
             for k in ("decision", "denial_category", "target", "port", "method", "path",
@@ -205,6 +328,7 @@ class Audit:
         elif t == "session_started":
             rec["ts"] = ev.get("started")
             rec["command"] = " ".join(ev.get("command") or [])[:500]
+            self.sess[sid] = [parse_ts(rec["ts"] or ""), (ev.get("command") or [""])[0]]
             self.sessions[ws] = self.sessions.get(ws, 0) + 1
         elif t == "session_ended":
             rec["ts"] = ev.get("ended")
@@ -370,6 +494,10 @@ async def collect(audit: Audit, du: dict[str, int]) -> str:
     for ws, v in sorted(audit.sessions.items()):
         m.add("aio_nono_sessions_total", "counter", "nono sandbox sessions started.", v,
               workspace=ws)
+    for ws, v in sorted(audit.overflow.items()):
+        m.add("aio_nono_audit_overflow_total", "counter",
+              "Proxy events past nono's 4096-event session buffer (still shipped from nono's log).",
+              v, workspace=ws)
     backup_metrics(m)
     await service_metrics(m)
     m.add("aio_exporter_scrape_duration_seconds", "gauge", "Time taken to collect.",

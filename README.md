@@ -78,7 +78,7 @@ flowchart LR
 | `ui/common.py` | Paths, workspace / policy files and network helpers both services use |
 | `bin/sandbox-ui` | UI launcher (systemd `ExecStart`) |
 | `bin/sandbox-ui-cert` | Private, name-constrained CA + server cert in `ui/tls/` |
-| `bin/claude-in <name>` | Claude Code inside nono for one workspace (prepares agent + profile) |
+| `bin/claude-in <name>` | Claude Code inside nono for one workspace (prepares agent + profile); nono's log goes to `monitoring/data/nono-logs/<name>.log`, outside the sandbox |
 | `libexec/ssh-proxy-connect` | SSH `ProxyCommand` through nono's proxy (readable in the sandbox) |
 | `compose.workspace.yaml` | Container template (compose project `aio-<name>`) |
 | `nono/claude-browser.jsonc` → `~/.config/nono/profiles/` | nono profile |
@@ -350,6 +350,7 @@ and *Services* whether the UI and proxy services are up (and the proxy's code cu
 | Services (via the exporter) | Prometheus `aio_service_up`, `aio_proxy_*`, `aio_port_filter_denied_total` | Both units active; the proxy service answering, its code current, bridge up, problems; port-filter denials per workspace |
 | Proxy service journal | Loki `{source="journal", unit="agent-sandboxes-proxy.service"}` | Start-up, problems, container proxy messages; one logfmt line per port-filter denial (`port-filter workspace=… decision=deny host=… port=…`), which nono's own log records as allowed |
 | nono audit trail (via the exporter) | Loki `{source="nono"}`, `aio_nono_*` | Session start/end, every connection allowed or denied, with workspace |
+| nono's log (`monitoring/data/nono-logs/<workspace>.log`, via the exporter) | Loki `{source="nono"}` (`via="log"`), `aio_nono_audit_overflow_total` | The proxy's connections as they happen (nono ≤ 0.81 keeps only 4096 of them for the audit trail, written at exit); nono's warnings and errors (`type="nono_log"`) |
 | Claude Code OpenTelemetry | Loki `{service_name="claude-code"}`, Prometheus `claude_code_*` | API requests (tokens, cost, model), tool use and decisions, errors; prompt and response text stays redacted |
 | cAdvisor (in Alloy) | Prometheus `container_*{workspace=…}` | Sandbox container CPU, memory, network |
 | node exporter (in Alloy) | Prometheus `node_*` | Host CPU, memory, disk, load |

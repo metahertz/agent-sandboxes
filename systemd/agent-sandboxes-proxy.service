@@ -20,12 +20,12 @@ Restart=always
 RestartSec=2
 
 # No privileges at all, and nearly everything read-only: it writes only its
-# control socket and nono's proxy session state.
+# control socket, nono's proxy session state and the container proxies' logs.
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/run/user/1000 -/home/metahertz/.local/state/nono
+ReadWritePaths=/run/user/1000 -/home/metahertz/.local/state/nono -/home/metahertz/agent-sandboxes/monitoring/data/nono-logs
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

@@ -33,6 +33,7 @@ HTTP_BRIDGE = ("127.0.0.2", int(os.environ.get("AIO_BRIDGE_PORT", "7100")))
 CONTAINER_NET = os.environ.get("AIO_CONTAINER_NET", "10.231")
 CONTAINER_PROXY_PORT = 3128
 CONTAINER_PROXY_SECRETS = SECRETS / "container-proxy"   # per-workspace proxy password (= token placeholder there)
+NONO_LOGS = ROOT / "monitoring" / "data" / "nono-logs"   # nono's --log-file (bin/claude-in, container proxies)
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")          # pool key / token ids
 DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
