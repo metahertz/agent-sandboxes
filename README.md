@@ -349,12 +349,22 @@ and *Services* whether the UI and proxy services are up (and the proxy's code cu
 | UI server journal | Loki `{source="journal", unit="agent-sandboxes-ui.service"}` | One logfmt line per backup run (`backup trigger=… result=… bytes=… seconds=… warnings=… pruned=…`) |
 | Services (via the exporter) | Prometheus `aio_service_up`, `aio_proxy_*`, `aio_port_filter_denied_total` | Both units active; the proxy service answering, its code current, bridge up, problems; port-filter denials per workspace |
 | Proxy service journal | Loki `{source="journal", unit="agent-sandboxes-proxy.service"}` | Start-up, problems, container proxy messages; one logfmt line per port-filter denial (`port-filter workspace=… decision=deny host=… port=…`), which nono's own log records as allowed |
-| nono audit trail (via the exporter) | Loki `{source="nono"}`, `aio_nono_*` | Session start/end, every connection allowed or denied, with workspace |
+| nono audit trail (via the exporter) | Loki `{source="nono"}`, `aio_nono_*` | Session start/end, every connection allowed or denied, with workspace; one record per token-route request, with its endpoint-policy rule and response status (nono records the two separately) |
 | nono's log (`monitoring/data/nono-logs/<workspace>.log`, via the exporter) | Loki `{source="nono"}` (`via="log"`), `aio_nono_audit_overflow_total` | The proxy's connections as they happen (nono ≤ 0.81 keeps only 4096 of them for the audit trail, written at exit); nono's warnings and errors (`type="nono_log"`) |
 | Claude Code OpenTelemetry | Loki `{service_name="claude-code"}`, Prometheus `claude_code_*` | API requests (tokens, cost, model), tool use and decisions, errors; prompt and response text stays redacted |
 | cAdvisor (in Alloy) | Prometheus `container_*{workspace=…}` | Sandbox container CPU, memory, network |
 | node exporter (in Alloy) | Prometheus `node_*` | Host CPU, memory, disk, load |
 | Docker, journald | Loki `{source="docker"}`, `{source="journal"}` | `aio-*` / `mon-*` container logs; system journal |
+
+nono records each token-route request twice: the endpoint policy's decision (with
+`endpoint_policy_rule`) before forwarding, then the response (with `status`). The exporter
+holds an allowed decision until its response arrives and sends one record with both,
+from either the audit trail or nono's log. It matches them by target, method and path,
+since concurrent requests interleave. An `upstream_connect_failed` denial takes the
+waiting decision for its target, keeping the method, path and rule. A decision that
+denies the request has no response and is sent as it is, and so is an allowed one whose
+response hasn't come within 5 minutes. Decisions still waiting are saved in
+`monitoring/data/exporter/offsets.json`, so an exporter restart doesn't lose them.
 
 Once `monitoring/.env` exists (and unless telemetry is switched off in Settings,
 `CLAUDE_TELEMETRY=0`), workspace profiles add Claude Code's telemetry settings and open

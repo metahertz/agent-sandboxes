@@ -48,6 +48,7 @@ LOG_KEY = re.compile(r"\s(mode|host|port|method|decision|reason|denial_category|
                      r"endpoint_policy_action|endpoint_policy_rule|route_id|credential|action)=")
 LOG_EVENTS = {"proxy request allowed": "allow", "proxy request denied": "deny",
               "l7 proxy response": "allow", "l7 endpoint policy decision": None}   # None: its decision=
+HOLD = 300                           # seconds an allowed endpoint-policy decision waits for its response
 
 
 def parse_ts(s: str) -> float | None:
@@ -151,12 +152,57 @@ class Audit:
         self.log_offsets: dict[str, int] = st.get("log_offsets", {})
         self.log_starts: dict[str, list[float]] = st.get("log_starts", {})
         self.sess: dict[str, list] = st.get("sess", {})         # sid: [started epoch, command]
+        # allowed endpoint-policy decisions waiting for their response, per session
+        # or log file: [[arrived epoch, record], ...]
+        self.held: dict[str, list] = st.get("held", {})
 
     def save(self):
         server.private_write(OFFSETS, json.dumps(
             {"offsets": self.offsets, "ws_of": self.ws_of, "net": self.net,
              "sessions": self.sessions, "overflow": self.overflow, "log_offsets": self.log_offsets,
-             "log_starts": self.log_starts, "sess": self.sess}))
+             "log_starts": self.log_starts, "sess": self.sess, "held": self.held}))
+
+    def count(self, rec: dict) -> dict:
+        key = f"{rec['workspace']}\t{rec.get('decision', '?')}\t{rec.get('denial_category') or ''}"
+        self.net[key] = self.net.get(key, 0) + 1
+        return rec
+
+    def emit(self, stream: str, rec: dict | None) -> list[dict]:
+        """Pass on a record, merging each request's two events into one.
+
+        nono records a token-route request twice: the endpoint policy's
+        decision (with the rule) before forwarding, then the response (with
+        the status), or an upstream_connect_failed denial. Requests interleave,
+        so the response takes the oldest decision for its target, method and path.
+        """
+        if not rec or rec.get("type") != "network":
+            return [rec] if rec else []
+        held = self.held.setdefault(stream, [])
+        if rec.get("endpoint_policy_action") and rec.get("decision") == "allow":
+            held.append([time.time(), rec])
+            return []
+        key = (rec.get("target"), rec.get("method"), rec.get("path"))
+        failed = rec.get("denial_category") == "upstream_connect_failed"   # no method or path
+        for i, (_, p) in enumerate(held):
+            if (("status" in rec and key == (p.get("target"), p.get("method"), p.get("path")))
+                    or (failed and p.get("target") == rec.get("target"))):
+                del held[i]
+                rec = {**p, **rec}
+                break
+        if not held:
+            del self.held[stream]
+        return [self.count(rec)]
+
+    def flush_held(self) -> list[dict]:
+        """Decisions whose response never came (or nono didn't record it), as they are."""
+        out, now = [], time.time()
+        for stream, held in list(self.held.items()):
+            out += [self.count(r) for t, r in held if now - t > HOLD]
+            if keep := [h for h in held if now - h[0] <= HOLD]:
+                self.held[stream] = keep
+            else:
+                del self.held[stream]
+        return out
 
     def workspace(self, sid: str, wss: list[dict[str, str]]) -> str:
         if sid in self.ws_of:
@@ -211,8 +257,8 @@ class Audit:
                     rec = self.record(sid, ws, json.loads(raw)["event"])
                 except (ValueError, KeyError, TypeError):
                     continue
-                if rec:
-                    out.append(rec)
+                out += self.emit(sid, rec)
+        out += self.flush_held()
         if out:
             # Loki rejects a stream's entries arriving far out of order (backfill)
             out = [json.dumps(r, separators=(",", ":")) for r in sorted(out, key=lambda r: r["ts"] or "")]
@@ -253,8 +299,7 @@ class Audit:
                 continue
             self.log_offsets[stem] = off + end
             for raw in chunk[:end].decode("utf-8", "replace").splitlines():
-                if rec := self.log_record(ws, raw, kind):
-                    out.append(rec)
+                out += self.emit(f"log:{stem}", self.log_record(ws, raw, kind))
             # nono keeps the file open in append mode, so it carries on at 0
             if off + end == size > MAX_LOG:
                 try:
@@ -283,18 +328,15 @@ class Audit:
             rec["proxy"] = kind
         if level == "INFO" and msg in LOG_EVENTS:
             decision = LOG_EVENTS[msg] or str(f.get("decision", "")).lower()
-            if msg == "l7 endpoint policy decision" and decision == "allow":
-                return None     # its "l7 proxy response" line follows, with the status
             rec.update(type="network", decision=decision, target=f.get("host") or f.get("target"))
-            for k in ("mode", "port", "method", "path", "status", "reason"):
+            for k in ("mode", "port", "method", "path", "status", "reason",
+                      "endpoint_policy_action", "endpoint_policy_rule"):
                 if f.get(k) not in (None, ""):
                     rec[k] = int(f[k]) if k in ("port", "status") and str(f[k]).isdigit() else f[k]
             cat = f.get("denial_category") or (
                 "host_denied" if "not in the allowlist" in str(f.get("reason", "")) else "")   # 0.80
             if cat:
                 rec["denial_category"] = cat
-            key = f"{ws}\t{decision}\t{cat}"
-            self.net[key] = self.net.get(key, 0) + 1
             return rec
         if "audit buffer full" in msg:
             self.overflow[ws] = self.overflow.get(ws, 0) + 1
@@ -320,11 +362,9 @@ class Audit:
             ms = n.get("timestamp_unix_ms") or time.time() * 1000
             rec["ts"] = datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
             for k in ("decision", "denial_category", "target", "port", "method", "path",
-                      "status", "reason", "mode"):
+                      "status", "reason", "mode", "endpoint_policy_action", "endpoint_policy_rule"):
                 if n.get(k) is not None:
                     rec[k] = n[k]
-            key = f"{ws}\t{n.get('decision', '?')}\t{n.get('denial_category') or ''}"
-            self.net[key] = self.net.get(key, 0) + 1
         elif t == "session_started":
             rec["ts"] = ev.get("started")
             rec["command"] = " ".join(ev.get("command") or [])[:500]
