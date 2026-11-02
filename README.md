@@ -281,7 +281,9 @@ ssh -i ~/.ssh/key me@host 'git status'  # any command, in the sandbox; rsync / s
 Everything except the Claude session runs through `claude-in --shell / --exec`, i.e. under
 that workspace's own nono profile: the key reaches exactly what Claude there can. No port
 forwarding. tmux is configured so attached clients (SSH or the web terminal) can only
-detach (`C-b d`) and scroll (`C-b [`), not open windows or switch sessions. Use a key per
+detach (`C-b d`) and scroll (`C-b [`, or the mouse wheel / trackpad, which suits
+laptops without PageUp), not open windows or switch sessions. With the wheel handed to
+tmux, selecting text in the web terminal takes Shift-drag (Option-drag on a Mac). Use a key per
 workspace, and not one that already logs in to the account unrestricted (sshd would use
 that line first; the UI refuses such keys).
 

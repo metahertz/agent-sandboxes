@@ -281,6 +281,7 @@ function initXterm() {
     fontFamily: css.getPropertyValue("--mono"),
     fontSize: 13,
     scrollback: 5000,
+    macOptionClickForcesSelection: true,   // tmux takes the mouse (wheel scrollback); Shift-drag elsewhere
     theme: { background: css.getPropertyValue("--term-bg").trim() || "#1b1b19" },
   });
   term.fit = new FitAddon.FitAddon();
