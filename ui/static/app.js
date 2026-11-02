@@ -544,6 +544,7 @@ async function loadAccess() {
         el("span", {}, el("strong", { textContent: mode }), " ", el("span", { className: "muted", textContent: desc })))));
     form.elements.allow.value = policy.network.allow.join("\n");
     form.elements.deny.value = policy.network.deny.join("\n");
+    form.elements.listen.value = (policy.network.listen || []).join(", ");
     form.elements.memory.value = policy.limits.memory;
     form.elements.pids.value = policy.limits.pids || "";
     form.elements.claude_md.checked = policy.claude_md;
@@ -565,7 +566,7 @@ async function saveAccess(restart) {
     ssh_keys: $$('input[name="ssh"]:checked', form).map((i) => i.value),
     tokens: $$('input[name="token"]:checked', form).map((i) => i.value),
     network: { mode: form.elements.mode?.value || "claude-code", allow: lines(form.elements.allow.value), deny: lines(form.elements.deny.value),
-      container: form.elements.container.value || "open" },
+      container: form.elements.container.value || "open", listen: lines(form.elements.listen.value) },
     limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0) },
     claude_md: form.elements.claude_md.checked,
   };

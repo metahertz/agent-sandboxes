@@ -46,7 +46,7 @@ flowchart LR
 ```
 
 - **Claude (nono):** reads/writes its project folder; reaches only its own sandbox port
-  on localhost; internet limited to the workspace's allowlist; no Unix sockets except its
+  (and any listen ports you give it) on localhost; internet limited to the workspace's allowlist; no Unix sockets except its
   own ssh-agent (so no Docker, tmux, D-Bus). Per-workspace settings (the **Access** tab)
   are rendered to `workspaces/<name>.profile.json`, which extends `claude-browser`.
 - **Keys & tokens:** a pool in `secrets/`, assigned per workspace. SSH keys are loaded
@@ -167,6 +167,14 @@ container's network, resource limits, the CLAUDE.md notes, and workspace-only SS
   have no outbound network (a UI restart doesn't affect them). Loopback, `0.0.0.0` and link-local addresses are refused,
   including names that resolve to them. Only programs that use `HTTPS_PROXY` (or, for
   SSH, `ssh-proxy-connect`) get out; raw TCP clients such as `psql` stay blocked.
+- **Listen ports** (*Access* tab): ports Claude's own servers (a dev server, a test
+  instance of this app) may listen on, as nono's `listen_port`, and connect to on
+  localhost (`open_port`). Single ports or ranges, 1024–65535, at most 100. nono can't
+  limit the address, so a server on `0.0.0.0` is reachable from the network unless the
+  host's firewall blocks it. Ports this app listens on are refused (sandbox ports, the
+  UI's sandbox views, the port filters and API bridge, 3128, 4318), since a workspace
+  holding one could stand in for it, and so are other workspaces' listen ports.
+  Restart Claude to apply.
 - **Container network** (*Access* tab): *Same as Claude* gives the AIO container the
   workspace's allowlist and API tokens. `compose()` adds a generated override
   (`workspaces/<name>.compose-filtered.yaml`): an internal Docker network

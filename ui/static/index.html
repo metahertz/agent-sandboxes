@@ -170,6 +170,9 @@
               <label>Block <span class="muted">(hosts or IP addresses; wins over everything else)</span>
                 <textarea name="deny" rows="4" spellcheck="false" placeholder="pastebin.com"></textarea></label>
             </div>
+            <label>Listen ports <span class="muted">(servers Claude runs, e.g. a dev server: <code>8000</code> or <code>8000-8010</code>, 1024–65535; Claude can connect to them on localhost)</span>
+              <input name="listen" placeholder="none" autocomplete="off" spellcheck="false"></label>
+            <p class="hint">nono can't limit which address a server binds, so one on <code>0.0.0.0</code> is reachable from your network unless the host's firewall blocks it. Ports this app uses (7100–7199, 8101–8199, 9101–9199, 3128, 4318) and other workspaces' listen ports are refused.</p>
             <h3>Container network <span class="muted">(the sandbox's browser, VS Code and terminal)</span></h3>
             <div class="radios">
               <label><input type="radio" name="container" value="open"> <span><strong>Unfiltered</strong> — the container reaches the internet directly; no API tokens there</span></label>
@@ -201,7 +204,7 @@
             <ul>
               <li>Files: read/write the project folder only (plus Claude's own state); <code>~/.ssh</code>, credentials, keyrings, browser data and shell history denied.</li>
               <li>Unix sockets denied by default: no Docker, tmux, D-Bus or <code>systemd --user</code>.</li>
-              <li>Localhost: only this workspace's sandbox port <span id="acc-port"></span>, plus Alloy's telemetry receiver (4318) when Claude Code telemetry is on.</li>
+              <li>Localhost: only this workspace's sandbox port <span id="acc-port"></span>, plus Alloy's telemetry receiver (4318) when Claude Code telemetry is on, and its listen ports.</li>
               <li>Secrets in the pool and other workspaces' keys are never readable inside the sandbox.</li>
             </ul>
           </section>

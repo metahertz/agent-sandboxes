@@ -41,7 +41,7 @@ MAX_HEAD = 64 * 1024
 PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("proxyd.py")]
 
 DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False,
-                  "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open"},
+                  "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open", "listen": []},
                   "limits": {"memory": "", "pids": 0}}
 
 

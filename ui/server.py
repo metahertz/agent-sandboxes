@@ -49,7 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLICY, DOMAIN_RE,  # noqa: E402
-                    HTTP_BRIDGE, ITEM_RE, MAX_HEAD, NAME_RE, PROXYD_SOCK, ROOT, RUNTIME, SANDBOX_PORTS,
+                    EGRESS_PORT_OFFSET, HTTP_BRIDGE, ITEM_RE, MAX_HEAD, NAME_RE, PROXYD_SOCK, ROOT, RUNTIME, SANDBOX_PORTS,
                     SECRETS, SSH_POOL, TOKEN_POOL, WS_ROOT, all_ws, container_ca_paths, container_filtered,
                     container_net, container_password_path, container_profile_path, die_with_parent,
                     egress_port, load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version,
@@ -622,6 +622,44 @@ def clean_net_list(v, what: str, ports_ok: bool) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def reserved_ports() -> list[tuple[int, int, str]]:
+    """Ports this app listens on, which a workspace mustn't take over: nono lets
+    a listen_port bind every address, so it could stand in for them."""
+    lo, hi = SANDBOX_PORTS.start, SANDBOX_PORTS.stop - 1
+    return [(lo, hi, "the sandbox ports"),
+            (lo + PROXY_PORT_OFFSET, hi + PROXY_PORT_OFFSET, "the UI's sandbox views"),
+            (lo + EGRESS_PORT_OFFSET, hi + EGRESS_PORT_OFFSET, "the port filters"),
+            (HTTP_BRIDGE[1], HTTP_BRIDGE[1], "the API bridge"),
+            (CONTAINER_PROXY_PORT, CONTAINER_PROXY_PORT, "the container proxies"),
+            (OTLP_PORT, OTLP_PORT, "Alloy's telemetry receiver")]
+
+
+def port_range(x: str) -> tuple[int, int]:
+    lo, _, hi = x.partition("-")
+    return int(lo), int(hi or lo)
+
+
+def clean_listen(v) -> list[str]:
+    """Ports the workspace's own servers may listen on: '8000' or '8000-8010'."""
+    out, total = [], 0
+    for x in clean_list(v, re.compile(r"^[0-9]{1,5}(-[0-9]{1,5})?$"), "Listen ports", limit=20):
+        lo, hi = port_range(x)
+        if not 1024 <= lo <= hi <= 65535:
+            raise ValueError(f"Listen ports: {x!r} isn't a port 1024–65535 or a range low-high of them")
+        for a, b, what in reserved_ports():
+            if lo <= b and a <= hi:
+                raise ValueError(f"Listen ports: {x} overlaps {a if a == b else f'{a}–{b}'}, {what}")
+        total += hi - lo + 1
+        out.append(f"{lo}" if lo == hi else f"{lo}-{hi}")
+    if total > 100:
+        raise ValueError("Listen ports: at most 100 in all")
+    return out
+
+
+def listen_ports(pol: dict) -> list[int]:
+    return sorted({p for x in pol["network"].get("listen", []) for p in range(port_range(x)[0], port_range(x)[1] + 1)})
+
+
 def validate_policy(body: dict) -> dict:
     pol = json.loads(json.dumps(DEFAULT_POLICY))
     pol["ssh_keys"] = clean_list(body.get("ssh_keys", []), ITEM_RE, "SSH keys")
@@ -644,7 +682,8 @@ def validate_policy(body: dict) -> dict:
         raise ValueError("Container network: open or filtered")
     pol["network"] = {"mode": net.get("mode", "claude-code"), "container": net.get("container", "open"),
                       "allow": clean_net_list(net.get("allow", []), "Allowed hosts", ports_ok=True),
-                      "deny": clean_net_list(net.get("deny", []), "Blocked hosts", ports_ok=False)}
+                      "deny": clean_net_list(net.get("deny", []), "Blocked hosts", ports_ok=False),
+                      "listen": clean_listen(net.get("listen", []))}
     lim = body.get("limits", {}) or {}
     mem = str(lim.get("memory", "") or "").strip().upper()
     if mem and not MEM_RE.match(mem):
@@ -887,6 +926,10 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
             net["upstream_proxy"] = f"127.0.0.1:{egress_port(ws)}"
     if pol["network"]["deny"]:
         net["deny_domain"] = pol["network"]["deny"]
+    if ports := listen_ports(pol):
+        # its own servers (on any address: nono can't limit that), and connecting to them
+        net["listen_port"] = ports
+        net["open_port"] += ports
     creds = {}
     for tid in pol["tokens"]:
         meta = token_meta(tid)
@@ -1009,6 +1052,9 @@ def network_summary(pol: dict) -> str:
             text += ", plus " + ", ".join(f"`{x}`" for x in net["allow"])
     if net["deny"]:
         text += "; blocked: " + ", ".join(f"`{x}`" for x in net["deny"])
+    if net.get("listen"):
+        text += ("; your servers may listen on port(s) " + ", ".join(f"`{x}`" for x in net["listen"])
+                 + " (and you can connect to them on localhost)")
     return text
 
 
@@ -1106,6 +1152,10 @@ async def policy_api(ws: dict[str, str], req: Request, w):
     if req.method == "PUT":
         try:
             pol = validate_policy(json.loads(req.body or b"{}"))
+            mine = set(listen_ports(pol))
+            for o in all_ws():
+                if o["WS_NAME"] != name and (both := mine & set(listen_ports(load_policy(o["WS_NAME"])))):
+                    raise ValueError(f"Listen ports: {min(both)} is already used by workspace '{o['WS_NAME']}'")
         except (ValueError, json.JSONDecodeError) as e:
             return await send_json(w, {"error": str(e)}, 400)
         old = load_policy(name)
