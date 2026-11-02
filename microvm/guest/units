@@ -1,0 +1,52 @@
+# Guest systemd units for microVM workspaces. bin/microvm-image splits this file
+# at the "### <name>" lines into /etc/systemd/system/<name>.
+
+### aio-config.service
+[Unit]
+Description=Apply the workspace's config disk (agent-sandboxes)
+DefaultDependencies=no
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=sshd-extra.socket ssh.service docker.service aio-relay.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/aio-config
+
+[Install]
+WantedBy=sysinit.target
+
+### aio-relay.service
+[Unit]
+Description=Relay to the workspace's proxy on the host, over vsock (agent-sandboxes)
+After=aio-config.service
+Before=docker.service
+
+[Service]
+ExecStart=/usr/local/lib/aio/aio-relay.py
+Restart=always
+RestartSec=1
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
+
+### aio-browser.service
+[Unit]
+Description=The workspace's AIO browser container, if it has one (agent-sandboxes)
+After=docker.service aio-relay.service
+Requires=docker.service
+
+[Service]
+# exec: waiting for the image mustn't hold up the boot
+Type=exec
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/aio-browser
+
+[Install]
+WantedBy=multi-user.target
+
+### docker.service.d/aio-proxy.conf
+[Service]
+EnvironmentFile=/etc/aio/proxy.env

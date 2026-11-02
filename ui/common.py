@@ -34,13 +34,21 @@ CONTAINER_NET = os.environ.get("AIO_CONTAINER_NET", "10.231")
 CONTAINER_PROXY_PORT = 3128
 CONTAINER_PROXY_SECRETS = SECRETS / "container-proxy"   # per-workspace proxy password (= token placeholder there)
 NONO_LOGS = ROOT / "monitoring" / "data" / "nono-logs"   # nono's --log-file (bin/claude-in, container proxies)
+# microVM workspaces (WS_KIND=microvm): Claude runs in a VM with no network
+# interface; its only way out is vsock to the proxy service (port VM_RELAY_PORT),
+# which hands it to the workspace's nono proxy on 127.0.0.1:<sandbox port - 2000>.
+VM_ROOT = ROOT / "vm"                  # base/ image, <name>/ disk, config, key (bin/microvm)
+VM_RELAY_PORT = 3128
+VM_PROXY_OFFSET = -2000
+VM_CID_BASE = 1000                     # guest CID = 1000 + slot (sandbox port 8101 -> CID 1001)
+VM_BROWSER_PORT = 8080                 # the AIO container in the VM (Browser container ticked): guest vsock port
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")          # pool key / token ids
 DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 MAX_HEAD = 64 * 1024
 PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("proxyd.py")]
 
-DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False,
+DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False, "vm_browser": False,
                   "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open", "listen": []},
                   "limits": {"memory": "", "pids": 0}}
 
@@ -97,6 +105,7 @@ def load_policy(name: str) -> dict:
     pol["network"].update(saved.get("network", {}))
     pol["limits"].update(saved.get("limits", {}))
     pol["claude_md"] = saved.get("claude_md") is True
+    pol["vm_browser"] = saved.get("vm_browser") is True
     return pol
 
 
@@ -153,6 +162,29 @@ def egress_port(ws: dict[str, str]) -> int:
 
 def container_filtered(name: str) -> bool:
     return load_policy(name)["network"]["container"] == "filtered"
+
+
+def is_microvm(ws: dict[str, str] | None) -> bool:
+    return bool(ws) and ws.get("WS_KIND") == "microvm"
+
+
+def vm_cid(ws: dict[str, str]) -> int:
+    """Its vsock address, set by the host: the proxy service trusts it to pick the workspace."""
+    return VM_CID_BASE + int(ws["WS_PORT"]) - SANDBOX_PORTS.start + 1
+
+
+def vm_proxy_port(ws: dict[str, str]) -> int:
+    return int(ws["WS_PORT"]) + VM_PROXY_OFFSET
+
+
+def vm_browser(ws: dict[str, str]) -> bool:
+    """A microVM workspace with the AIO browser container running in its VM."""
+    return is_microvm(ws) and load_policy(ws["WS_NAME"])["vm_browser"]
+
+
+def wants_ws_proxy(ws: dict[str, str]) -> bool:
+    """Whether the proxy service runs a nono proxy for it (filtered container, or microVM)."""
+    return is_microvm(ws) or container_filtered(ws["WS_NAME"])
 
 
 def container_net(ws: dict[str, str]) -> tuple[str, str, str]:

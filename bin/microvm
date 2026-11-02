@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# microVM workspaces (WS_KIND=microvm): Claude, with root and Docker, in a VM
+# that has no network interface. Its only way out is vsock to the proxy
+# service, which hands it to the workspace's nono proxy (allowlist, tokens,
+# logs). Only the project folder is shared in (virtiofs, at /project).
+#
+#   microvm start <name>     prepare (ui/server.py vm-prepare), then run it as
+#                            the systemd --user unit aio-vm-<name>
+#   microvm stop <name>      shut the guest down (then stop the unit)
+#   microvm status <name>    the unit's state (active, inactive, failed, ...)
+#   microvm ssh <name> [ssh options] [-- command]
+#                            as dev in the guest, over vsock, with the
+#                            workspace's ssh-agent forwarded
+#   microvm load-image <name>
+#                            copy the AIO browser image from the host's Docker
+#                            into the VM's (when the workspace has the browser
+#                            container; started by `start`)
+#   microvm run <name>       the unit's command: virtiofsd (its own namespace
+#                            sandbox) and QEMU under nono (no network, only
+#                            /dev/kvm, /dev/vhost-vsock and its own files)
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+cmd="${1:?usage: microvm start|stop|status|ssh|load-image|run <workspace>}"
+name="${2:?usage: microvm $cmd <workspace>}"
+shift 2
+env_file="$ROOT/workspaces/$name.env"
+[[ $name =~ ^[a-z0-9][a-z0-9-]{0,29}$ && -r $env_file ]] || { echo "No workspace '$name'." >&2; exit 1; }
+[[ $(sed -n 's/^WS_KIND=//p' "$env_file") == microvm ]] || { echo "'$name' isn't a microVM workspace." >&2; exit 1; }
+VM="$ROOT/vm/$name"
+unit="aio-vm-$name"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+vm_env() { set -a; . "$VM/vm.env"; set +a; }
+
+case $cmd in
+start)
+  if systemctl --user is-active -q "$unit"; then
+    echo "$name: already running"
+    exit 0
+  fi
+  python3 -I "$ROOT/ui/server.py" vm-prepare "$name"     # disk, config, nono profile, vm.env
+  vm_env
+  # A bigger (sparse) disk for the browser container; the guest grows its
+  # filesystem at boot. Never shrinks.
+  want=$((VM_DISK_GB * 1024 * 1024 * 1024))
+  (( $(stat -c %s "$VM/rootfs.img") < want )) && truncate -s "$want" "$VM/rootfs.img"
+  rm -f "$VM/config.img"
+  mke2fs -q -t ext4 -L aio-config -d "$VM/config" "$VM/config.img" 8M
+  chmod 600 "$VM/config.img"
+  : > "$VM/console.log"
+  systemctl --user reset-failed "$unit" 2>/dev/null || true
+  systemd-run --user --unit="$unit" --collect --quiet --description="agent-sandboxes microVM $name" \
+    -p MemoryMax=$((VM_MEMORY_MB + 768))M -p KillMode=mixed -p TimeoutStopSec=20 \
+    -- "$ROOT/bin/microvm" run "$name"
+  if [[ $VM_BROWSER == 1 ]] && ! systemctl --user is-active -q "$unit-image"; then
+    systemctl --user reset-failed "$unit-image" 2>/dev/null || true
+    systemd-run --user --unit="$unit-image" --collect --quiet \
+      --description="agent-sandboxes microVM $name: browser image" -- "$ROOT/bin/microvm" load-image "$name"
+  fi
+  echo "$name: started"
+  ;;
+
+load-image)
+  vm_env
+  for _ in $(seq 90); do
+    "$ROOT/bin/microvm" ssh "$name" -o ConnectTimeout=3 -- true 2>/dev/null && break
+    sleep 2
+  done
+  if "$ROOT/bin/microvm" ssh "$name" -- docker image inspect "$VM_BROWSER_IMAGE" >/dev/null 2>&1; then
+    echo "$name: $VM_BROWSER_IMAGE is already in the VM"
+    exit 0
+  fi
+  docker image inspect "$VM_BROWSER_IMAGE" >/dev/null 2>&1 || docker pull "$VM_BROWSER_IMAGE"
+  echo "$name: copying $VM_BROWSER_IMAGE into the VM"
+  docker save "$VM_BROWSER_IMAGE" | "$ROOT/bin/microvm" ssh "$name" -- docker load
+  "$ROOT/bin/microvm" ssh "$name" -- sudo systemctl restart aio-browser.service
+  ;;
+
+stop)
+  systemctl --user stop "$unit-image" 2>/dev/null || true
+  systemctl --user is-active -q "$unit" || exit 0
+  # A clean shutdown: the guest reboots (no ACPI, so no poweroff), and QEMU
+  # runs with -no-reboot, so it exits instead
+  timeout 15 "$ROOT/bin/microvm" ssh "$name" -o ConnectTimeout=5 -- sudo systemctl reboot >/dev/null 2>&1 || true
+  for _ in $(seq 30); do
+    systemctl --user is-active -q "$unit" || { echo "$name: stopped"; exit 0; }
+    sleep 1
+  done
+  systemctl --user stop "$unit"
+  echo "$name: stopped (forced)"
+  ;;
+
+status)
+  systemctl --user is-active "$unit" || true
+  ;;
+
+ssh)
+  vm_env
+  opts=()
+  while (($#)) && [[ $1 != -- ]]; do opts+=("$1"); shift; done
+  [[ ${1:-} == -- ]] && shift
+  agent="$XDG_RUNTIME_DIR/agent-sandboxes/$name/agent.sock"
+  [[ -S $agent ]] && { export SSH_AUTH_SOCK="$agent"; opts+=(-A); }
+  # systemd's ssh_config.d/20-systemd-ssh-proxy.conf makes vsock/<cid> work
+  # (and skips host keys: the host assigns the CID, nothing else can take it)
+  exec ssh -i "$VM/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
+    "${opts[@]}" "dev@vsock/$VM_CID" "$@"
+  ;;
+
+run)
+  vm_env
+  rm -f "$VM/vfs.sock"
+  /usr/libexec/virtiofsd --socket-path="$VM/vfs.sock" --shared-dir="$WS_DIR" --sandbox=namespace \
+    --cache=auto >> "$VM/virtiofsd.log" 2>&1 &
+  # virtiofsd exits when QEMU disconnects
+  for _ in $(seq 100); do [[ -S $VM/vfs.sock ]] && break; sleep 0.05; done
+  # rtc=off: microvm gives its virtio devices IRQs from 12 down, and the RTC
+  # holds 8 (the guest takes the time from kvmclock)
+  qemu=(qemu-system-x86_64 -M microvm,acpi=off,rtc=off -enable-kvm -cpu host
+    -smp "$VM_VCPUS" -m "${VM_MEMORY_MB}M"
+    -object "memory-backend-memfd,id=mem,size=${VM_MEMORY_MB}M,share=on" -numa node,memdev=mem
+    -kernel "$VM/vmlinuz" -initrd "$VM/initrd.img"
+    -append "console=ttyS0 root=LABEL=root rw reboot=t"
+    -drive "id=root,file=$VM/rootfs.img,format=raw,if=none" -device virtio-blk-device,drive=root
+    -drive "id=cfg,file=$VM/config.img,format=raw,if=none,readonly=on" -device virtio-blk-device,drive=cfg
+    -nic none -device "vhost-vsock-device,guest-cid=$VM_CID"
+    -chardev "socket,id=vfs,path=$VM/vfs.sock" -device vhost-user-fs-device,chardev=vfs,tag=project
+    -display none -serial "file:$VM/console.log" -no-reboot)
+  run=(env NONO_NO_UPDATE_CHECK=1 nono run --silent --profile "$VM/host-profile.json" -- "${qemu[@]}")
+  # /dev/kvm and /dev/vhost-vsock are the kvm group's; a user manager started
+  # before the user joined it doesn't have it yet. exec: bash stops reading
+  # this file, so it can be updated while VMs run.
+  if id -nG | tr ' ' '\n' | grep -qx kvm; then
+    exec "${run[@]}"
+  fi
+  exec sg kvm -c "exec $(printf '%q ' "${run[@]}")"
+  ;;
+
+*)
+  echo "usage: microvm start|stop|status|ssh|load-image|run <workspace>" >&2
+  exit 2
+  ;;
+esac

@@ -9,7 +9,10 @@ containers' connections:
     upstream_proxy when the allowlist has host:port entries;
   - for Container network "Same as Claude": the container's nono proxy on
     its Docker gateway, and 127.0.0.1:<sandbox port> forwarded to the
-    container (MCP and the UI's sandbox view).
+    container (MCP and the UI's sandbox view);
+  - for microVM workspaces: the VM's nono proxy on 127.0.0.1:<sandbox port -
+    2000>, and the vsock listener (port 3128) that the VMs' only way out
+    goes through: the guest's CID, which the host assigns, picks the workspace.
 
 What runs follows the workspace files the UI writes (workspaces/*.env and
 policies): rescanned every RESCAN seconds, and at once when the UI asks on
@@ -35,9 +38,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (CONTAINER_PROXY_PORT, HTTP_BRIDGE, MAX_HEAD, NAME_RE, NONO_LOGS, PROXYD_SOCK, RUNTIME,  # noqa: E402
-                    all_ws, container_ca_paths, container_filtered, container_net, container_password_path,
-                    container_profile_path, die_with_parent, egress_port, load_policy, load_ws, parse_net_entry,
-                    proxyd_source_version, token_meta, unsafe_ip)
+                    VM_BROWSER_PORT, VM_RELAY_PORT, all_ws, container_ca_paths, container_filtered, container_net,
+                    container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
+                    load_policy, load_ws, parse_net_entry, proxyd_source_version, token_meta, unsafe_ip,
+                    vm_browser, vm_cid, vm_proxy_port, wants_ws_proxy)
 
 
 VERSION = proxyd_source_version()
@@ -277,12 +281,16 @@ container_forwarders: dict[str, asyncio.Server] = {}
 
 
 async def supervise_container_proxy(ws: dict[str, str]):
-    """Keep the container's nono proxy running while the policy says filtered.
-    It can only bind once Docker has created the network, so it retries."""
+    """Keep the workspace's nono proxy running while the policy says filtered
+    (or it's a microVM). A container's can only bind once Docker has created
+    the network, so it retries."""
     name = ws["WS_NAME"]
-    _, gw, _ = container_net(ws)
+    if is_microvm(ws):
+        gw, port = "127.0.0.1", vm_proxy_port(ws)      # reached through the vsock listener
+    else:
+        (_, gw, _), port = container_net(ws), CONTAINER_PROXY_PORT
     last_err = None
-    while load_ws(name) and container_filtered(name):
+    while (cur := load_ws(name)) and wants_ws_proxy(cur):
         ca_crt, ca_key = container_ca_paths(name)
         files = (container_profile_path(name), ca_crt, ca_key, container_password_path(name))
         if missing := [p.name for p in files if not p.is_file()]:
@@ -302,7 +310,7 @@ async def supervise_container_proxy(ws: dict[str, str]):
             log = []
         proc = await asyncio.create_subprocess_exec(
             "nono", "proxy", *log, "--profile", str(container_profile_path(name)),
-            "--listen", gw, "--port", str(CONTAINER_PROXY_PORT),
+            "--listen", gw, "--port", str(port),
             "--proxy-ca-cert", str(ca_crt), "--proxy-ca-key", str(ca_key),
             env={**os.environ, "NONO_PROXY_PASS": container_password_path(name).read_text().strip(),
                  "RUST_LOG": "warn,nono_proxy::audit=info", "NONO_NO_UPDATE_CHECK": "1"},
@@ -325,9 +333,9 @@ async def supervise_container_proxy(ws: dict[str, str]):
 
 def ensure_container_proxy(ws: dict[str, str]):
     name = ws["WS_NAME"]
-    if container_filtered(name) and name not in container_proxies:
+    if wants_ws_proxy(ws) and name not in container_proxies:
         container_proxies[name] = asyncio.create_task(supervise_container_proxy(ws))
-    elif not container_filtered(name):
+    elif not wants_ws_proxy(ws):
         restart_container_proxy(name)      # the supervisor sees the policy and stops
 
 
@@ -392,6 +400,75 @@ def close_container_forwarder(name: str):
         s.close()
 
 
+# --------------------------------------------------------------- microVMs' way out (vsock)
+# A microVM has no network interface: the guest's relay connects to the host
+# (CID 2) on VM_RELAY_PORT over vsock, and this hands the connection to the
+# nono proxy of the workspace whose CID it comes from. The host's vhost-vsock
+# sets the source CID, so a guest can't pose as another workspace.
+
+vm_relay: asyncio.Server | None = None
+
+
+async def handle_vm(reader, writer):
+    cid = (writer.get_extra_info("peername") or (None,))[0]
+    ws = next((w for w in all_ws() if is_microvm(w) and w.get("WS_PORT", "").isdigit() and vm_cid(w) == cid), None)
+    if not ws:
+        print(f"vm-relay: refused a connection from vsock CID {cid} (no microVM workspace has it)", flush=True)
+        writer.close()
+        return
+    try:
+        up_r, up_w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", vm_proxy_port(ws)), 10)
+    except (OSError, asyncio.TimeoutError):
+        writer.close()
+        return
+    await splice(reader, writer, up_r, up_w)
+
+
+async def open_vm_forwarder(ws: dict[str, str]):
+    """127.0.0.1:<sandbox port> -> the browser container in the VM (vsock port
+    VM_BROWSER_PORT, which the guest's relay hands to the container), so the
+    UI's sandbox views work as for a container on the host. Claude, inside the
+    VM, reaches the container there directly."""
+    name, port, cid = ws["WS_NAME"], int(ws["WS_PORT"]), vm_cid(ws)
+    if name in container_forwarders:
+        return
+
+    async def forward(reader, writer):
+        s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        s.setblocking(False)
+        try:
+            await asyncio.wait_for(asyncio.get_running_loop().sock_connect(s, (cid, VM_BROWSER_PORT)), 10)
+            up_r, up_w = await asyncio.open_connection(sock=s)
+        except (OSError, asyncio.TimeoutError):
+            s.close()
+            writer.close()
+            return
+        await splice(reader, writer, up_r, up_w)
+
+    try:
+        container_forwarders[name] = await asyncio.start_server(forward, "127.0.0.1", port)
+    except OSError as e:
+        problem(name, "forwarder", f"Can't forward 127.0.0.1:{port} to '{name}''s VM: {e.strerror}")
+        return
+    problem(name, "forwarder", None)
+
+
+async def open_vm_relay():
+    global vm_relay
+    if vm_relay is not None:
+        return
+    try:
+        s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        s.bind((socket.VMADDR_CID_ANY, VM_RELAY_PORT))
+        s.listen(128)
+        vm_relay = await asyncio.start_server(handle_vm, sock=s, limit=MAX_HEAD)
+    except OSError as e:
+        problem("", "vm-relay", f"vm-relay: can't listen on vsock port {VM_RELAY_PORT} ({e.strerror}); "
+                "microVM workspaces have no network (reinstall the proxy unit: it needs AF_VSOCK)")
+        return
+    problem("", "vm-relay", None)
+
+
 # --------------------------------------------------------------- following the workspace files
 
 async def sync(restart: list[str] = ()) -> dict[str, list[str]]:
@@ -408,7 +485,17 @@ async def sync(restart: list[str] = ()) -> dict[str, list[str]]:
             seen.add(name)
             if name not in egress_listeners:
                 await open_egress_filter(ws)
-            if container_filtered(name):
+            if is_microvm(ws):
+                await open_vm_relay()
+                if vm_browser(ws):
+                    await open_vm_forwarder(ws)
+                else:
+                    close_container_forwarder(name)
+                    problem(name, "forwarder", None)
+                ensure_container_proxy(ws)
+                if name in restart:
+                    restart_container_proxy(name)
+            elif container_filtered(name):
                 await open_container_forwarder(ws)
                 ensure_container_proxy(ws)
                 if name in restart:
@@ -439,7 +526,7 @@ async def rescan():
 
 def status() -> dict:
     return {"version": VERSION, "started": STARTED, "pid": os.getpid(),
-            "bridge": bridge_server is not None,
+            "bridge": bridge_server is not None, "vm_relay": vm_relay is not None,
             "port_filters": sorted(egress_listeners), "forwarders": sorted(container_forwarders),
             "container_proxies": {n: "running" if n in container_proxy_procs else "starting"
                                   for n in sorted(container_proxies)},

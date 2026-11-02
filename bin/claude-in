@@ -23,6 +23,24 @@ env_file="$WS_ROOT/$name.env"
 
 set -a; source "$env_file"; set +a
 
+if [[ "${WS_KIND:-}" == microvm ]]; then
+  # Claude runs in the workspace's VM (bin/microvm), not under nono here:
+  # in /project (the shared folder), over vsock ssh, with the agent forwarded.
+  aux=(); [[ $mode == claude ]] || aux=(--aux)
+  eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${aux[@]}")"    # agent keys, WS_PROMPT
+  if [[ $("$ROOT/bin/microvm" status "$name") != active ]]; then
+    echo "The VM for '$name' isn't running — start it from the web UI (or bin/microvm start $name)." >&2
+    exit 1
+  fi
+  case $mode in
+    claude) remote="cd /project && exec aio-claude${WS_PROMPT:+ --append-system-prompt $(printf '%q' "$WS_PROMPT")}$(printf ' %q' "$@")"
+            tty=(-t) ;;
+    shell)  remote="cd /project && exec bash -l"; tty=(-t) ;;
+    exec)   remote="cd /project && ${1:?--exec needs a command}"; tty=() ;;
+  esac
+  exec "$ROOT/bin/microvm" ssh "$name" "${tty[@]}" -- "$remote"
+fi
+
 [[ $mode == exec ]] || if ! curl -fsS -o /dev/null --max-time 2 -H "X-AIO-API-Key: $WS_KEY" "http://127.0.0.1:${WS_PORT}/v1/docs"; then
   echo "AIO sandbox for '$name' isn't answering on :${WS_PORT} — start it from the web UI." >&2
 fi

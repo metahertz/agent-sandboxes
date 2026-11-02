@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Build the base image for microVM workspaces, from Ubuntu's archive only, as
+# this user (mmdebstrap --mode=unshare; no root, no downloaded images):
+#   vm/base/{vmlinuz,initrd.img,rootfs.img,BUILT}
+# A new workspace copies it; rebuilding doesn't touch existing workspaces' VMs.
+#
+#   microvm-image [suite]        default: the host's release (e.g. resolute)
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+GUEST="$ROOT/microvm/guest"
+OUT="$ROOT/vm/base"
+. /etc/os-release
+suite="${1:-$VERSION_CODENAME}"
+mirror="${AIO_VM_MIRROR:-$(sed -n 's/^URIs: *//p' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null | head -1)}"
+mirror="${mirror:-http://archive.ubuntu.com/ubuntu/}"
+security="${AIO_VM_SECURITY_MIRROR:-http://security.ubuntu.com/ubuntu/}"
+
+for t in mmdebstrap mke2fs; do
+  command -v "$t" >/dev/null || { echo "$t is missing: sudo apt install mmdebstrap e2fsprogs" >&2; exit 1; }
+done
+
+mkdir -p -m 700 "$ROOT/vm"
+tmp=$(mktemp -d "$ROOT/vm/.build.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+sources="deb $mirror $suite main universe
+deb $mirror $suite-updates main universe
+deb $security $suite-security main universe"
+
+# The guest's own files, staged here: mmdebstrap's hooks run as a mapped root
+# that can't read this user's home, but sync-in copies as this user.
+stage="$tmp/guest"
+install -D -m 755 "$GUEST/aio-config" "$stage/usr/local/sbin/aio-config"
+install -D -m 755 "$GUEST/aio-relay.py" "$stage/usr/local/lib/aio/aio-relay.py"
+install -D -m 755 "$GUEST/aio-claude" "$stage/usr/local/bin/aio-claude"
+install -D -m 755 "$GUEST/aio-browser" "$stage/usr/local/sbin/aio-browser"
+install -D -m 755 "$ROOT/libexec/ssh-proxy-connect" "$stage/usr/local/bin/ssh-proxy-connect"
+python3 -I - "$GUEST/units" "$stage/etc/systemd/system" <<'EOF'
+import os, re, sys
+src, dst = sys.argv[1], sys.argv[2]
+for name, body in re.findall(r'^### (\S+)\n(.*?)(?=^### |\Z)', open(src).read(), re.S | re.M):
+    path = os.path.join(dst, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(body.strip() + "\n")
+EOF
+install -d "$stage/etc/ssh/ssh_config.d"
+printf '# git and ssh go out through the workspace proxy\nHost *\n  ProxyCommand /usr/local/bin/ssh-proxy-connect %%h %%p\n' \
+  > "$stage/etc/ssh/ssh_config.d/50-aio-proxy.conf"
+chmod -R go+rX "$stage"
+
+# shellcheck disable=SC2016  # $1 is mmdebstrap's chroot path, expanded by its hook shell
+mmdebstrap --mode=unshare --variant=apt --format=tar \
+  --include=linux-image-virtual,initramfs-tools,systemd-sysv,udev,dbus,openssh-server,sudo,ca-certificates,curl,iproute2,tmux,git,python3,docker.io,docker-buildx,docker-compose-v2,e2fsprogs,kmod,less,vim-tiny,rsync,jq,unzip,ripgrep,build-essential \
+  --customize-hook='echo aio-vm > "$1/etc/hostname"; cp "$1/etc/environment" "$1/etc/environment.base"' \
+  --customize-hook='printf "LABEL=root / ext4 defaults 0 1\nproject /project virtiofs defaults 0 0\n" > "$1/etc/fstab"; mkdir -p "$1/project"' \
+  --customize-hook='chroot "$1" useradd -m -u 1000 -s /bin/bash -G sudo,docker dev; echo "dev ALL=(ALL) NOPASSWD:ALL" > "$1/etc/sudoers.d/dev"; chmod 440 "$1/etc/sudoers.d/dev"; chroot "$1" passwd -l root' \
+  --customize-hook="sync-in '$stage' /" \
+  --customize-hook='chown -R 0:0 "$1/usr/local" "$1/etc/systemd/system" "$1/etc/ssh/ssh_config.d"' \
+  --customize-hook='chroot "$1" systemctl enable aio-config.service aio-relay.service aio-browser.service docker.service' \
+  --customize-hook='chroot "$1" systemctl mask systemd-networkd-wait-online.service systemd-networkd.service ssh.service ssh.socket apt-daily.timer apt-daily-upgrade.timer' \
+  --customize-hook='rm -f "$1"/etc/ssh/ssh_host_*; : > "$1/etc/machine-id"' \
+  --customize-hook='printf "virtiofs\nvsock\nvmw_vsock_virtio_transport\n" >> "$1/etc/initramfs-tools/modules"; chroot "$1" update-initramfs -u -k all' \
+  --customize-hook='cp -L "$1/boot/vmlinuz" "$1/vmlinuz.out"; cp -L "$1/boot/initrd.img" "$1/initrd.out"; ls "$1/lib/modules" > "$1/kernel.out"' \
+  --customize-hook="download /vmlinuz.out '$tmp/vmlinuz'" \
+  --customize-hook="download /initrd.out '$tmp/initrd.img'" \
+  --customize-hook="download /kernel.out '$tmp/kernel'" \
+  --customize-hook='rm -f "$1/vmlinuz.out" "$1/initrd.out" "$1/kernel.out"' \
+  "$suite" "$tmp/rootfs.tar" "$sources"
+
+mke2fs -q -t ext4 -L root -d "$tmp/rootfs.tar" "$tmp/rootfs.img" 16G
+rm "$tmp/rootfs.tar"
+printf 'built=%s\nsuite=%s\nkernel=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$suite" "$(cat "$tmp/kernel")" > "$tmp/BUILT"
+rm -rf "$tmp/kernel" "$stage"
+chmod 600 "$tmp"/*
+rm -rf "$OUT.old"
+[[ -d $OUT ]] && mv "$OUT" "$OUT.old"
+mv "$tmp" "$OUT"
+trap - EXIT
+rm -rf "$OUT.old"
+cat "$OUT/BUILT"
+du -sh "$OUT"

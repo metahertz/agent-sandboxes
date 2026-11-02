@@ -37,6 +37,7 @@ NONO_STATE = Path.home() / ".local" / "state" / "nono"
 CGROUP_APP = Path(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/"
                   f"user@{os.getuid()}.service/app.slice")
 SCOPE_RE = re.compile(r"^claude-(.+)-\d+\.scope$")
+VM_UNIT_RE = re.compile(r"^aio-vm-(.+)\.service$")    # bin/microvm's systemd --user units
 INTERVAL = float(os.environ.get("AIO_EXPORTER_INTERVAL", "15"))
 DU_EVERY = 300                       # seconds between workspace disk-usage scans
 MAX_LOG = 20 * 1024 * 1024           # rotate nono-audit.ndjson (one old copy kept)
@@ -130,6 +131,20 @@ def claude_scopes() -> dict[str, dict[str, int]]:
         u["cpu_us"] += kv_file(d / "cpu.stat").get("usage_usec", 0)
         u["pids"] += read_int(d / "pids.current")
         u["oom"] += kv_file(d / "memory.events").get("oom_kill", 0)
+    return usage
+
+
+def vm_units() -> dict[str, dict[str, int]]:
+    """cgroup usage of each microVM workspace's VM (QEMU, virtiofsd)."""
+    usage: dict[str, dict[str, int]] = {}
+    try:
+        units = list(CGROUP_APP.iterdir())
+    except OSError:
+        return usage
+    for d in units:
+        if m := VM_UNIT_RE.match(d.name):
+            usage[m.group(1)] = {"mem": read_int(d / "memory.current"),
+                                 "cpu_us": kv_file(d / "cpu.stat").get("usage_usec", 0)}
     return usage
 
 
@@ -483,6 +498,7 @@ async def collect(audit: Audit, du: dict[str, int]) -> str:
     status = {s["name"]: s for s in await server.status_all()}
     audit.poll(wss)
     scopes = claude_scopes()
+    vms = vm_units()
     for ws in wss:
         n = ws["WS_NAME"]
         s = status.get(n, {})
@@ -490,11 +506,18 @@ async def collect(audit: Audit, du: dict[str, int]) -> str:
         lim = pol["limits"]
         m.add("aio_workspace_info", "gauge", "Workspace (always 1) with its settings as labels.", 1,
               workspace=n, dir=ws.get("WS_DIR", ""), port=ws.get("WS_PORT", ""),
-              network=pol["network"]["mode"])
-        m.add("aio_workspace_container_up", "gauge", "AIO Sandbox container is running.",
+              network=pol["network"]["mode"], kind=s.get("kind", "sandbox"))
+        vm = s.get("kind") == "microvm"
+        m.add("aio_workspace_container_up", "gauge", "AIO Sandbox container (or microVM) is running.",
               int(s.get("container") == "running"), workspace=n)
-        m.add("aio_workspace_container_healthy", "gauge", "AIO Sandbox container reports healthy.",
-              int("(healthy)" in s.get("containerDetail", "")), workspace=n)
+        m.add("aio_workspace_container_healthy", "gauge", "AIO Sandbox container reports healthy (microVM: running).",
+              int(s.get("container") == "running" if vm else "(healthy)" in s.get("containerDetail", "")),
+              workspace=n)
+        if u := vms.get(n):
+            m.add("aio_vm_memory_bytes", "gauge", "Memory used by the microVM (QEMU, virtiofsd).",
+                  u["mem"], workspace=n)
+            m.add("aio_vm_cpu_seconds_total", "counter", "CPU time of the microVM.", u["cpu_us"] / 1e6,
+                  workspace=n)
         m.add("aio_workspace_claude_running", "gauge", "Claude's tmux session is alive.",
               int(s.get("claude") == "running"), workspace=n)
         m.add("aio_workspace_policy_pending", "gauge",

@@ -1,0 +1,43 @@
+#!/bin/bash
+# Inside a microVM workspace, at every boot (aio-config.service): apply what the
+# host put on the config disk (/dev/disk/by-label/aio-config, read-only,
+# rebuilt at each start from the workspace's policy).
+#   hostname           workspace name
+#   authorized_keys    the host's key for this VM (bin/microvm ssh)
+#   proxy.env          HTTP(S)_PROXY with this VM's proxy password, API token placeholders
+#   ca.crt             the workspace proxy's CA (TLS interception for token hosts)
+set -euo pipefail
+C=/run/aio-config
+mkdir -p "$C"
+mountpoint -q "$C" || mount -o ro,nodev,nosuid,noexec /dev/disk/by-label/aio-config "$C"
+
+# The host may have grown the disk (browser container): take the space
+resize2fs "$(findmnt -n -o SOURCE /)" >/dev/null 2>&1 || true
+
+name=$(cat "$C/hostname")
+echo "$name" > /etc/hostname
+hostname "$name"
+grep -q " $name\$" /etc/hosts || echo "127.0.1.1 $name" >> /etc/hosts
+
+install -d -m 700 -o dev -g dev /home/dev/.ssh
+install -m 600 -o dev -g dev "$C/authorized_keys" /home/dev/.ssh/authorized_keys
+[[ -e /etc/ssh/ssh_host_ed25519_key ]] || ssh-keygen -A
+
+install -d -m 755 /etc/aio
+install -m 644 "$C/proxy.env" /etc/aio/proxy.env
+# Every login (ssh sessions read /etc/environment via pam_env): the image's
+# own file plus the proxy settings
+cat /etc/environment.base /etc/aio/proxy.env > /etc/environment
+# apt and Docker's daemon (its unit reads /etc/aio/proxy.env); containers get
+# the proxy through Docker's client config, on the bridge address
+proxy=$(sed -n 's/^HTTPS_PROXY=//p' /etc/aio/proxy.env)
+printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$proxy" "$proxy" > /etc/apt/apt.conf.d/90aio-proxy
+bridge=${proxy/127.0.0.1/172.17.0.1}
+install -d -m 700 -o dev -g dev /home/dev/.docker
+printf '{"proxies": {"default": {"httpProxy": "%s", "httpsProxy": "%s", "noProxy": "localhost,127.0.0.1"}}}\n' \
+  "$bridge" "$bridge" > /home/dev/.docker/config.json
+chown dev:dev /home/dev/.docker/config.json
+chmod 600 /home/dev/.docker/config.json
+
+install -m 644 "$C/ca.crt" /usr/local/share/ca-certificates/aio-proxy.crt
+update-ca-certificates >/dev/null 2>&1 || true

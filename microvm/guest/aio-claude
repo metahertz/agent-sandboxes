@@ -1,0 +1,11 @@
+#!/bin/bash
+# Inside a microVM workspace: start Claude Code, installing it first if this VM
+# doesn't have it yet (through the workspace's proxy; claude.ai and
+# downloads.claude.ai are always allowed for microVM workspaces).
+set -euo pipefail
+claude=$HOME/.local/bin/claude
+if [[ ! -x $claude ]]; then
+  echo "Installing Claude Code in this VM (first start)…"
+  curl -fsSL https://claude.ai/install.sh | bash
+fi
+exec "$claude" "$@"

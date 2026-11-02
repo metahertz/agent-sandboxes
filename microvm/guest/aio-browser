@@ -1,0 +1,18 @@
+#!/bin/bash
+# Inside a microVM workspace (aio-browser.service): run the AIO browser
+# container when the config disk has its compose file (Access tab -> Browser
+# container in the VM), remove it when not. The host copies the image in
+# (bin/microvm load-image); until it's here, wait.
+set -euo pipefail
+C=/run/aio-config
+compose=(docker compose -p aio -f "$C/browser-compose.yaml")
+if [[ ! -f $C/browser-compose.yaml ]]; then
+  docker rm -f aio-browser >/dev/null 2>&1 || true
+  exit 0
+fi
+image=$(sed -n 's/^ *image: *//p' "$C/browser-compose.yaml")
+until docker image inspect "$image" >/dev/null 2>&1; do
+  echo "waiting for $image (the host copies it in)"
+  sleep 15
+done
+exec "${compose[@]}" up -d --remove-orphans

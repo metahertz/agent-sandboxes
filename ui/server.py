@@ -26,6 +26,7 @@ import contextlib
 import ctypes
 import datetime
 import fcntl
+import grp
 import hashlib
 import hmac
 import json
@@ -49,11 +50,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLICY, DOMAIN_RE,  # noqa: E402
-                    EGRESS_PORT_OFFSET, HTTP_BRIDGE, ITEM_RE, MAX_HEAD, NAME_RE, PROXYD_SOCK, ROOT, RUNTIME, SANDBOX_PORTS,
-                    SECRETS, SSH_POOL, TOKEN_POOL, WS_ROOT, all_ws, container_ca_paths, container_filtered,
-                    container_net, container_password_path, container_profile_path, die_with_parent,
-                    egress_port, load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version,
-                    read_env, token_meta)
+                    EGRESS_PORT_OFFSET, HTTP_BRIDGE, ITEM_RE, MAX_HEAD, NAME_RE, PROXYD_SOCK, ROOT, RUNTIME,
+                    SANDBOX_PORTS, SECRETS, SSH_POOL, TOKEN_POOL, VM_BROWSER_PORT, VM_PROXY_OFFSET,
+                    VM_RELAY_PORT, VM_ROOT,
+                    WS_ROOT, all_ws, container_ca_paths, container_filtered, container_net,
+                    container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
+                    load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version, read_env,
+                    token_meta, vm_browser, vm_cid)
 
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
 CLAUDE_IN = ROOT / "bin" / "claude-in"
@@ -74,6 +77,22 @@ PROJECTS_BASE = Path(os.environ.get("AIO_PROJECTS", Path.home() / "projects"))
 LISTEN_PORT = int(os.environ.get("AIO_UI_PORT", "9000"))
 PROXY_PORT_OFFSET = 1000          # sandbox 8101 is served to browsers on 9101
 CONTAINER_CA_MOUNT = "/usr/local/share/ca-certificates/agent-sandboxes-proxy.crt"   # in the container
+MICROVM = ROOT / "bin" / "microvm"
+VM_BASE = VM_ROOT / "base"                # bin/microvm-image's output; each new VM copies it
+VM_DISK_FILES = ("vmlinuz", "initrd.img", "rootfs.img")
+VM_DEFAULT_MEMORY = "2G"
+VM_BROWSER_MEMORY = "5G"                  # default with the browser container (2G + 2G shm for it)
+VM_VCPUS = 2
+VM_DISK_GB, VM_BROWSER_DISK_GB = 16, 48   # sparse; the browser image alone is about 13 GB
+VM_BRIDGE = "172.17.0.1"                  # Docker's default bridge in the guest: its relay listens there too
+VM_GUEST_CA = "/usr/local/share/ca-certificates/aio-proxy.crt"   # where the guest installs the proxy CA
+# Always allowed for microVM workspaces: the guest installs Claude Code itself
+VM_EXTRA_HOSTS = ["claude.ai", "downloads.claude.ai"]
+# A new microVM workspace's allowlist starts with these (editable): apt in the
+# guest (the mirrors bin/microvm-image used) and Docker Hub
+VM_DEFAULT_ALLOW = ["registry-1.docker.io", "auth.docker.io", "production.cloudflare.docker.com",
+                    "production.cloudfront.docker.com"]
+QEMU_DATA = ["/usr/share/qemu", "/usr/share/seabios", "/usr/lib/ipxe", "/usr/lib/x86_64-linux-gnu/qemu"]
 
 TMUX = ["tmux", "-L", "agent-sandboxes", "-f", str(TMUX_CONF)]
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
@@ -353,6 +372,9 @@ async def api(req: Request, w):
         return await send_json(w, {"error": "No such workspace"}, 404)
     name, action = ws["WS_NAME"], parts[2:]
 
+    if is_microvm(ws) and (resp := await vm_api(ws, action, m, w)) is not None:
+        return resp
+
     if action == [] and m == "DELETE":
         await run(*TMUX, "kill-session", "-t", f"cl-{name}")
         rc, out, err = await run(*compose(ws, "down", "--remove-orphans"))
@@ -410,6 +432,48 @@ async def api(req: Request, w):
     await respond(w, 404, "Not found\n")
 
 
+async def vm_api(ws: dict[str, str], action: list[str], m: str, w):
+    """The workspace API calls that differ for a microVM (None: as for a sandbox)."""
+    name = ws["WS_NAME"]
+    if action == [] and m == "DELETE":
+        await run(*TMUX, "kill-session", "-t", f"cl-{name}")
+        rc, out, err = await run(str(MICROVM), "stop", name, timeout=90)
+        if rc != 0:
+            return await send_json(w, {"error": err or out}, 500)
+        (WS_ROOT / f"{name}.env").unlink()
+        kill_agent(name)
+        remove_access(lambda scope, _: scope == name)
+        for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_profile_path(name),
+                  *(CONTAINER_PROXY_SECRETS / f"{name}{x}" for x in ("", ".ca.crt", ".ca.key"))):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(vm_dir(name), ignore_errors=True)      # the VM's disk: its Claude login, Docker images
+        shutil.rmtree(STATE_ROOT / name, ignore_errors=True)
+        shutil.rmtree(RUNTIME / name, ignore_errors=True)
+        close_sandbox_listener(name)
+        await sync_proxies()
+        return await send_json(w, {"ok": True, "kept": ws["WS_DIR"]})
+    if action == ["container", "start"] and m == "POST":
+        await sync_proxies(name)
+        rc, out, err = await run(str(MICROVM), "start", name, timeout=300)
+        return await send_json(w, {"ok": rc == 0, "log": err or out}, 200 if rc == 0 else 500)
+    if action == ["container", "stop"] and m == "POST":
+        await run(*TMUX, "kill-session", "-t", f"cl-{name}")
+        rc, out, err = await run(str(MICROVM), "stop", name, timeout=90)
+        return await send_json(w, {"ok": rc == 0, "log": err or out}, 200 if rc == 0 else 500)
+    if action == ["logs"] and m == "GET":
+        try:
+            with open(vm_dir(name) / "console.log", "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 64 * 1024))
+                log = f.read().decode(errors="replace")
+        except OSError:
+            log = "(the VM hasn't started yet)"
+        return await send_json(w, {"log": re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", log)})
+    if action in (["files"], ["download"], ["sandbox-link"]) and not vm_browser(ws):
+        return await send_json(w, {"error": "This microVM has no browser container (Access tab)"}, 404)
+    return None
+
+
 async def status_all() -> list[dict]:
     _, ps, _ = await run("docker", "ps", "-a", "--filter", "name=^aio-",
                          "--format", "{{.Names}}\t{{.State}}\t{{.Status}}")
@@ -423,17 +487,23 @@ async def status_all() -> list[dict]:
         s, dead = (line.split("\t") + [""])[:2]
         if s.startswith("cl-"):
             claude[s[3:]] = "exited" if dead == "1" else "running"
+    vms = await vm_states()
     out = []
     for ws in all_ws():
         n = ws.get("WS_NAME", "")
-        state, detail = states.get(container(n), ("absent", ""))
+        vm = is_microvm(ws)
+        if vm:
+            state, detail = vm_container_state(n, vms.get(n)), vms.get(n, "not started")
+        else:
+            state, detail = states.get(container(n), ("absent", ""))
         pol = load_policy(n)
         out.append({"name": n, "dir": ws.get("WS_DIR"), "port": ws.get("WS_PORT"),
+                    "kind": "microvm" if vm else "sandbox", "browser": not vm or pol["vm_browser"],
                     "container": state, "containerDetail": detail,
                     "claude": claude.get(n, "stopped"),
                     "sshKeys": len(pol["ssh_keys"]), "tokens": len(pol["tokens"]),
                     "network": pol["network"]["mode"],
-                    "policyPending": claude.get(n) == "running" and policy_pending(ws)})
+                    "policyPending": not vm and claude.get(n) == "running" and policy_pending(ws)})
     return out
 
 
@@ -443,8 +513,12 @@ class WsError(Exception):
         self.status = status
 
 
-def check_new_ws(name: str, raw_dir: str | None) -> str:
+def check_new_ws(name: str, raw_dir: str | None, kind: str = "sandbox") -> str:
     """Validate a new workspace's name and folder; returns the real folder path."""
+    if kind not in ("sandbox", "microvm"):
+        raise WsError("Type: sandbox or microvm")
+    if kind == "microvm" and (missing := vm_problems()):
+        raise WsError("MicroVM workspaces can't run here yet: " + "; ".join(missing))
     if not NAME_RE.match(name):
         raise WsError("Name: lowercase letters, digits and dashes, max 30")
     if name == "upload":          # bin/ws-ssh's inbox target
@@ -466,15 +540,8 @@ def check_new_ws(name: str, raw_dir: str | None) -> str:
     return d
 
 
-async def provision_ws(name: str, d: str) -> dict:
-    """Create (or adopt) the folder, link it to a new sandbox and start that."""
-    used = {int(o["WS_PORT"]) for o in all_ws()}
-    port = next((p for p in SANDBOX_PORTS if p not in used and port_free(p)), None)
-    if port is None:
-        raise WsError("No free sandbox port", 500)
-
-    created_dir = not os.path.exists(d)
-    os.makedirs(d, exist_ok=True)
+def ensure_mcp_json(d: str) -> list[str]:
+    """The project's .mcp.json links Claude to its AIO sandbox (${AIO_PORT} / ${AIO_KEY})."""
     notes = []
     mcp = Path(d) / ".mcp.json"
     if mcp.is_symlink():          # e.g. from an imported project: never write through it
@@ -483,6 +550,7 @@ async def provision_ws(name: str, d: str) -> dict:
     template = json.loads(MCP_TEMPLATE.read_text())
     if not mcp.exists():
         mcp.write_text(json.dumps(template, indent=2) + "\n")
+        os.chown(mcp, -1, USER_GID)
     else:
         try:
             cfg = json.loads(mcp.read_text())
@@ -493,6 +561,22 @@ async def provision_ws(name: str, d: str) -> dict:
                 notes.append("Added aio-sandbox to the existing .mcp.json")
         except (json.JSONDecodeError, AttributeError):
             notes.append(".mcp.json exists but isn't valid JSON; add the aio-sandbox server by hand")
+    return notes
+
+
+async def provision_ws(name: str, d: str, kind: str = "sandbox") -> dict:
+    """Create (or adopt) the folder, link it to a new sandbox and start that."""
+    if kind == "microvm":
+        return await provision_vm(name, d)
+    used = {int(o["WS_PORT"]) for o in all_ws()}
+    port = next((p for p in SANDBOX_PORTS if p not in used and port_free(p)), None)
+    if port is None:
+        raise WsError("No free sandbox port", 500)
+
+    created_dir = not os.path.exists(d)
+    os.makedirs(d, exist_ok=True)
+    notes = ensure_mcp_json(d)
+    mcp = Path(d) / ".mcp.json"
 
     env_path = WS_ROOT / f"{name}.env"
     fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -514,6 +598,35 @@ async def provision_ws(name: str, d: str) -> dict:
     return {"ok": True, "name": name, "dir": d, "port": port, "notes": notes}
 
 
+async def provision_vm(name: str, d: str) -> dict:
+    """A microVM workspace: the folder (shared into the VM at /project), its
+    proxy, and the VM, which copies the image the first time."""
+    used = {int(o["WS_PORT"]) for o in all_ws()}
+    port = next((p for p in SANDBOX_PORTS if p not in used), None)
+    if port is None:
+        raise WsError("No free workspace slot", 500)
+    created_dir = not os.path.exists(d)
+    os.makedirs(d, exist_ok=True)
+    env_path = WS_ROOT / f"{name}.env"
+    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"WS_NAME={name}\nWS_DIR={d}\nWS_PORT={port}\nWS_KEY={secrets.token_hex(32)}\nWS_KIND=microvm\n")
+    for p in [env_path] + ([d] if created_dir else []):
+        os.chown(p, -1, USER_GID)
+    ws = read_env(env_path)
+    pol = load_policy(name)
+    pol["network"]["allow"] = list(dict.fromkeys(vm_apt_hosts() + VM_DEFAULT_ALLOW))
+    save_policy(name, validate_policy(pol))
+    notes = await sync_proxies(name)
+    await refresh_cert()          # <name>.localhost, for the browser container's views
+    if err := await open_sandbox_listener(ws):
+        notes.append(err)
+    rc, out, err = await run(str(MICROVM), "start", name, timeout=300)
+    if rc != 0:
+        notes.append(f"The VM didn't start: {(err or out).strip()[-500:]}")
+    return {"ok": True, "name": name, "dir": d, "port": port, "notes": notes}
+
+
 async def create_ws(req: Request, w):
     try:
         body = json.loads(req.body or b"{}")
@@ -521,8 +634,9 @@ async def create_ws(req: Request, w):
         return await send_json(w, {"error": "Invalid JSON"}, 400)
     try:
         name = str(body.get("name", "")).strip()
-        d = check_new_ws(name, body.get("dir"))
-        return await send_json(w, await provision_ws(name, d), 201)
+        kind = str(body.get("kind") or "sandbox")
+        d = check_new_ws(name, body.get("dir"), kind)
+        return await send_json(w, await provision_ws(name, d, kind), 201)
     except WsError as e:
         return await send_json(w, {"error": str(e)}, e.status)
 
@@ -629,6 +743,7 @@ def reserved_ports() -> list[tuple[int, int, str]]:
     return [(lo, hi, "the sandbox ports"),
             (lo + PROXY_PORT_OFFSET, hi + PROXY_PORT_OFFSET, "the UI's sandbox views"),
             (lo + EGRESS_PORT_OFFSET, hi + EGRESS_PORT_OFFSET, "the port filters"),
+            (lo + VM_PROXY_OFFSET, hi + VM_PROXY_OFFSET, "the microVMs' proxies"),
             (HTTP_BRIDGE[1], HTTP_BRIDGE[1], "the API bridge"),
             (CONTAINER_PROXY_PORT, CONTAINER_PROXY_PORT, "the container proxies"),
             (OTLP_PORT, OTLP_PORT, "Alloy's telemetry receiver")]
@@ -696,6 +811,7 @@ def validate_policy(body: dict) -> dict:
         raise ValueError("Max processes: 0 (no limit) or 32–100000")
     pol["limits"] = {"memory": mem, "pids": pids}
     pol["claude_md"] = body.get("claude_md") is True
+    pol["vm_browser"] = body.get("vm_browser") is True
     return pol
 
 
@@ -918,6 +1034,8 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
     mode = pol["network"]["mode"]
     net["network_profile"] = None if mode == "open" else mode
     allow = [parse_net_entry(x, "", True) for x in pol["network"]["allow"]]
+    if is_microvm(ws) and mode != "open":
+        allow += [(h, 0, 0) for h in VM_EXTRA_HOSTS]
     if allow:
         net["allow_domain"] = list(dict.fromkeys(h for h, _, _ in allow))
         if any(lo for _, lo, _ in allow):
@@ -1077,6 +1195,18 @@ def render_claude_md(ws: dict[str, str], pol: dict) -> str:
 
 
 def session_prompt(ws: dict[str, str], pol: dict) -> str:
+    if is_microvm(ws):
+        vm = (f"This session runs in the agent-sandboxes microVM workspace {ws['WS_NAME']}: a VM of its own, "
+              "where you have sudo (root) and Docker. /project is the host's project folder, shared in; the "
+              "rest of the VM's disk stays in the VM. The VM has no network interface: everything goes "
+              f"through the proxy on 127.0.0.1:{VM_RELAY_PORT} (HTTP(S)_PROXY are set, also for apt, Docker "
+              "and git over ssh), which allows only the workspace's allowlist and logs each connection. "
+              "Programs that ignore the proxy variables can't connect.")
+        if not pol["tokens"]:
+            return vm
+        return vm + (" API token variables hold placeholders; the proxy swaps in the real token only on "
+                     "requests that carry the placeholder. Never ask the user for a real token.\n"
+                     + token_lines(pol))
     if not pol["tokens"]:
         return ""
     return (f"This session runs in the agent-sandboxes workspace {ws['WS_NAME']}, inside a nono sandbox. "
@@ -1096,7 +1226,7 @@ def sync_claude_md(ws: dict[str, str]):
         old = None
     rest = re.sub(rf"\n*{re.escape(MD_BEGIN)}.*?{re.escape(MD_END)}\n?", "\n", old or "", flags=re.S).rstrip()
     pol = load_policy(ws["WS_NAME"])
-    if pol["claude_md"]:
+    if pol["claude_md"] and not is_microvm(ws):      # the notes describe nono; a VM's prompt says what it is
         block = f"{MD_BEGIN}\n{MD_TAG}\n\n{render_claude_md(ws, pol).strip()}\n{MD_END}\n"
         new = f"{rest}\n\n{block}" if rest else block
     else:
@@ -1166,7 +1296,10 @@ async def policy_api(ws: dict[str, str], req: Request, w):
             sync_claude_md(ws)
         except (OSError, ValueError) as e:
             return await send_json(w, {"error": f"Saved, but CLAUDE.md: {e}"}, 500)
-        notes = await apply_container_network(ws, old)
+        if is_microvm(ws):
+            notes = await apply_vm_policy(ws, old, pol)
+        else:
+            notes = await apply_container_network(ws, old)
     else:
         notes = []
     rc, out, _ = await run(*TMUX, "list-panes", "-t", f"cl-{name}", "-F", "#{pane_dead}")
@@ -2066,13 +2199,20 @@ def clean_container_path(p: str) -> str | None:
     return posixpath.normpath(p)
 
 
+def sandbox_exec(ws: dict[str, str], *args: str) -> list[str]:
+    """A command in the workspace's AIO container (as gem): on the host, or in its microVM."""
+    cmd = ["docker", "exec", "-u", "1000"]
+    if is_microvm(ws):
+        return [str(MICROVM), "ssh", ws["WS_NAME"], "--", shlex.join(cmd + ["aio-browser", *args])]
+    return cmd + [container(ws["WS_NAME"]), *args]
+
+
 async def list_files(ws, req: Request, w):
     path = clean_container_path(req.query.get("path", "/home/gem"))
     if not path:
         return await send_json(w, {"error": "Bad path"}, 400)
-    rc, out, err = await run("docker", "exec", "-u", "1000", container(ws["WS_NAME"]),
-                             "find", path, "-mindepth", "1", "-maxdepth", "1",
-                             "-printf", r"%y\t%s\t%T@\t%f\0", timeout=30)
+    rc, out, err = await run(*sandbox_exec(ws, "find", path, "-mindepth", "1", "-maxdepth", "1",
+                                           "-printf", r"%y\t%s\t%T@\t%f\0"), timeout=30)
     if rc != 0 and not out:
         return await send_json(w, {"error": err.strip() or "Listing failed"}, 404)
     entries = []
@@ -2089,15 +2229,14 @@ async def download(ws, req: Request, w):
     path = clean_container_path(req.query.get("path", ""))
     if not path or path == "/":
         return await respond(w, 400, "Bad path\n")
-    c = container(ws["WS_NAME"])
-    rc, kind, err = await run("docker", "exec", "-u", "1000", c, "stat", "-L", "-c", "%F", path)
+    rc, kind, err = await run(*sandbox_exec(ws, "stat", "-L", "-c", "%F", path))
     kind = kind.strip()
     base = posixpath.basename(path)
     if kind == "directory":
-        cmd = ["docker", "exec", "-u", "1000", c, "tar", "-C", posixpath.dirname(path), "-cf", "-", "--", base]
+        cmd = sandbox_exec(ws, "tar", "-C", posixpath.dirname(path), "-cf", "-", "--", base)
         fname, ctype = base + ".tar", "application/x-tar"
     elif kind.startswith("regular"):
-        cmd = ["docker", "exec", "-u", "1000", c, "cat", "--", path]
+        cmd = sandbox_exec(ws, "cat", "--", path)
         fname, ctype = base, mimetypes.guess_type(base)[0] or "application/octet-stream"
     else:
         return await respond(w, 404, f"Not a file or directory: {err.strip() or kind}\n")
@@ -2504,13 +2643,16 @@ def container_password(name: str) -> str:
         return pw
 
 
-def container_env_text(ws: dict[str, str], pol: dict) -> str:
-    _, gw, _ = container_net(ws)
+def container_env_text(ws: dict[str, str], pol: dict, gw: str | None = None,
+                       port: int = CONTAINER_PROXY_PORT) -> str:
+    """The AIO container's environment: everything through the workspace proxy
+    (on its Docker gateway; in a microVM, the guest's relay on Docker's bridge)."""
+    gw = gw or container_net(ws)[1]
     pw = container_password(ws["WS_NAME"])
-    proxy = f"http://nono:{pw}@{gw}:{CONTAINER_PROXY_PORT}"
+    proxy = f"http://nono:{pw}@{gw}:{port}"
     no_proxy = f"localhost,127.0.0.1,{gw}"     # the token routes are plain requests to the proxy
     bundle = "/etc/ssl/certs/ca-certificates.crt"      # with the proxy CA, after the init hook
-    env = {"PROXY_SERVER": f"nono:{pw}@{gw}:{CONTAINER_PROXY_PORT}",   # AIO's GOST -> Chromium
+    env = {"PROXY_SERVER": f"nono:{pw}@{gw}:{port}",   # AIO's GOST -> Chromium
            "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "https_proxy": proxy,
            "NO_PROXY": no_proxy, "no_proxy": no_proxy,
            # AIO runs this as root at every start: add the mounted proxy CA to the system store
@@ -2520,7 +2662,7 @@ def container_env_text(ws: dict[str, str], pol: dict) -> str:
     for tid in pol["tokens"]:
         if meta := token_meta(tid):
             env[meta["env_var"]] = pw
-            env[base_url_var(tid)] = f"http://{gw}:{CONTAINER_PROXY_PORT}/pool_{tid.replace('-', '_')}"
+            env[base_url_var(tid)] = f"http://{gw}:{port}/pool_{tid.replace('-', '_')}"
     return "# Generated by agent-sandboxes (Access tab -> Container network). Don't edit.\n" + \
         "".join(f"{k}={v}\n" for k, v in env.items())
 
@@ -2567,6 +2709,12 @@ def write_container_files(ws: dict[str, str]) -> bool:
     policy. Returns whether the container is filtered."""
     name = ws["WS_NAME"]
     pol = load_policy(name)
+    if is_microvm(ws):
+        # The proxy service runs the VM's nono proxy with these; no container
+        container_ca(name)
+        container_password(name)
+        write_if_changed(container_profile_path(name), profile_text(ws))
+        return False
     if pol["network"]["container"] != "filtered":
         for p in (container_override_path(name), container_env_path(name), container_profile_path(name),
                   *container_ca_files(name)):
@@ -2584,6 +2732,224 @@ def write_container_files(ws: dict[str, str]) -> bool:
     write_if_changed(container_override_path(name), container_override_text(ws))
     write_if_changed(container_profile_path(name), profile_text(ws))
     return True
+
+
+# --------------------------------------------------------------- microVM workspaces
+# WS_KIND=microvm: Claude runs as root-capable `dev` in a VM (bin/microvm) with
+# no network interface. Its HTTP(S)_PROXY is the guest's relay on
+# 127.0.0.1:3128, which goes over vsock to the proxy service and on to the
+# workspace's nono proxy (the same profile, CA and password as a filtered
+# container's). The guest gets those settings on a read-only config disk,
+# rebuilt at every start from vm/<name>/config/.
+
+def vm_dir(name: str) -> Path:
+    return VM_ROOT / name
+
+
+def vm_memory_mb(pol: dict) -> int:
+    mem = pol["limits"]["memory"] or (VM_BROWSER_MEMORY if pol["vm_browser"] else VM_DEFAULT_MEMORY)
+    return int(mem[:-1]) * (1024 if mem.endswith("G") else 1)
+
+
+def vm_proxy_env_text(ws: dict[str, str], pol: dict) -> str:
+    pw = container_password(ws["WS_NAME"])
+    relay = f"127.0.0.1:{VM_RELAY_PORT}"
+    proxy = f"http://nono:{pw}@{relay}"
+    bundle = "/etc/ssl/certs/ca-certificates.crt"
+    env = {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "https_proxy": proxy,
+           "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1",
+           "NODE_EXTRA_CA_CERTS": VM_GUEST_CA, "REQUESTS_CA_BUNDLE": bundle, "PIP_CERT": bundle,
+           "NODE_USE_ENV_PROXY": "1", "AIO_WORKSPACE": ws["WS_NAME"]}
+    if pol["vm_browser"]:     # .mcp.json's aio-sandbox server: the container in the VM
+        env.update({"AIO_PORT": str(VM_BROWSER_PORT), "AIO_KEY": ws["WS_KEY"]})
+    for tid in pol["tokens"]:
+        if meta := token_meta(tid):
+            env[meta["env_var"]] = pw
+            env[base_url_var(tid)] = f"http://{relay}/pool_{tid.replace('-', '_')}"
+    return "".join(f"{k}={v}\n" for k, v in env.items())
+
+
+def aio_image() -> str:
+    """The AIO Sandbox image compose.workspace.yaml pins."""
+    m = re.search(r"^\s*image:\s*(\S+)", COMPOSE_FILE.read_text(), re.M)
+    return m[1] if m else ""
+
+
+def vm_browser_compose_text(ws: dict[str, str]) -> str:
+    """The AIO container inside the VM, as compose.workspace.yaml has it on the
+    host, but on the guest's Docker bridge, through the guest's relay."""
+    return f"""# Generated by agent-sandboxes (Access tab -> Browser container in the VM). Don't edit.
+services:
+  sandbox:
+    image: {aio_image()}
+    container_name: aio-browser
+    security_opt:
+      - seccomp:unconfined
+    restart: unless-stopped
+    shm_size: "2gb"
+    mem_limit: "2g"
+    network_mode: bridge
+    ports:
+      - "127.0.0.1:{VM_BROWSER_PORT}:8080"
+    env_file:
+      - /run/aio-config/browser.env
+    environment:
+      SANDBOX_API_KEY: {ws['WS_KEY']}
+      TZ: Etc/UTC
+      WORKSPACE: /home/gem/workspace
+      DISABLE_JUPYTER: "true"
+      DISABLE_CODE_SERVER: "false"
+    volumes:
+      - /project:/home/gem/workspace
+      - /run/aio-config/ca.crt:{CONTAINER_CA_MOUNT}:ro
+      - /run/aio-config/chromium-ca-policy.json:/etc/chromium/policies/managed/agent-sandboxes-proxy-ca.json:ro
+"""
+
+
+def ensure_ws_key(ws: dict[str, str]) -> dict[str, str]:
+    """The AIO API key (microVM workspaces made before the browser option have none)."""
+    if ws.get("WS_KEY"):
+        return ws
+    path = WS_ROOT / f"{ws['WS_NAME']}.env"
+    with open(path, "a") as f:
+        f.write(f"WS_KEY={secrets.token_hex(32)}\n")
+    return read_env(path)
+
+
+def vm_host_profile(ws: dict[str, str]) -> dict:
+    """nono profile for QEMU on the host: its own files, /dev/kvm and
+    /dev/vhost-vsock, the virtiofsd socket; no network, no other sockets."""
+    d = vm_dir(ws["WS_NAME"])
+    return {
+        "meta": {"name": f"vm-{ws['WS_NAME']}", "version": "1.0.0",
+                 "description": f"Generated by agent-sandboxes: QEMU for microVM workspace {ws['WS_NAME']}"},
+        "extends": "default",
+        "linux": {"af_unix_mediation": "pathname"},
+        "filesystem": {"allow": [str(d)], "allow_file": ["/dev/kvm", "/dev/vhost-vsock"],
+                       "read": [p for p in QEMU_DATA if os.path.isdir(p)],
+                       "unix_socket": [str(d / "vfs.sock")]},
+        "network": {"block": True},
+    }
+
+
+def vm_apt_hosts() -> list[str]:
+    """The archive hosts the guest's apt uses (bin/microvm-image takes the host's)."""
+    hosts = []
+    try:
+        for line in Path("/etc/apt/sources.list.d/ubuntu.sources").read_text().splitlines():
+            if line.startswith("URIs:"):
+                hosts += [urllib.parse.urlsplit(u).hostname for u in line.split()[1:]]
+    except OSError:
+        pass
+    # and Docker images' own (ubuntu:*, for apt in a docker build)
+    return [h for h in dict.fromkeys(hosts + ["security.ubuntu.com", "archive.ubuntu.com"]) if h]
+
+
+def vm_problems() -> list[str]:
+    """What's missing on this host for microVM workspaces."""
+    out = []
+    for tool, pkg in (("qemu-system-x86_64", "qemu-system-x86"), ("/usr/libexec/virtiofsd", "virtiofsd"),
+                      ("mke2fs", "e2fsprogs")):
+        if not shutil.which(tool):
+            out.append(f"{tool} is missing (sudo apt install {pkg})")
+    if not os.path.exists("/dev/kvm"):
+        out.append("/dev/kvm is missing (no hardware virtualisation: enable nested virtualisation for this VM)")
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+        if user not in grp.getgrnam("kvm").gr_mem and os.getgid() != grp.getgrnam("kvm").gr_gid:
+            out.append(f"{user} isn't in the kvm group (sudo usermod -aG kvm {user})")
+    except KeyError:
+        out.append("there's no kvm group")
+    if not all((VM_BASE / f).is_file() for f in VM_DISK_FILES):
+        out.append("no microVM image yet (run bin/microvm-image)")
+    return out
+
+
+def vm_prepare(name: str) -> None:
+    """Everything bin/microvm start needs: the VM's own copy of the image
+    (first time), its ssh key, the config disk's contents, QEMU's nono profile
+    and vm.env, and the workspace proxy's files."""
+    ws = load_ws(name)
+    if not is_microvm(ws):
+        raise SystemExit(f"'{name}' isn't a microVM workspace")
+    pol = load_policy(name)
+    d = vm_dir(name)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not all((d / f).is_file() for f in VM_DISK_FILES):
+        if missing := [f for f in VM_DISK_FILES if not (VM_BASE / f).is_file()]:
+            raise SystemExit(f"No microVM image ({', '.join(missing)} missing in {VM_BASE}): run bin/microvm-image")
+        for f in VM_DISK_FILES:      # the kernel too: its modules are on this disk
+            subprocess.run(["cp", "--sparse=always", "--reflink=auto", str(VM_BASE / f), str(d / f)], check=True)
+            (d / f).chmod(0o600)
+    key = d / "id_ed25519"
+    if not key.is_file():
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"agent-sandboxes {name} host",
+                        "-f", str(key)], check=True)
+    ws = ensure_ws_key(ws)
+    write_container_files(ws)                     # the proxy's profile, CA and password
+    crt, _ = container_ca(name)
+    pem = crt.read_text()
+    cfg = d / "config"
+    cfg.mkdir(mode=0o700, exist_ok=True)
+    write_if_changed(cfg / "hostname", name + "\n")
+    write_if_changed(cfg / "authorized_keys", (d / "id_ed25519.pub").read_text())
+    write_if_changed(cfg / "proxy.env", vm_proxy_env_text(ws, pol))
+    write_if_changed(cfg / "ca.crt", pem)
+    browser = cfg / "browser-compose.yaml", cfg / "browser.env", cfg / "chromium-ca-policy.json"
+    if pol["vm_browser"]:
+        ensure_mcp_json(ws["WS_DIR"])
+        der = ssl.PEM_cert_to_DER_cert(pem)
+        write_if_changed(browser[0], vm_browser_compose_text(ws))
+        write_if_changed(browser[1], container_env_text(ws, pol, VM_BRIDGE, VM_RELAY_PORT))
+        write_if_changed(browser[2], json.dumps({"CACertificates": [base64.b64encode(der).decode()]}) + "\n")
+    else:
+        for p in browser:
+            p.unlink(missing_ok=True)
+    write_if_changed(d / "host-profile.json", json.dumps(vm_host_profile(ws), indent=2) + "\n")
+    write_if_changed(d / "vm.env", f"VM_CID={vm_cid(ws)}\nVM_MEMORY_MB={vm_memory_mb(pol)}\n"
+                                   f"VM_VCPUS={VM_VCPUS}\nWS_DIR={shlex.quote(ws['WS_DIR'])}\n"
+                                   f"VM_DISK_GB={VM_BROWSER_DISK_GB if pol['vm_browser'] else VM_DISK_GB}\n"
+                                   f"VM_BROWSER={int(pol['vm_browser'])}\n"
+                                   f"VM_BROWSER_IMAGE={shlex.quote(aio_image())}\n")
+
+
+async def vm_states() -> dict[str, str]:
+    """systemd --user state of each aio-vm-<name> unit."""
+    rc, out, _ = await run("systemctl", "--user", "list-units", "--all", "--plain", "--no-legend",
+                           "--type=service", "aio-vm-*")
+    states = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[0].startswith("aio-vm-") and f[0].endswith(".service"):
+            states[f[0][len("aio-vm-"):-len(".service")]] = f[2]
+    return states
+
+
+def vm_container_state(name: str, unit_state: str | None) -> str:
+    """In the UI's container terms."""
+    if unit_state == "active":
+        return "running"
+    if unit_state in ("activating", "reloading"):
+        return "restarting"
+    if unit_state == "deactivating":
+        return "exited"
+    return "exited" if (vm_dir(name) / "rootfs.img").is_file() else "absent"
+
+
+async def apply_vm_policy(ws: dict[str, str], old: dict, pol: dict) -> list[str]:
+    """After a policy save: the VM's proxy takes allowlist changes at once; token
+    variables and memory are on the config disk / QEMU's command line."""
+    name = ws["WS_NAME"]
+    write_container_files(ws)
+    notes = await sync_proxies(name, restart=True)
+    if (old["tokens"] != pol["tokens"] or old["limits"]["memory"] != pol["limits"]["memory"]
+            or old["vm_browser"] != pol["vm_browser"]) and (await vm_states()).get(name) == "active":
+        notes.append("Network changes apply now; restart the VM (Stop, then Start) for token, memory or "
+                     "browser container changes.")
+    if pol["vm_browser"] and not old["vm_browser"]:
+        notes.append("The first start with the browser container copies its image (about 13 GB) into the VM: "
+                     "the Browser tab works a few minutes after that.")
+    return notes
 
 
 async def container_running(name: str) -> bool:
@@ -2696,6 +3062,10 @@ def cli_prepare(name: str, aux: bool = False):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["vm-prepare"] and len(sys.argv) == 3:
+        ensure_dirs()
+        vm_prepare(sys.argv[2])
+        sys.exit(0)
     if sys.argv[1:2] == ["prepare"] and len(sys.argv) in (3, 4) and sys.argv[3:] in ([], ["--aux"]):
         cli_prepare(sys.argv[2], aux=sys.argv[3:] == ["--aux"])
         sys.exit(0)

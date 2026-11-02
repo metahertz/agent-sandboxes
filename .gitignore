@@ -2,6 +2,7 @@
 workspaces/
 secrets/
 state/
+vm/
 ui/token
 ui/tls/
 ui/extra-hostnames

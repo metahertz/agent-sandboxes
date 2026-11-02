@@ -213,3 +213,6 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
   .two, .two.narrow, .three { grid-template-columns: 1fr; }
   .pool { height: auto; }
 }
+
+/* microVM workspaces: their own Access-tab notes; no container-only parts */
+#detail.is-vm .sandbox-only, #detail:not(.is-vm) .vm-only { display: none !important; }

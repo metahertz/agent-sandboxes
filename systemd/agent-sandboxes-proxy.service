@@ -2,8 +2,9 @@
 # container proxies and forwarders), apart from the web UI so a UI restart
 # doesn't cut sandbox connections. Restarting this one does.
 # Install: sudo install -m 644 ~/agent-sandboxes/systemd/agent-sandboxes-proxy.service /etc/systemd/system/
+# AF_VSOCK: the microVM workspaces reach their proxies over vsock (no network interface).
 [Unit]
-Description=Agent Sandboxes network proxies (API bridge, port filters, container proxies)
+Description=Agent Sandboxes network proxies (API bridge, port filters, container and microVM proxies)
 Documentation=file:///home/metahertz/agent-sandboxes/README.md
 Wants=network-online.target
 After=network-online.target docker.service user-runtime-dir@1000.service
@@ -31,7 +32,7 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_VSOCK
 RestrictNamespaces=yes
 LockPersonality=yes
 

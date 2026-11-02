@@ -68,10 +68,10 @@ function renderList() {
     b.setAttribute("aria-current", String(state.view === "ws" && w.name === state.selected));
     b.innerHTML = `<span class="n"></span><span class="dots"><span class="dot" title="container"></span><span class="dot" title="Claude"></span></span><span class="sub"></span>`;
     $(".n", b).textContent = w.name;
-    $(".sub", b).textContent = w.dir.replace(/^\/home\/[^/]+/, "~");
+    $(".sub", b).textContent = w.dir.replace(/^\/home\/[^/]+/, "~") + (w.kind === "microvm" ? " · microVM" : "");
     const [dc, dl] = $$(".dot", b);
     dc.classList.add(CONTAINER_TONE[w.container] || "none");
-    dc.title = `Container: ${w.container}`;
+    dc.title = `${w.kind === "microvm" ? "VM" : "Container"}: ${w.container}`;
     dl.classList.add(CLAUDE_TONE[w.claude] || "none");
     dl.title = `Claude: ${w.claude}`;
     b.addEventListener("click", () => select(w.name));
@@ -98,8 +98,16 @@ function renderDetail() {
   $("#d-name").textContent = w.name;
   $("#d-dir").textContent = w.dir;
   $$(".d-dir-inline").forEach((el) => (el.textContent = w.dir));
+  const vm = w.kind === "microvm";
+  $("#detail").classList.toggle("is-vm", vm);
+  $("#d-port-label").textContent = vm ? "microVM, slot" : "sandbox port";
   $("#d-port").textContent = w.port;
-  setPill($("#d-container"), "container", w.container, CONTAINER_TONE[w.container]);
+  $("#d-runtime").textContent = vm ? "VM" : "Container";
+  setPill($("#d-container"), vm ? "VM" : "container", w.container, CONTAINER_TONE[w.container]);
+  // a microVM without the browser container: no sandbox views, no container files
+  const views = !vm || w.browser;
+  for (const tab of VM_HIDDEN_TABS) $(`.tabs [data-tab="${tab}"]`).hidden = !views;
+  if (!views && VM_HIDDEN_TABS.includes(state.tab)) selectTab("claude");
   setPill($("#d-claude"), "Claude", w.claude, CLAUDE_TONE[w.claude]);
   $("#d-pending").hidden = !w.policyPending;
 
@@ -116,17 +124,18 @@ function renderDetail() {
   overlay.hidden = w.claude !== "stopped";
   $("#term-overlay-msg").textContent = up
     ? "Claude isn't running in this workspace."
-    : "Claude isn't running. Start the container first so it can use the browser.";
+    : vm ? "Claude isn't running. Start the VM first: Claude runs inside it."
+      : "Claude isn't running. Start the container first so it can use the browser.";
   if (state.tab === "claude" && w.claude !== "stopped") ensureTerm(w);
   if (w.claude === "stopped" && term.for === w.name) disconnectTerm();
 
   // Browser tab
   // Sandbox-backed tabs (browser, VS Code, container terminal)
   for (const tab of Object.keys(FRAMES)) {
-    $(`[data-panel="${tab}"] .overlay`).hidden = up;
-    if (!up && state.frameFor[tab]) clearFrame(tab);
+    $(`[data-panel="${tab}"] .overlay`).hidden = up && views;
+    if ((!up || !views) && state.frameFor[tab]) clearFrame(tab);
   }
-  if (up && FRAMES[state.tab] && state.frameFor[state.tab] !== w.name) loadFrame(state.tab, w);
+  if (up && views && FRAMES[state.tab] && state.frameFor[state.tab] !== w.name) loadFrame(state.tab, w);
 }
 
 function select(name) {
@@ -167,6 +176,8 @@ function msg(text, isErr = false) {
   el.classList.toggle("err", isErr);
 }
 
+const VM_HIDDEN_TABS = ["browser", "vscode", "shell", "files"];
+
 const ACT_LABEL = {
   "container/start": "Starting container…", "container/stop": "Stopping container…",
   "claude/start": "Starting Claude…", "claude/restart": "Restarting Claude…", "claude/stop": "Stopping Claude…",
@@ -179,7 +190,8 @@ document.addEventListener("click", async (ev) => {
   if (!w) return;
   const act = btn.dataset.act;
   $$("[data-act]").forEach((b) => (b.disabled = true));
-  msg(ACT_LABEL[act] || "Working…");
+  msg(w.kind === "microvm" && act.startsWith("container/")
+    ? (act === "container/start" ? "Starting VM…" : "Stopping VM…") : ACT_LABEL[act] || "Working…");
   try {
     await api("POST", wsPath(w.name, `/${act}`));
     msg("");
@@ -195,6 +207,8 @@ $("#remove-btn").addEventListener("click", () => {
   const w = current();
   $("#rm-name").textContent = w.name;
   $("#rm-dir").textContent = w.dir;
+  $("#rm-what").textContent = w.kind === "microvm"
+    ? "VM and its disk (Claude's login there, Docker images, anything outside /project)" : "container and its key";
   $("#remove-confirm").hidden = false;
 });
 const hideConfirm = () => ($("#remove-confirm").hidden = true);
@@ -224,6 +238,9 @@ $("#new-toggle").addEventListener("click", () => {
   $("#new-toggle").hidden = true;
   newForm.elements.name.focus();
 });
+newForm.elements.kind.addEventListener("change", () => {
+  $("#new-kind-hint").hidden = newForm.elements.kind.value !== "microvm";
+});
 $("#new-cancel").addEventListener("click", () => {
   newForm.hidden = true;
   $("#new-toggle").hidden = false;
@@ -233,13 +250,17 @@ newForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const name = newForm.elements.name.value.trim();
   const dir = newForm.elements.dir.value.trim();
+  const kind = newForm.elements.kind.value;
   const out = $("#new-msg");
   out.classList.remove("err");
-  out.textContent = "Creating workspace and starting its container…";
+  out.textContent = kind === "microvm"
+    ? "Creating workspace and starting its VM (the first start copies the image)…"
+    : "Creating workspace and starting its container…";
   $$("button", newForm).forEach((b) => (b.disabled = true));
   try {
-    const res = await api("POST", "workspaces", { name, dir: dir || undefined });
+    const res = await api("POST", "workspaces", { name, dir: dir || undefined, kind });
     newForm.reset();
+    $("#new-kind-hint").hidden = true;
     newForm.hidden = true;
     $("#new-toggle").hidden = false;
     out.textContent = "";
@@ -548,6 +569,7 @@ async function loadAccess() {
     form.elements.memory.value = policy.limits.memory;
     form.elements.pids.value = policy.limits.pids || "";
     form.elements.claude_md.checked = policy.claude_md;
+    form.elements.vm_browser.checked = !!policy.vm_browser;
     form.elements.container.value = policy.network.container;
     $("#acc-restart").hidden = w.claude === "stopped";
     loadWsSshAccess(w);
@@ -569,6 +591,7 @@ async function saveAccess(restart) {
       container: form.elements.container.value || "open", listen: lines(form.elements.listen.value) },
     limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0) },
     claude_md: form.elements.claude_md.checked,
+    vm_browser: form.elements.vm_browser.checked,
   };
   out.textContent = "Saving…";
   try {

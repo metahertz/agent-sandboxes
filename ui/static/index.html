@@ -29,6 +29,13 @@
       <label>Project folder <span class="muted">(optional)</span>
         <input name="dir" placeholder="~/projects/my-app" autocomplete="off">
       </label>
+      <label>Type
+        <select name="kind">
+          <option value="sandbox">Sandbox: Claude under nono, plus a browser container</option>
+          <option value="microvm">MicroVM: Claude with root and Docker, in a VM</option>
+        </select>
+      </label>
+      <p class="hint muted" id="new-kind-hint" hidden>A VM with no network interface: it reaches only this workspace's allowlist, through its proxy on the host. Only the project folder is shared in (at <code>/project</code>). The browser container is optional (Access tab).</p>
       <div class="row">
         <button class="btn primary" type="submit">Create</button>
         <button class="btn ghost" type="button" id="new-cancel">Cancel</button>
@@ -59,7 +66,7 @@
       <header class="detail-head">
         <div class="title">
           <h1 id="d-name"></h1>
-          <p class="meta"><span id="d-dir"></span> · sandbox port <span id="d-port"></span></p>
+          <p class="meta"><span id="d-dir"></span> · <span id="d-port-label">sandbox port</span> <span id="d-port"></span></p>
         </div>
         <div class="status">
           <span class="pill" id="d-container"></span>
@@ -70,7 +77,7 @@
 
       <div class="toolbar">
         <div class="group">
-          <span class="group-label">Container</span>
+          <span class="group-label" id="d-runtime">Container</span>
           <button class="btn" data-act="container/start">Start</button>
           <button class="btn" data-act="container/stop">Stop</button>
         </div>
@@ -85,7 +92,7 @@
         </div>
       </div>
       <div class="confirm" id="remove-confirm" hidden>
-        <p>Remove <strong id="rm-name"></strong>? Stops Claude, deletes the container and its key. The project folder <code id="rm-dir"></code> is kept.</p>
+        <p>Remove <strong id="rm-name"></strong>? Stops Claude, deletes the <span id="rm-what">container and its key</span>. The project folder <code id="rm-dir"></code> is kept.</p>
         <div class="row">
           <button class="btn danger" id="rm-yes">Remove workspace</button>
           <button class="btn ghost" id="rm-no">Cancel</button>
@@ -170,25 +177,34 @@
               <label>Block <span class="muted">(hosts or IP addresses; wins over everything else)</span>
                 <textarea name="deny" rows="4" spellcheck="false" placeholder="pastebin.com"></textarea></label>
             </div>
+            <div class="sandbox-only">
             <label>Listen ports <span class="muted">(servers Claude runs, e.g. a dev server: <code>8000</code> or <code>8000-8010</code>, 1024–65535; Claude can connect to them on localhost)</span>
               <input name="listen" placeholder="none" autocomplete="off" spellcheck="false"></label>
-            <p class="hint">nono can't limit which address a server binds, so one on <code>0.0.0.0</code> is reachable from your network unless the host's firewall blocks it. Ports this app uses (7100–7199, 8101–8199, 9101–9199, 3128, 4318) and other workspaces' listen ports are refused.</p>
+            <p class="hint">nono can't limit which address a server binds, so one on <code>0.0.0.0</code> is reachable from your network unless the host's firewall blocks it. Ports this app uses (6101–6199, 7100–7199, 8101–8199, 9101–9199, 3128, 4318) and other workspaces' listen ports are refused.</p>
             <h3>Container network <span class="muted">(the sandbox's browser, VS Code and terminal)</span></h3>
             <div class="radios">
               <label><input type="radio" name="container" value="open"> <span><strong>Unfiltered</strong> — the container reaches the internet directly; no API tokens there</span></label>
               <label><input type="radio" name="container" value="filtered"> <span><strong>Same as Claude</strong> — only this allowlist, through the workspace's own nono proxy, with the same API tokens (HTTPS APIs at their own URL or <code>$POOL_&lt;NAME&gt;_BASE_URL</code>, HTTP ones via the latter; the container trusts the workspace's proxy CA)</span></label>
             </div>
             <p class="hint">“Same as Claude” puts the container on a network with no route out; its browser and shell tools use the proxy, and the rest (DNS, raw TCP) can't connect. Allowlist changes apply to the container at once; switching this, or changing its tokens, recreates the container (its browser session restarts). VS Code extensions need <code>open-vsx.org</code> allowed.</p>
+            </div>
+            <p class="hint vm-only">This VM has no network interface: everything in it (Claude, apt, Docker, git over ssh) goes through its proxy on the host, with this allowlist, which applies at once. <code>claude.ai</code> and <code>downloads.claude.ai</code> are always allowed, for installing Claude Code in the VM. Token changes apply when the VM restarts.</p>
+          </section>
+          <section class="card vm-only">
+            <h2>Browser container</h2>
+            <label class="check"><input type="checkbox" name="vm_browser"> <span>Run the AIO browser container in the VM <span class="muted">(Chromium, VS Code, terminal; Claude's MCP tools)</span></span></label>
+            <p class="hint">The same container as a sandbox workspace's, inside the VM: its network is the VM's (this allowlist, through the proxy), and the Browser, VS Code, Terminal and Files tabs reach it over vsock. Its image (about 13 GB) is copied from this host into the VM's disk on the first start, which takes a few minutes; the VM's memory default goes up to 5G and its disk to 48G (sparse). Restart the VM to apply.</p>
           </section>
           <section class="card">
             <h2>Resource limits</h2>
-            <p class="hint">Applied to Claude's whole process tree via cgroups. Leave empty for no limit. Restart Claude to apply.</p>
+            <p class="hint sandbox-only">Applied to Claude's whole process tree via cgroups. Leave empty for no limit. Restart Claude to apply.</p>
+            <p class="hint vm-only">Memory is the VM's (default 2G, or 5G with the browser container; 2 vCPUs). Restart the VM to apply.</p>
             <div class="two narrow">
               <label>Memory <input name="memory" placeholder="e.g. 4G" autocomplete="off"></label>
-              <label>Max processes <input name="pids" type="number" min="0" placeholder="0 = no limit"></label>
+              <label class="sandbox-only">Max processes <input name="pids" type="number" min="0" placeholder="0 = no limit"></label>
             </div>
           </section>
-          <section class="card">
+          <section class="card sandbox-only">
             <h2>Notes for Claude</h2>
             <label class="check"><input type="checkbox" name="claude_md"> <span>Keep the sandbox notes in this project's <code>CLAUDE.md</code> <span class="muted">(edit them under Settings)</span></span></label>
             <p class="hint">A marked block at the end of the file, refreshed whenever Claude starts and removed when you untick this; the rest of the file is left alone. It's part of the project, so it shows up in git. Whether or not this is on, Claude is told at startup how to call this workspace's API tokens.</p>
@@ -201,7 +217,13 @@
           </section>
           <section class="card fixed">
             <h2>Always enforced</h2>
-            <ul>
+            <ul class="vm-only">
+              <li>Claude runs in its own VM (QEMU, KVM): its kernel, root and Docker (and the browser container, if ticked) stay inside it. Only the project folder is shared in, at <code>/project</code>.</li>
+              <li>No network interface: the VM's only channel is vsock to this host's proxy service, which identifies it by its vsock address and hands it to this workspace's nono proxy.</li>
+              <li>On the host, QEMU runs under nono with no network and only its own files; the folder is served by virtiofsd in its own sandbox.</li>
+              <li>Secrets in the pool and other workspaces' keys never enter the VM; API tokens are swapped in by the proxy on the host.</li>
+            </ul>
+            <ul class="sandbox-only">
               <li>Files: read/write the project folder only (plus Claude's own state); <code>~/.ssh</code>, credentials, keyrings, browser data and shell history denied.</li>
               <li>Unix sockets denied by default: no Docker, tmux, D-Bus or <code>systemd --user</code>.</li>
               <li>Localhost: only this workspace's sandbox port <span id="acc-port"></span>, plus Alloy's telemetry receiver (4318) when Claude Code telemetry is on, and its listen ports.</li>

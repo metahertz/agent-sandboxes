@@ -61,6 +61,9 @@ flowchart LR
 - **UI:** token login, same-origin API, per-workspace capability URLs for sandbox views.
   Runs as your user with only `CAP_NET_BIND_SERVICE`, which it clears from the
   inheritable set once 443 is bound.
+- **MicroVM workspaces:** Claude in a KVM guest with root and Docker, no network
+  interface, its only channel vsock to the proxy service; see
+  [MicroVM workspaces](#microvm-workspaces).
 - **Proxies:** the parts of the sandboxes' network path that run outside nono — the HTTP
   API bridge, the port filters, and the containers' nono proxies and forwarders (see
   Usage) — run in their own service, `agent-sandboxes-proxy` (`ui/proxyd.py`), so
@@ -74,13 +77,15 @@ flowchart LR
 | Path | What |
 |---|---|
 | `ui/server.py`, `ui/static/` | Web UI (stdlib Python; vanilla JS; xterm.js 5.5.0 vendored, MIT) |
-| `ui/proxyd.py` | Proxy service: HTTP API bridge, port filters, container proxies / forwarders |
+| `ui/proxyd.py` | Proxy service: HTTP API bridge, port filters, container proxies / forwarders, microVM proxies and their vsock listener |
 | `ui/common.py` | Paths, workspace / policy files and network helpers both services use |
 | `bin/sandbox-ui` | UI launcher (systemd `ExecStart`) |
 | `bin/sandbox-ui-cert` | Private, name-constrained CA + server cert in `ui/tls/` |
 | `bin/claude-in <name>` | Claude Code inside nono for one workspace (prepares agent + profile); nono's log goes to `monitoring/data/nono-logs/<name>.log`, outside the sandbox |
 | `libexec/ssh-proxy-connect` | SSH `ProxyCommand` through nono's proxy (readable in the sandbox) |
 | `compose.workspace.yaml` | Container template (compose project `aio-<name>`) |
+| `bin/microvm`, `bin/microvm-image`, `microvm/guest/` | MicroVM workspaces: start / stop / ssh a VM (systemd `--user` unit `aio-vm-<name>`); build the base image; the guest's own scripts and units |
+| `vm/base/` ✱, `vm/<name>/` ✱ | The base image; each VM's disk, kernel, ssh key, config disk, QEMU's nono profile, console log |
 | `nono/claude-browser.jsonc` → `~/.config/nono/profiles/` | nono profile |
 | `nono/aio-env.sh` → `~/.config/nono/hooks/` | nono hook: gives Claude its sandbox port/key |
 | `systemd/agent-sandboxes-ui.service`, `agent-sandboxes-proxy.service` → `/etc/systemd/system/` | Service units (the UI `Wants=` the proxies) |
@@ -128,6 +133,15 @@ sudo systemctl daemon-reload && sudo systemctl enable --now agent-sandboxes-prox
 sudo ufw allow from <your-subnet> to any port 443,9101:9199 proto tcp
 ```
 
+For microVM workspaces (optional): hardware virtualisation (`/dev/kvm`; in a VM, nested
+virtualisation and a CPU type that passes `vmx`/`svm` through), then
+
+```bash
+sudo apt install qemu-system-x86 virtiofsd mmdebstrap
+sudo usermod -aG kvm $USER
+bin/microvm-image            # as you, from Ubuntu's archive: vm/base/, about 1.5 GB
+```
+
 Then, on the machine you browse from, import `ui/tls/ca.crt` as a trusted CA (it's also
 at `https://<host>/ca.crt`; check the fingerprint in `journalctl -u agent-sandboxes-ui`)
 and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
@@ -172,7 +186,7 @@ container's network, resource limits, the CLAUDE.md notes, and workspace-only SS
   localhost (`open_port`). Single ports or ranges, 1024–65535, at most 100. nono can't
   limit the address, so a server on `0.0.0.0` is reachable from the network unless the
   host's firewall blocks it. Ports this app listens on are refused (sandbox ports, the
-  UI's sandbox views, the port filters and API bridge, 3128, 4318), since a workspace
+  UI's sandbox views, the port filters and API bridge, the microVMs' proxies, 3128, 4318), since a workspace
   holding one could stand in for it, and so are other workspaces' listen ports.
   Restart Claude to apply.
 - **Container network** (*Access* tab): *Same as Claude* gives the AIO container the
@@ -205,6 +219,51 @@ container's network, resource limits, the CLAUDE.md notes, and workspace-only SS
   the workspace's allowlist and tokens filled in. Refreshed at every Claude start.
 - **Remote terminal** (*Access* tab): SSH keys that reach one workspace only. See
   [SSH into a workspace](#ssh-into-a-workspace).
+
+### MicroVM workspaces
+
+For work that needs more than the nono sandbox allows (Docker, root, systemd, its own
+tmux, building and running this app itself): *New workspace* → **Type: MicroVM**. Claude
+runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/project`.
+
+- **Boundary:** a KVM guest (QEMU's `microvm` machine, Ubuntu's kernel) with its own disk
+  (`vm/<name>/rootfs.img`, a copy of `vm/base/`). Only the project folder is shared in,
+  by virtiofsd in its own namespace sandbox. On the host, QEMU runs under nono with no
+  network, only `/dev/kvm`, `/dev/vhost-vsock`, its own files and the virtiofsd socket.
+- **Network:** the VM has no network interface. Its only channel is vsock: a relay in
+  the guest (`127.0.0.1:3128`, which `HTTP(S)_PROXY`, apt, Docker and ssh's
+  `ProxyCommand` use) connects to the host's proxy service on vsock port 3128. The proxy
+  service picks the workspace by the guest's CID (`1000 + slot`), which the host
+  assigns, and hands the connection to that workspace's `nono proxy` on
+  `127.0.0.1:<slot port − 2000>`, with the same profile, CA and password a filtered
+  container's proxy gets. So the allowlist, phantom API tokens and the per-connection log
+  (`monitoring/data/nono-logs/<name>.container.log`, in Loki) work as for any workspace;
+  allowlist changes apply at once. `claude.ai` and `downloads.claude.ai` are always
+  allowed: the guest installs Claude Code itself on its first start (`aio-claude`). Listen
+  ports don't apply; containers inside the VM reach the relay on Docker's bridge.
+- **Claude and SSH keys:** `bin/claude-in` (and the UI's *Claude* tab) ssh into the guest
+  over vsock (systemd's `vsock/<cid>`) with the workspace's ssh-agent forwarded, so git
+  over ssh uses the assigned keys, through the proxy. Claude's login, settings and history
+  live in the VM, not in the host's shared `~/.claude`.
+- **Config:** at each start `bin/microvm` writes a read-only config disk (hostname, the
+  host's ssh key for the VM, proxy settings and token placeholders, the proxy CA), which
+  `aio-config.service` applies at boot. Token and memory changes need a VM restart.
+  Memory: the *Memory* limit (default 2G); 2 vCPUs.
+- **Lifecycle:** *Start* / *Stop* in the toolbar (`bin/microvm start|stop <name>`; stop
+  shuts the guest down cleanly). VMs don't start by themselves after the host reboots.
+  *Remove* deletes the VM's disk, and keeps the project folder.
+- **Browser container** (optional, *Access* tab): the AIO container, as a sandbox
+  workspace has it, but run by Docker inside the VM (`aio-browser.service`, from a compose
+  file on the config disk): on the guest's Docker bridge, everything through the guest's
+  relay, so the workspace's allowlist and tokens, the proxy CA in its system store and
+  Chromium's policy. Claude's MCP (`.mcp.json`, `AIO_PORT=8080`) reaches it inside the VM.
+  The proxy service forwards `127.0.0.1:<slot port>` to the guest's vsock port 8080, which
+  the guest's relay hands to the container, so the Browser, VS Code and Terminal tabs work
+  through the UI as usual; the Files tab runs `docker exec` over the VM's ssh. The first
+  start copies the image from the host's Docker (`docker save | docker load`, about
+  13 GB, a few minutes; `bin/microvm load-image`), so no registry needs allowing. With it,
+  the VM's memory default is 5G and its disk 48G (sparse; the guest grows its filesystem
+  at boot). Off by default.
 
 ### Keys & tokens
 
