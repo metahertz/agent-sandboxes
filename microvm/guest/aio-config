@@ -38,6 +38,9 @@ printf '{"proxies": {"default": {"httpProxy": "%s", "httpsProxy": "%s", "noProxy
   "$bridge" "$bridge" > /home/dev/.docker/config.json
 chown dev:dev /home/dev/.docker/config.json
 chmod 600 /home/dev/.docker/config.json
+# git asks the proxy for its auth method and waits for a 407, which nono's
+# proxy never sends ("Proxy CONNECT aborted"): send the credentials up front
+git config --system http.proxyAuthMethod basic
 
 install -m 644 "$C/ca.crt" /usr/local/share/ca-certificates/aio-proxy.crt
 update-ca-certificates >/dev/null 2>&1 || true
