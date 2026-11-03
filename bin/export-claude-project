@@ -2,7 +2,8 @@
 """Send a project, with its Claude Code history, to an Agent Sandboxes host.
 
 Run this on the machine the project is on now (Linux or macOS; python3 and
-rsync, nothing else). It uploads into the host's import inbox; then use
+rsync, nothing else: macOS's own rsync 2.6.9 or openrsync will do, the
+options it lacks are left out with a note). It uploads into the host's import inbox; then use
 Import in the host's web UI to turn it into a workspace.
 
   export-claude-project [PROJECT] --to USER@HOST          with an upload key (Import page)
@@ -23,6 +24,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -131,6 +133,57 @@ def build_history(project, paths, staging, args):
     return manifest, stats
 
 
+# rsync options this uses. Required: without them the upload can't work.
+# Optional: left out, with a note, when the local rsync doesn't take them.
+# macOS ships rsync 2.6.9 or, from 15.4, Apple's openrsync, which take fewer
+# options than rsync 3; each one is tested rather than guessed from versions.
+RSYNC_REQUIRED = ["-a", "-e", "--exclude"]
+RSYNC_OPTIONAL = {
+    "--partial": "an interrupted upload starts each unfinished file again from the beginning",
+}
+# How to test each: rsync checks every option before acting on --version, so
+# one it doesn't know makes `rsync <option> --version` fail.
+RSYNC_PROBE = {"-e": ["-e", "ssh"], "--exclude": ["--exclude=x"]}
+
+
+def rsync_flavour():
+    """(description of the local rsync, options it takes)."""
+    try:
+        v = subprocess.run(["rsync", "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True)
+    except FileNotFoundError:
+        die("rsync isn't installed" + (" (it comes with macOS; is /usr/bin on your PATH?)"
+                                       if sys.platform == "darwin" else ": install the rsync package"))
+    first = (v.stdout.strip().splitlines() or ["rsync (unknown version)"])[0].strip()
+    if v.returncode != 0:
+        # can't test options this way: assume only the basics
+        return first, set(RSYNC_REQUIRED)
+    ok = set()
+    for opt in RSYNC_REQUIRED + list(RSYNC_OPTIONAL):
+        test = RSYNC_PROBE.get(opt, [opt])
+        if subprocess.call(["rsync"] + test + ["--version"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL) == 0:
+            ok.add(opt)
+    return first, ok
+
+
+def check_rsync():
+    """The options to pass on every upload, after checking the local rsync."""
+    desc, ok = rsync_flavour()
+    missing = [o for o in RSYNC_REQUIRED if o not in ok]
+    if missing:
+        die("this rsync ({}) doesn't take {}. Install a current rsync{}, or use --out and copy "
+            "the folder over yourself.".format(desc, ", ".join(missing),
+                                                " (brew install rsync)" if sys.platform == "darwin" else ""))
+    opts = ["-a"]
+    for o, without in RSYNC_OPTIONAL.items():
+        if o in ok:
+            opts.append(o)
+        else:
+            print("Note: this rsync ({}) doesn't take {}: {}.".format(desc, o, without))
+    return opts
+
+
 def rsync(src, dest, args, extra=()):
     ssh = ["ssh"]
     if args.identity:
@@ -140,9 +193,11 @@ def rsync(src, dest, args, extra=()):
         ssh += ["-i", key, "-o", "IdentitiesOnly=yes"]
     if args.port:
         ssh += ["-p", str(args.port)]
-    cmd = ["rsync", "-a", "--partial", "-e", " ".join(ssh)] + list(extra) + [src, dest]
+    # rsync splits -e at spaces but keeps quoted words together (a key path with spaces)
+    cmd = ["rsync"] + args.rsync_opts + ["-e", " ".join(shlex.quote(s) for s in ssh)] \
+        + list(extra) + [src, dest]
     if subprocess.call(cmd) != 0:
-        die("rsync failed: " + " ".join(cmd))
+        die("rsync failed: " + " ".join(shlex.quote(c) for c in cmd))
 
 
 def main():
@@ -167,6 +222,8 @@ def main():
     paths = {project, os.path.abspath(args.project)}
     args.name = args.name or re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(project)).strip("-.") or "project"
     excludes = ([] if args.include_all else DEFAULT_EXCLUDES) + args.exclude + [".claude-import"]
+
+    args.rsync_opts = check_rsync() if args.to else []
 
     with tempfile.TemporaryDirectory(prefix="claude-export-") as tmp:
         staging = Path(tmp)

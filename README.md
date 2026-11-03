@@ -329,6 +329,10 @@ upload isn't importable). Upload keys can only rsync into the inbox (`rrsync -wo
 no shell, no reading; symlinks are stored defused and restored on import). With a normal
 login use `--to user@host:agent-sandboxes/inbox`; or `--out DIR` and copy the folder in
 any way. A plain folder with no `.claude-import/` imports too, without history.
+Before uploading it tests which options the local rsync takes, so macOS's rsync 2.6.9
+or openrsync (macOS 15.4+) work too: if it lacks `--partial` it says so and an
+interrupted upload restarts unfinished files; an rsync too old for the basics stops
+with a hint (`brew install rsync`, or `--out`).
 
 *Import* moves the folder to `~/projects/<name>` (or the folder you give; never merging
 into an existing one), creates the workspace, and installs the history under the new path
