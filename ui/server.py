@@ -2397,6 +2397,11 @@ async def terminal(req: Request, name: str, reader, w):
 
 PROXY_LOGIN_PAGE = b"""<!doctype html><meta charset=utf-8><title>Sandbox</title>
 <p style="font:15px system-ui;margin:3rem">Open this sandbox from the Agent Sandboxes dashboard.</p>"""
+SANDBOX_DOWN_VM = b"""The browser container in this workspace's VM isn't answering.
+- Just ticked Browser container in the Access tab? Stop and Start the VM.
+- After a start, the first one copies the image into the VM (about 13 GB): give it a few minutes.
+- Otherwise check the VM's log (Logs tab), or in the VM: docker ps -a; systemctl status aio-browser
+"""
 
 
 async def handle_proxy(req: Request, name: str, reader, w):
@@ -2445,7 +2450,14 @@ async def handle_proxy(req: Request, name: str, reader, w):
 
     c2u = asyncio.create_task(client_to_upstream())
     try:
-        resp_head = await up_r.readuntil(b"\r\n\r\n")
+        try:
+            resp_head = await up_r.readuntil(b"\r\n\r\n")
+        except (asyncio.IncompleteReadError, ConnectionError):
+            # Closed before answering. For a microVM the proxy service's forwarder
+            # takes the connection and drops it when nothing in the VM answers;
+            # without a response the browser shows a TLS error instead.
+            return await respond(w, 502, SANDBOX_DOWN_VM if is_microvm(ws) else
+                                 b"The sandbox container closed the connection.\n", "text/plain; charset=utf-8")
         lines = resp_head[:-4].decode("latin-1").split("\r\n")
         out = [lines[0]]
         for line in lines[1:]:
