@@ -48,7 +48,13 @@ EOF
 install -d "$stage/etc/ssh/ssh_config.d"
 printf '# git and ssh go out through the workspace proxy\nHost *\n  ProxyCommand /usr/local/bin/ssh-proxy-connect %%h %%p\n' \
   > "$stage/etc/ssh/ssh_config.d/50-aio-proxy.conf"
-chmod -R go+rX "$stage"
+chmod -R go-w,go+rX "$stage"
+# sync-in copies each staged path's owner (this user) and mode, including the
+# directories that already exist in the image (/, /etc, /etc/ssh, /usr...): give
+# them all back to root. ssh refuses its config otherwise ("Bad owner or
+# permissions"), and the guest's system directories mustn't be dev's.
+# ($1 stays literal here: the hook's shell expands it to the chroot.)
+staged=$(cd "$stage" && find . -printf '"$1/%P" ')
 
 # shellcheck disable=SC2016  # $1 is mmdebstrap's chroot path, expanded by its hook shell
 mmdebstrap --mode=unshare --variant=apt --format=tar \
@@ -57,7 +63,7 @@ mmdebstrap --mode=unshare --variant=apt --format=tar \
   --customize-hook='printf "LABEL=root / ext4 defaults 0 1\nproject /project virtiofs defaults 0 0\n" > "$1/etc/fstab"; mkdir -p "$1/project"' \
   --customize-hook='chroot "$1" useradd -m -u 1000 -s /bin/bash -G sudo,docker dev; echo "dev ALL=(ALL) NOPASSWD:ALL" > "$1/etc/sudoers.d/dev"; chmod 440 "$1/etc/sudoers.d/dev"; chroot "$1" passwd -l root' \
   --customize-hook="sync-in '$stage' /" \
-  --customize-hook='chown -R 0:0 "$1/usr/local" "$1/etc/systemd/system" "$1/etc/ssh/ssh_config.d"' \
+  --customize-hook="chown -h 0:0 $staged" \
   --customize-hook='chroot "$1" systemctl enable aio-config.service aio-relay.service aio-browser.service docker.service' \
   --customize-hook='chroot "$1" systemctl mask systemd-networkd-wait-online.service systemd-networkd.service ssh.service ssh.socket apt-daily.timer apt-daily-upgrade.timer' \
   --customize-hook='rm -f "$1"/etc/ssh/ssh_host_*; : > "$1/etc/machine-id"' \
