@@ -141,13 +141,18 @@ RSYNC_REQUIRED = ["-a", "-e", "--exclude"]
 RSYNC_OPTIONAL = {
     "--partial": "an interrupted upload starts each unfinished file again from the beginning",
 }
+# openrsync only. Its -r turns on --dirs and sends that to the host, where
+# rrsync (the upload key's restricted rsync) doesn't allow it and refuses the
+# whole upload ("invalid rsync-command syntax or options"). With -r, --dirs
+# changes nothing.
+RSYNC_OPENRSYNC = ["--no-dirs"]
 # How to test each: rsync checks every option before acting on --version, so
 # one it doesn't know makes `rsync <option> --version` fail.
 RSYNC_PROBE = {"-e": ["-e", "ssh"], "--exclude": ["--exclude=x"]}
 
 
 def rsync_flavour():
-    """(description of the local rsync, options it takes)."""
+    """(first line of `rsync --version`, whether it's openrsync, options it takes)."""
     try:
         v = subprocess.run(["rsync", "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            universal_newlines=True)
@@ -155,36 +160,38 @@ def rsync_flavour():
         die("rsync isn't installed" + (" (it comes with macOS; is /usr/bin on your PATH?)"
                                        if sys.platform == "darwin" else ": install the rsync package"))
     first = (v.stdout.strip().splitlines() or ["rsync (unknown version)"])[0].strip()
+    openrsync = "openrsync" in v.stdout.lower()
     if v.returncode != 0:
         # can't test options this way: assume only the basics
-        return first, set(RSYNC_REQUIRED)
+        return first, openrsync, set(RSYNC_REQUIRED)
     ok = set()
-    for opt in RSYNC_REQUIRED + list(RSYNC_OPTIONAL):
+    for opt in RSYNC_REQUIRED + list(RSYNC_OPTIONAL) + (RSYNC_OPENRSYNC if openrsync else []):
         test = RSYNC_PROBE.get(opt, [opt])
         if subprocess.call(["rsync"] + test + ["--version"], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL) == 0:
             ok.add(opt)
-    return first, ok
+    return first, openrsync, ok
 
 
 def check_rsync():
-    """The options to pass on every upload, after checking the local rsync."""
-    desc, ok = rsync_flavour()
-    missing = [o for o in RSYNC_REQUIRED if o not in ok]
+    """(options to pass on every upload, whether it's openrsync), after checking the local rsync."""
+    desc, openrsync, ok = rsync_flavour()
+    missing = [o for o in RSYNC_REQUIRED + (RSYNC_OPENRSYNC if openrsync else []) if o not in ok]
     if missing:
         die("this rsync ({}) doesn't take {}. Install a current rsync{}, or use --out and copy "
             "the folder over yourself.".format(desc, ", ".join(missing),
                                                 " (brew install rsync)" if sys.platform == "darwin" else ""))
-    opts = ["-a"]
+    opts = ["-a"] + (RSYNC_OPENRSYNC if openrsync else [])
     for o, without in RSYNC_OPTIONAL.items():
         if o in ok:
             opts.append(o)
         else:
             print("Note: this rsync ({}) doesn't take {}: {}.".format(desc, o, without))
-    return opts
+    return opts, openrsync
 
 
-def rsync(src, dest, args, extra=()):
+def rsh_command(args, openrsync, tmp):
+    """rsync's -e: ssh with the upload key / port."""
     ssh = ["ssh"]
     if args.identity:
         # only this key: otherwise ssh offers the agent's / default keys first, and one
@@ -193,9 +200,24 @@ def rsync(src, dest, args, extra=()):
         ssh += ["-i", key, "-o", "IdentitiesOnly=yes"]
     if args.port:
         ssh += ["-p", str(args.port)]
-    # rsync splits -e at spaces but keeps quoted words together (a key path with spaces)
-    cmd = ["rsync"] + args.rsync_opts + ["-e", " ".join(shlex.quote(s) for s in ssh)] \
-        + list(extra) + [src, dest]
+    if not any(re.search(r"\s", s) for s in ssh):
+        return " ".join(ssh)
+    if not openrsync:
+        # rsync splits -e at spaces but keeps quoted words together
+        return " ".join(shlex.quote(s) for s in ssh)
+    # openrsync splits -e at every space, quotes or not: a key path with
+    # spaces goes in a wrapper script instead
+    wrapper = Path(tmp) / "ssh"
+    if re.search(r"\s", str(wrapper)):
+        die("can't pass the ssh options to openrsync (spaces in both the key path and the "
+            "temp folder {}): set TMPDIR to a folder without spaces".format(tmp))
+    wrapper.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(s) for s in ssh) + ' "$@"\n')
+    wrapper.chmod(0o700)
+    return str(wrapper)
+
+
+def rsync(src, dest, args, extra=()):
+    cmd = ["rsync"] + args.rsync_opts + ["-e", args.rsh] + list(extra) + [src, dest]
     if subprocess.call(cmd) != 0:
         die("rsync failed: " + " ".join(shlex.quote(c) for c in cmd))
 
@@ -223,7 +245,7 @@ def main():
     args.name = args.name or re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(project)).strip("-.") or "project"
     excludes = ([] if args.include_all else DEFAULT_EXCLUDES) + args.exclude + [".claude-import"]
 
-    args.rsync_opts = check_rsync() if args.to else []
+    args.rsync_opts, openrsync = check_rsync() if args.to else ([], False)
 
     with tempfile.TemporaryDirectory(prefix="claude-export-") as tmp:
         staging = Path(tmp)
@@ -246,6 +268,7 @@ def main():
                   "then use Import in the web UI.")
             return
 
+        args.rsh = rsh_command(args, openrsync, tmp)
         host, _, rdir = args.to.partition(":")
         base = host + ":" + (rdir.rstrip("/") + "/" if rdir else "") + args.name
         print("Uploading " + project + " -> " + base)
