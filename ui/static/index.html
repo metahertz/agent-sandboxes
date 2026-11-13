@@ -50,6 +50,9 @@
       <button id="import-btn" class="ws-item pool-item" type="button" aria-current="false">
         <span class="n">Import</span><span class="sub">Projects and Claude history from other machines</span>
       </button>
+      <button id="host-btn" class="ws-item pool-item" type="button" aria-current="false">
+        <span class="n">Host</span><span class="sub">A shell on this host; update and restart the setup</span>
+      </button>
       <button id="settings-btn" class="ws-item pool-item" type="button" aria-current="false">
         <span class="n">Settings</span><span class="sub">Monitoring, backups and sandbox notes</span>
       </button>
@@ -356,6 +359,33 @@
           <div class="keylist" id="upload-keys"></div>
         </section>
         <p class="form-msg" id="import-msg" role="status"></p>
+      </div>
+    </section>
+
+    <section id="host" class="pool host-page" hidden>
+      <header class="detail-head">
+        <div class="title">
+          <h1>Host</h1>
+          <p class="meta" id="host-meta">A shell on this host.</p>
+        </div>
+        <div class="status" id="host-pills"></div>
+      </header>
+      <div class="toolbar">
+        <div class="group">
+          <span class="group-label">Setup</span>
+          <button class="btn" type="button" data-host-cmd="update" title="Runs bin/update-host: git pull, then reinstalls and restarts what changed">Update from git</button>
+          <button class="btn ghost" type="button" data-host-cmd="restart-ui" title="sudo systemctl restart agent-sandboxes-ui">Restart UI</button>
+          <button class="btn ghost" type="button" data-host-cmd="restart-proxy" title="sudo systemctl restart agent-sandboxes-proxy (drops open sandbox connections)">Restart proxy</button>
+          <button class="btn ghost" type="button" data-host-cmd="status" title="systemctl status of the services">Service status</button>
+        </div>
+        <p class="hint host-hint">The buttons type a command into the shell below and run it. sudo asks for your password there.</p>
+      </div>
+      <div class="host-term-wrap">
+        <div id="host-term" class="term"></div>
+        <div class="overlay" id="host-overlay" hidden>
+          <p id="host-overlay-msg"></p>
+          <button class="btn primary" type="button" id="host-reconnect">Open a shell</button>
+        </div>
       </div>
     </section>
 

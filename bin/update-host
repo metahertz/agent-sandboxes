@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Update this host's agent-sandboxes from git and apply it: pull (fast-forward
+# only), then reinstall and restart only what changed. Run it from the web UI's
+# Host page (its Update button types it) or any shell on the host.
+#
+#   update-host            pull, then apply what the pull changed
+#   update-host --all      apply everything, changed or not (after a manual pull)
+#
+# The web UI restarts last; the Host page's shell lives in its own tmux server
+# and carries on, and the page reconnects.
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+cd "$ROOT"
+all=0; [[ ${1:-} == --all ]] && all=1
+
+say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
+note() { printf '\033[33m    %s\033[0m\n' "$*"; }
+
+if [[ $(sed -n 's/^NoNewPrivs:\s*//p' /proc/self/status) == 1 ]]; then
+  echo "This shell can't use sudo (it runs under a service with NoNewPrivileges)." >&2
+  echo "Enable lingering (sudo loginctl enable-linger $USER) and reopen the Host page, or use ssh." >&2
+  exit 1
+fi
+
+old=$(git rev-parse HEAD)
+say "git pull --ff-only ($(git rev-parse --abbrev-ref HEAD) at $(git rev-parse --short HEAD))"
+git pull --ff-only
+new=$(git rev-parse HEAD)
+if [[ $old == "$new" && $all == 0 ]]; then
+  say "Already up to date. (update-host --all applies everything anyway.)"
+  exit 0
+fi
+[[ $old != "$new" ]] && git --no-pager log --oneline "$old..$new"
+
+# True if any of these paths changed in the pull (always, with --all)
+changed() { (( all )) || ! git diff --quiet "$old" "$new" -- "$@"; }
+
+# System units: reinstall the ones that differ from the installed copies
+reload=0
+for u in agent-sandboxes-ui agent-sandboxes-proxy; do
+  if [[ -f /etc/systemd/system/$u.service ]] && ! cmp -s "systemd/$u.service" "/etc/systemd/system/$u.service"; then
+    say "Installing systemd/$u.service"
+    sudo install -m 644 "systemd/$u.service" /etc/systemd/system/
+    reload=1
+  fi
+done
+(( reload )) && sudo systemctl daemon-reload
+
+# nono's profile and hook, as the install copies them
+if [[ -d ~/.config/nono/profiles ]] && ! cmp -s nono/claude-browser.jsonc ~/.config/nono/profiles/claude-browser.jsonc; then
+  say "Updating ~/.config/nono/profiles/claude-browser.jsonc"
+  cp nono/claude-browser.jsonc ~/.config/nono/profiles/
+fi
+if [[ -d ~/.config/nono/hooks ]] && ! cmp -s nono/aio-env.sh ~/.config/nono/hooks/aio-env.sh; then
+  say "Updating ~/.config/nono/hooks/aio-env.sh"
+  install -m 700 nono/aio-env.sh ~/.config/nono/hooks/
+fi
+
+# The tmux servers keep their old config until it's sourced again
+if changed ui/tmux.conf && tmux -L agent-sandboxes has-session 2>/dev/null; then
+  say "Reloading the Claude sessions' tmux config"
+  tmux -L agent-sandboxes source-file ui/tmux.conf
+fi
+if changed ui/tmux-host.conf && tmux -L agent-sandboxes-host has-session 2>/dev/null; then
+  tmux -L agent-sandboxes-host source-file ui/tmux-host.conf
+fi
+
+# The metrics exporter (a user unit, installed by bin/monitoring) imports the UI's code
+exporter=~/.config/systemd/user/agent-sandboxes-exporter.service
+if [[ -f $exporter ]]; then
+  if ! cmp -s systemd/agent-sandboxes-exporter.service "$exporter"; then
+    say "Installing the exporter's user unit"
+    install -m 644 systemd/agent-sandboxes-exporter.service "$exporter"
+    systemctl --user daemon-reload
+  fi
+  if changed ui/ systemd/agent-sandboxes-exporter.service && systemctl --user is-active -q agent-sandboxes-exporter; then
+    say "Restarting the metrics exporter"
+    systemctl --user restart agent-sandboxes-exporter
+  fi
+fi
+
+# Things that take long or need a decision: say so, don't do them
+image=$(sed -n 's/^\s*image:\s*\(\S\+\).*/\1/p' compose.workspace.yaml | head -1)
+if changed compose.workspace.yaml && ! docker image inspect "$image" >/dev/null 2>&1; then
+  note "compose.workspace.yaml now pins $image: docker pull $image (containers use it when recreated)"
+fi
+if changed microvm/ bin/microvm-image libexec/ssh-proxy-connect; then
+  note "The microVM guest changed: bin/microvm-image rebuilds the base image (new VMs only)."
+fi
+
+if changed ui/proxyd.py ui/common.py systemd/agent-sandboxes-proxy.service; then
+  say "Restarting the proxy service (open sandbox connections drop; requests in flight retry)"
+  sudo systemctl restart agent-sandboxes-proxy
+fi
+if changed ui/ bin/sandbox-ui systemd/agent-sandboxes-ui.service; then
+  if systemctl is-active -q agent-sandboxes-ui; then
+    say "Restarting the web UI (the page reconnects in a few seconds)"
+    sudo systemctl restart agent-sandboxes-ui
+  else
+    note "The web UI isn't running as agent-sandboxes-ui: restart bin/sandbox-ui yourself."
+  fi
+fi
+say "Done: $(git log -1 --format='%h %s')"

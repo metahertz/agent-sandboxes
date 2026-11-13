@@ -96,6 +96,12 @@ VM_DEFAULT_ALLOW = ["registry-1.docker.io", "auth.docker.io", "production.cloudf
 QEMU_DATA = ["/usr/share/qemu", "/usr/share/seabios", "/usr/lib/ipxe", "/usr/lib/x86_64-linux-gnu/qemu"]
 
 TMUX = ["tmux", "-L", "agent-sandboxes", "-f", str(TMUX_CONF)]
+# The Host page's shell: its own tmux server, apart from the locked-down one
+# Claude's sessions (and workspace SSH keys) attach to. AIO_HOST_SHELL=0 turns it off.
+HOST_SHELL = os.environ.get("AIO_HOST_SHELL", "1") != "0"
+TMUX_HOST = ["tmux", "-L", "agent-sandboxes-host", "-f", str(ROOT / "ui" / "tmux-host.conf")]
+HOST_SESSION = "host"
+UI_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("common.py")]
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 MEM_RE = re.compile(r"^[1-9][0-9]{0,5}[MG]$")
@@ -309,6 +315,16 @@ async def handle_ui(req: Request, reader, w):
                       {"Content-Security-Policy": ui_csp(req)})
         return
 
+    if req.path == "/ws/host":
+        if req.headers.get("upgrade", "").lower() != "websocket" or not same_origin(req):
+            await respond(w, 403, "Forbidden\n")
+            return
+        if not HOST_SHELL:
+            await respond(w, 403, "The host shell is turned off (AIO_HOST_SHELL=0)\n")
+            return
+        await host_terminal(req, reader, w)
+        return
+
     if req.path.startswith("/ws/term/"):
         if req.headers.get("upgrade", "").lower() != "websocket" or not same_origin(req):
             await respond(w, 403, "Forbidden\n")
@@ -358,6 +374,8 @@ async def api(req: Request, w):
 
     if parts and parts[0] == "settings":
         return await settings_api(req, parts[1:], w)
+    if parts == ["host"] and m == "GET":
+        return await send_json(w, await host_status())
     if parts and parts[0] == "access":
         return await access_api(req, parts[1:], w)
     if parts and parts[0] == "inbox":
@@ -2359,10 +2377,7 @@ async def terminal(req: Request, name: str, reader, w):
     ws = load_ws(name)
     if not ws:
         return await respond(w, 404, "No such workspace\n")
-    key = req.headers.get("sec-websocket-key", "")
-    accept = base64.b64encode(hashlib.sha1(key.encode() + WS_GUID).digest()).decode()
-    w.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-             f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+    ws_accept(req, w)
     await w.drain()
 
     session = f"cl-{name}"
@@ -2372,8 +2387,28 @@ async def terminal(req: Request, name: str, reader, w):
         await w.drain()
         return
 
-    cols = max(20, min(500, int(req.query.get("cols", "120") or 120)))
-    rows = max(5, min(200, int(req.query.get("rows", "40") or 40)))
+    await attach_pty(req, reader, w, [*TMUX, "attach-session", "-t", session])
+
+
+def ws_accept(req: Request, w):
+    key = req.headers.get("sec-websocket-key", "")
+    accept = base64.b64encode(hashlib.sha1(key.encode() + WS_GUID).digest()).decode()
+    w.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+             f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+
+
+def term_size(req: Request) -> tuple[int, int]:
+    def num(k, default, lo, hi):
+        try:
+            return max(lo, min(hi, int(req.query.get(k, default) or default)))
+        except ValueError:
+            return default
+    return num("cols", 120, 20, 500), num("rows", 40, 5, 200)
+
+
+async def attach_pty(req: Request, reader, w, argv: list[str]):
+    """Run a tmux client (argv) on a pty and relay it over the WebSocket."""
+    cols, rows = term_size(req)
     master, slave = os.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     env = {**os.environ, "TERM": "xterm-256color"}
@@ -2381,7 +2416,7 @@ async def terminal(req: Request, name: str, reader, w):
     # setsid -c: new session with the pty as controlling terminal, so the
     # tmux client gets SIGWINCH when we resize.
     proc = await asyncio.create_subprocess_exec(
-        "setsid", "-c", "-w", *TMUX, "attach-session", "-t", session,
+        "setsid", "-c", "-w", *argv,
         stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     os.set_blocking(master, False)
@@ -2449,6 +2484,75 @@ async def terminal(req: Request, name: str, reader, w):
         except TimeoutError:
             proc.kill()
         os.close(master)
+
+
+# --------------------------------------------------------------- host shell
+# The Host page: a login shell on this host, as this user, in ~/agent-sandboxes.
+# The UI's service runs with NoNewPrivileges (so its children can't sudo); the
+# shell is started by the user's systemd instance instead, outside the
+# service, so sudo works there. It lives in tmux and outlasts UI restarts.
+
+def source_version(paths: list[Path]) -> str:
+    h = hashlib.sha256()
+    for p in paths:
+        h.update(p.read_bytes())
+    return h.hexdigest()[:12]
+
+
+UI_VERSION = source_version(UI_SOURCES)      # the code this process loaded
+
+
+async def user_manager() -> bool:
+    return (await run("systemctl", "--user", "show-environment"))[0] == 0
+
+
+async def host_session_alive() -> bool:
+    return (await run(*TMUX_HOST, "has-session", "-t", f"={HOST_SESSION}"))[0] == 0
+
+
+async def ensure_host_session(cols: int, rows: int) -> str | None:
+    """Start the host shell's tmux session unless it's running. Returns an error."""
+    if await host_session_alive():
+        return None
+    shell = pwd.getpwuid(os.getuid()).pw_shell or "/bin/bash"
+    if await user_manager():
+        argv = ["systemd-run", "--user", "--pty", "--quiet", "--collect", "--same-dir",
+                f"--unit=aio-host-shell-{secrets.token_hex(3)}", "--setenv=TERM=tmux-256color",
+                f"--setenv=AIO_ROOT={ROOT}", shell, "-l"]
+    else:      # a child of this service: no sudo (NoNewPrivileges)
+        note = ("No systemd --user instance (sudo loginctl enable-linger $USER): this shell runs under the "
+                "web UI's service, where sudo doesn't work.")
+        argv = ["sh", "-c", f"printf '\\033[33m%s\\033[0m\\n' {shlex.quote(note)}; exec {shlex.quote(shell)} -l"]
+    rc, out, err = await run(*TMUX_HOST, "new-session", "-d", "-s", HOST_SESSION, "-x", str(cols), "-y", str(rows),
+                             "-c", str(ROOT), *argv)
+    return None if rc == 0 else (err or out).strip() or "tmux failed"
+
+
+async def host_terminal(req: Request, reader, w):
+    ws_accept(req, w)
+    await w.drain()
+    cols, rows = term_size(req)
+    if err := await ensure_host_session(cols, rows):
+        w.write(ws_frame(0x2, f"\r\n\x1b[31mCouldn't start the host shell: {err}\x1b[0m\r\n".encode()))
+        w.write(ws_frame(0x8, struct.pack("!H", 1000)))
+        await w.drain()
+        return
+    await attach_pty(req, reader, w, [*TMUX_HOST, "attach-session", "-t", f"={HOST_SESSION}"])
+
+
+async def host_status() -> dict:
+    git = {}
+    rc, out, _ = await run("git", "-C", str(ROOT), "log", "-1", "--format=%h%x09%s%x09%cr")
+    if rc == 0 and out.strip():
+        git["commit"], git["subject"], git["when"] = (out.strip().split("\t") + ["", ""])[:3]
+        git["branch"] = (await run("git", "-C", str(ROOT), "rev-parse", "--abbrev-ref", "HEAD"))[1].strip()
+        git["dirty"] = bool((await run("git", "-C", str(ROOT), "status", "--porcelain", "-uno"))[1].strip())
+    proxy = await proxyd({"op": "status"}, timeout=5)
+    return {"enabled": HOST_SHELL, "user": pwd.getpwuid(os.getuid()).pw_name, "root": str(ROOT),
+            "sudo": await user_manager(), "running": HOST_SHELL and await host_session_alive(), "git": git,
+            "uiStale": source_version(UI_SOURCES) != UI_VERSION,
+            "proxyStale": "version" in proxy and proxy["version"] != proxyd_source_version(),
+            "proxyError": proxy.get("error", "")}
 
 
 # --------------------------------------------------------------- sandbox proxy

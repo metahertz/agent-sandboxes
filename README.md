@@ -319,6 +319,30 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
   `ui/proxyd.py` or `ui/common.py`, `sudo systemctl restart agent-sandboxes-proxy` too:
   that drops the connections open through it (a Claude request in flight retries). The
   UI's journal and the dashboard's *Proxy code* say when it runs older code.
+- **Updating:** `bin/update-host` pulls (fast-forward only) and applies what changed:
+  it reinstalls changed systemd units and nono files, reloads the tmux configs, restarts
+  the exporter, the proxy (only when `ui/proxyd.py` / `ui/common.py` changed) and, last,
+  the UI. It only reports what takes longer: a new AIO image pin, and microVM guest
+  changes (`bin/microvm-image`). `--all` applies everything after a manual pull.
+
+### Host page
+
+*Host* in the sidebar is a login shell on this host, as the UI's user, in
+`~/agent-sandboxes`, in its own tmux server (`tmux -L agent-sandboxes-host attach -t host`
+from an SSH login), separate from the locked-down one Claude's sessions use. It outlasts
+leaving the page and UI restarts, and ends when you `exit`. Its buttons type a command into
+the shell: *Update from git* (`bin/update-host`), *Restart UI*, *Restart proxy* and
+*Service status*. The header shows the checked-out commit, and whether the UI or the proxy
+runs older code than is on disk.
+
+The UI's service runs with `NoNewPrivileges`, so the shell is started by your
+`systemd --user` instance instead (`systemd-run --user --pty`), where sudo works. Without
+one (no lingering) it falls back to a child of the service, and the page says sudo won't
+work there.
+
+Anyone with the login token gets this shell: an unsandboxed shell as your user, who is
+in the docker group, so effectively root. Keep the token as safe as an SSH key. To turn
+the page off, add `Environment=AIO_HOST_SHELL=0` to the UI's unit.
 
 ## Importing projects
 

@@ -6,8 +6,9 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const POOL_HASH = "#~keys";
 const SETTINGS_HASH = "#~settings";
 const IMPORT_HASH = "#~import";
-const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings", [IMPORT_HASH]: "import" };
-const PAGES = { pool: "#pool", import: "#import", settings: "#settings" };   // view -> section
+const HOST_HASH = "#~host";
+const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings", [IMPORT_HASH]: "import", [HOST_HASH]: "host" };
+const PAGES = { pool: "#pool", import: "#import", host: "#host", settings: "#settings" };   // view -> section
 const state = {
   workspaces: [],
   view: VIEW_OF_HASH[location.hash] || "ws",
@@ -90,6 +91,7 @@ function renderDetail() {
     $(sel).hidden = state.view !== view;
     $(`${sel}-btn`).setAttribute("aria-current", String(state.view === view));
   }
+  if (state.view !== "host") disconnectHost();
   const w = page ? null : current();
   $("#empty").hidden = !!w || page;
   $("#detail").hidden = !w;
@@ -155,7 +157,7 @@ function select(name) {
   if (state.tab === "access") loadAccess();
 }
 
-const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), settings: () => loadSettings() };
+const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), host: () => loadHost(), settings: () => loadSettings() };
 
 function showPage(view) {
   state.view = view;
@@ -355,6 +357,135 @@ function disconnectTerm() {
   term.for = null;
   if (s) s.close();
 }
+
+// ------------------------------------------------------------------ host shell
+
+// The Host page: a login shell on this host (its own tmux session, which
+// outlasts the page and UI restarts). Separate from the Claude terminal.
+const host = { xterm: null, fit: null, sock: null, retry: 0, timer: null, info: null };
+
+const HOST_CMDS = {
+  update: () => `${host.info?.root || "~/agent-sandboxes"}/bin/update-host`,
+  "restart-ui": () => "sudo systemctl restart agent-sandboxes-ui",
+  "restart-proxy": () => "sudo systemctl restart agent-sandboxes-proxy",
+  status: () => "systemctl --no-pager status agent-sandboxes-ui agent-sandboxes-proxy",
+};
+
+function initHostXterm() {
+  if (host.xterm) return;
+  const css = getComputedStyle(document.documentElement);
+  host.xterm = new Terminal({
+    cursorBlink: true,
+    fontFamily: css.getPropertyValue("--mono"),
+    fontSize: 13,
+    scrollback: 5000,
+    macOptionClickForcesSelection: true,
+    theme: { background: css.getPropertyValue("--term-bg").trim() || "#1b1b19" },
+  });
+  host.fit = new FitAddon.FitAddon();
+  host.xterm.loadAddon(host.fit);
+  host.xterm.open($("#host-term"));
+  host.xterm.onData((d) => hostSend({ t: "i", d }));
+  new ResizeObserver(() => fitHost()).observe($("#host-term"));
+}
+
+function hostSend(obj) {
+  if (host.sock?.readyState === WebSocket.OPEN) { host.sock.send(JSON.stringify(obj)); return true; }
+  return false;
+}
+
+function fitHost() {
+  if (!host.xterm || $("#host").hidden) return;
+  try { host.fit.fit(); } catch { return; }
+  hostSend({ t: "r", c: host.xterm.cols, r: host.xterm.rows });
+}
+
+function hostOverlay(text) {
+  $("#host-overlay").hidden = !text;
+  $("#host-overlay-msg").textContent = text || "";
+}
+
+function connectHost() {
+  initHostXterm();
+  if (host.sock && host.sock.readyState <= WebSocket.OPEN) return;
+  clearTimeout(host.timer);
+  hostOverlay("");
+  host.xterm.reset();
+  fitHost();
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const sock = new WebSocket(`${proto}://${location.host}/ws/host?cols=${host.xterm.cols}&rows=${host.xterm.rows}`);
+  sock.binaryType = "arraybuffer";
+  sock.onopen = () => { host.retry = 0; fitHost(); host.xterm.focus(); };
+  sock.onmessage = (ev) => host.xterm.write(typeof ev.data === "string" ? ev.data : new Uint8Array(ev.data));
+  sock.onclose = async () => {
+    if (host.sock !== sock) return;      // closed on purpose
+    host.sock = null;
+    if (state.view !== "host") return;
+    // The shell exited, or the UI restarted (an update): reconnect while the
+    // session is there, with backoff; the UI may take a few seconds to return.
+    let info = null;
+    try { info = await api("GET", "host"); } catch { /* UI restarting */ }
+    if (state.view !== "host") return;
+    if (info) renderHostInfo(info);
+    if (info && !info.running) return hostOverlay("The shell ended.");
+    if (host.retry >= 10) return hostOverlay("Disconnected from the host shell.");
+    host.retry += 1;
+    hostOverlay("Reconnecting…");
+    host.timer = setTimeout(connectHost, Math.min(1000 * host.retry, 5000));
+  };
+  host.sock = sock;
+}
+
+function disconnectHost() {
+  clearTimeout(host.timer);
+  const s = host.sock;
+  host.sock = null;
+  if (s) s.close();
+}
+
+function renderHostInfo(info) {
+  host.info = info;
+  const g = info.git || {};
+  $("#host-meta").textContent = `A login shell as ${info.user} in ${info.root}`
+    + (g.commit ? ` · ${g.branch} at ${g.commit} (${g.when}): ${g.subject}` : "");
+  const pill = (cls, text, title = "") => el("span", { className: `pill ${cls}`, textContent: text, title });
+  const pills = [];
+  if (g.dirty) pills.push(pill("warn", "local changes", "Tracked files differ from the last commit: a pull may refuse to run"));
+  if (info.uiStale) pills.push(pill("warn", "UI runs older code", "ui/server.py or ui/common.py changed since the UI started: Restart UI"));
+  if (info.proxyStale) pills.push(pill("warn", "proxy runs older code", "ui/proxyd.py or ui/common.py changed since the proxy started: Restart proxy"));
+  if (info.proxyError) pills.push(pill("bad", "proxy not answering", info.proxyError));
+  if (!info.sudo) pills.push(pill("bad", "no sudo here", `No systemd --user instance, so the shell runs under the UI's service, which forbids sudo: sudo loginctl enable-linger ${info.user}`));
+  if (!pills.length) pills.push(pill("ok", "running the code on disk"));
+  $("#host-pills").replaceChildren(...pills);
+  $$("[data-host-cmd]").forEach((b) => (b.disabled = !info.enabled));
+}
+
+async function loadHost() {
+  let info;
+  try {
+    info = await api("GET", "host");
+  } catch (e) {
+    return hostOverlay(e.message);
+  }
+  renderHostInfo(info);
+  if (!info.enabled) {
+    initHostXterm();
+    $("#host-reconnect").hidden = true;
+    return hostOverlay("The host shell is turned off on this server (AIO_HOST_SHELL=0).");
+  }
+  connectHost();
+}
+
+$("#host-reconnect").addEventListener("click", () => { host.retry = 0; connectHost(); });
+$$("[data-host-cmd]").forEach((b) => b.addEventListener("click", () => {
+  const cmd = HOST_CMDS[b.dataset.hostCmd]();
+  if (!hostSend({ t: "i", d: `${cmd}\r` })) {
+    host.retry = 0;
+    connectHost();
+    return;
+  }
+  host.xterm.focus();
+}));
 
 // ------------------------------------------------------------------ browser (VNC via proxy)
 

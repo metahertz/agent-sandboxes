@@ -114,6 +114,8 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .term { flex: 1; min-height: 0; background: var(--term-bg); padding: 8px 0 0 10px; }
 .frame { flex: 1; width: 100%; border: 0; background: var(--term-bg); }
 .frame.vnc { background: #000; }
+.host-term-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--line); }
+.host-hint { margin: 0; font-size: 12px; color: var(--muted); }
 .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; background: color-mix(in srgb, var(--bg) 88%, transparent); color: var(--muted); }
 
 .path-form { flex: 1 1 260px; display: flex; }
