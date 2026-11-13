@@ -156,7 +156,7 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .check { display: flex; gap: 8px; align-items: baseline; font-size: 13px; cursor: pointer; }
 .check .muted { font-family: var(--mono); font-size: 12px; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
-.two.narrow { grid-template-columns: repeat(2, minmax(0, 14rem)); margin-top: 0; }
+.two.narrow { grid-template-columns: repeat(3, minmax(0, 11rem)); margin-top: 0; }
 .two label, .add-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; font-weight: 550; }
 textarea, select { font: 12.5px/1.4 var(--mono); color: inherit; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 0; }
 select { font-family: inherit; font-size: 13px; }

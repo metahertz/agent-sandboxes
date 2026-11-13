@@ -81,7 +81,8 @@ MICROVM = ROOT / "bin" / "microvm"
 VM_BASE = VM_ROOT / "base"                # bin/microvm-image's output; each new VM copies it
 VM_DISK_FILES = ("vmlinuz", "initrd.img", "rootfs.img")
 VM_DEFAULT_MEMORY = "2G"
-VM_BROWSER_MEMORY = "5G"                  # default with the browser container (2G + 2G shm for it)
+VM_BROWSER_HEADROOM_MB = 3072             # with the browser container, the VM's default: this + the container's
+BROWSER_MEMORY, BROWSER_CPUS = "2G", 2    # the AIO container's defaults (its /dev/shm is as big as its memory)
 VM_VCPUS = 2
 VM_DISK_GB, VM_BROWSER_DISK_GB = 16, 48   # sparse; the browser image alone is about 13 GB
 VM_BRIDGE = "172.17.0.1"                  # Docker's default bridge in the guest: its relay listens there too
@@ -98,6 +99,8 @@ TMUX = ["tmux", "-L", "agent-sandboxes", "-f", str(TMUX_CONF)]
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 MEM_RE = re.compile(r"^[1-9][0-9]{0,5}[MG]$")
+DISK_RE = re.compile(r"^[1-9][0-9]{0,3}G$")
+VM_DISK_MAX_GB = 4096
 DIR_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
 UI_HOSTNAMES = {"localhost", "127.0.0.1"}   # extended at startup with bind IPs / hostname
 BIND: list[str] = []
@@ -148,6 +151,9 @@ def compose(ws: dict[str, str], *args: str) -> list[str]:
     files = ["-f", str(COMPOSE_FILE)]
     if write_container_files(ws):
         files += ["-f", str(container_override_path(ws["WS_NAME"]))]
+    limits = container_limits_path(ws["WS_NAME"])
+    write_if_changed(limits, container_limits_text(load_policy(ws["WS_NAME"])))
+    files += ["-f", str(limits)]
     return ["docker", "compose", "-p", container(ws["WS_NAME"]),
             "--env-file", str(WS_ROOT / f"{ws['WS_NAME']}.env"), *files, *args]
 
@@ -384,6 +390,7 @@ async def api(req: Request, w):
         kill_agent(name)
         remove_access(lambda scope, _: scope == name)
         for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_override_path(name),
+                  container_limits_path(name),
                   container_env_path(name), container_profile_path(name), *container_ca_files(name),
                   *(CONTAINER_PROXY_SECRETS / f"{name}{x}" for x in ("", ".ca.crt", ".ca.key"))):
             p.unlink(missing_ok=True)
@@ -775,6 +782,18 @@ def listen_ports(pol: dict) -> list[int]:
     return sorted({p for x in pol["network"].get("listen", []) for p in range(port_range(x)[0], port_range(x)[1] + 1)})
 
 
+def mem_mb(mem: str) -> int:
+    return int(mem[:-1]) * (1024 if mem.endswith("G") else 1)
+
+
+def host_memory_mb() -> int:
+    try:
+        m = re.search(r"^MemTotal:\s+(\d+) kB", Path("/proc/meminfo").read_text(), re.M)
+        return int(m[1]) // 1024 if m else 1 << 30
+    except OSError:
+        return 1 << 30
+
+
 def validate_policy(body: dict) -> dict:
     pol = json.loads(json.dumps(DEFAULT_POLICY))
     pol["ssh_keys"] = clean_list(body.get("ssh_keys", []), ITEM_RE, "SSH keys")
@@ -809,7 +828,33 @@ def validate_policy(body: dict) -> dict:
         raise ValueError("Max processes: a whole number")
     if not 0 <= pids <= 100000 or 0 < pids < 32:
         raise ValueError("Max processes: 0 (no limit) or 32–100000")
-    pol["limits"] = {"memory": mem, "pids": pids}
+    if mem and mem_mb(mem) > (host := host_memory_mb()):
+        raise ValueError(f"Memory: this host has {host // 1024}G")
+    ncpu = os.cpu_count() or 1
+    try:
+        cpus = int(lim.get("cpus", 0) or 0)
+    except (TypeError, ValueError):
+        raise ValueError("CPUs: a whole number")
+    if not 0 <= cpus <= ncpu:
+        raise ValueError(f"CPUs: 0 (default) to {ncpu}, this host's count")
+    disk = str(lim.get("disk", "") or "").strip().upper()
+    if disk and not disk.endswith("G"):
+        disk += "G"
+    if disk and (not DISK_RE.match(disk) or not VM_DISK_GB <= int(disk[:-1]) <= VM_DISK_MAX_GB):
+        raise ValueError(f"Disk: {VM_DISK_GB}G to {VM_DISK_MAX_GB}G, e.g. 64G")
+    bmem = str(lim.get("browser_memory", "") or "").strip().upper()
+    if bmem and (not MEM_RE.match(bmem) or mem_mb(bmem) < 1024):
+        raise ValueError("Browser container memory: at least 1G, with M or G, e.g. 4G")
+    if bmem and mem_mb(bmem) > host_memory_mb():
+        raise ValueError(f"Browser container memory: this host has {host_memory_mb() // 1024}G")
+    try:
+        bcpus = int(lim.get("browser_cpus", 0) or 0)
+    except (TypeError, ValueError):
+        raise ValueError("Browser container CPUs: a whole number")
+    if not 0 <= bcpus <= ncpu:
+        raise ValueError(f"Browser container CPUs: 0 (default) to {ncpu}, this host's count")
+    pol["limits"] = {"memory": mem, "pids": pids, "cpus": cpus, "disk": disk,
+                     "browser_memory": bmem, "browser_cpus": bcpus}
     pol["claude_md"] = body.get("claude_md") is True
     pol["vm_browser"] = body.get("vm_browser") is True
     return pol
@@ -1286,6 +1331,18 @@ async def policy_api(ws: dict[str, str], req: Request, w):
             for o in all_ws():
                 if o["WS_NAME"] != name and (both := mine & set(listen_ports(load_policy(o["WS_NAME"])))):
                     raise ValueError(f"Listen ports: {min(both)} is already used by workspace '{o['WS_NAME']}'")
+            if is_microvm(ws) and pol["vm_browser"]:
+                lim = pol["limits"]
+                if lim["memory"] and mem_mb(lim["memory"]) < browser_memory_mb(pol) + 1024:
+                    raise ValueError(f"Memory: the VM needs at least {browser_memory_mb(pol) // 1024 + 1}G "
+                                     "with the browser container (its memory plus 1G)")
+                if lim["browser_cpus"] > vm_vcpus(pol):
+                    raise ValueError(f"Browser container CPUs: at most the VM's {vm_vcpus(pol)} vCPUs")
+            if is_microvm(ws) and pol["limits"]["disk"]:
+                img = vm_dir(name) / "rootfs.img"
+                have = img.stat().st_size >> 30 if img.is_file() else 0
+                if vm_disk_gb(pol) < have:
+                    raise ValueError(f"Disk: the VM's disk is already {have}G, and disks only grow")
         except (ValueError, json.JSONDecodeError) as e:
             return await send_json(w, {"error": str(e)}, 400)
         old = load_policy(name)
@@ -1300,6 +1357,7 @@ async def policy_api(ws: dict[str, str], req: Request, w):
             notes = await apply_vm_policy(ws, old, pol)
         else:
             notes = await apply_container_network(ws, old)
+            notes += await apply_container_limits(ws, old, pol, notes)
     else:
         notes = []
     rc, out, _ = await run(*TMUX, "list-panes", "-t", f"cl-{name}", "-F", "#{pane_dead}")
@@ -2614,6 +2672,40 @@ def container_override_path(name: str) -> Path:
     return WS_ROOT / f"{name}.compose-filtered.yaml"
 
 
+def container_limits_path(name: str) -> Path:
+    return WS_ROOT / f"{name}.compose-limits.yaml"
+
+
+def browser_memory_mb(pol: dict) -> int:
+    return mem_mb(pol["limits"]["browser_memory"] or BROWSER_MEMORY)
+
+
+def container_limits_text(pol: dict) -> str:
+    """The AIO container's size (Access tab -> Resource limits). /dev/shm
+    (Chromium's) is charged to the container's memory, so it gets the same size."""
+    mb = browser_memory_mb(pol)
+    return f"""# Generated by agent-sandboxes (Access tab -> Resource limits). Don't edit.
+services:
+  sandbox:
+    mem_limit: "{mb}m"
+    shm_size: "{mb}m"
+    cpus: "{pol['limits']['browser_cpus'] or BROWSER_CPUS}"
+"""
+
+
+async def apply_container_limits(ws: dict[str, str], old: dict, pol: dict, notes: list[str]) -> list[str]:
+    """After a policy save: recreate a running container whose size changed
+    (shm_size can't change in place)."""
+    keys = ("browser_memory", "browser_cpus")
+    if all(old["limits"][k] == pol["limits"][k] for k in keys) or not await container_running(ws["WS_NAME"]):
+        return []
+    if any(n.startswith("Container recreated") for n in notes):    # already, with these files
+        return []
+    rc, out, err = await run(*compose(ws, "up", "-d", "--remove-orphans"), timeout=600)
+    return ["Container recreated with the new limits (its browser session restarts)." if rc == 0
+            else f"Recreating the container failed: {(err or out).strip()[-300:]}"]
+
+
 def container_env_path(name: str) -> Path:
     return WS_ROOT / f"{name}.container.env"
 
@@ -2759,8 +2851,19 @@ def vm_dir(name: str) -> Path:
 
 
 def vm_memory_mb(pol: dict) -> int:
-    mem = pol["limits"]["memory"] or (VM_BROWSER_MEMORY if pol["vm_browser"] else VM_DEFAULT_MEMORY)
-    return int(mem[:-1]) * (1024 if mem.endswith("G") else 1)
+    if pol["limits"]["memory"]:
+        return mem_mb(pol["limits"]["memory"])
+    return VM_BROWSER_HEADROOM_MB + browser_memory_mb(pol) if pol["vm_browser"] else mem_mb(VM_DEFAULT_MEMORY)
+
+
+def vm_vcpus(pol: dict) -> int:
+    return pol["limits"]["cpus"] or VM_VCPUS
+
+
+def vm_disk_gb(pol: dict) -> int:
+    """The size bin/microvm grows the VM's (sparse) disk to; it never shrinks."""
+    disk = pol["limits"]["disk"]
+    return int(disk[:-1]) if disk else VM_BROWSER_DISK_GB if pol["vm_browser"] else VM_DISK_GB
 
 
 def vm_proxy_env_text(ws: dict[str, str], pol: dict) -> str:
@@ -2787,7 +2890,7 @@ def aio_image() -> str:
     return m[1] if m else ""
 
 
-def vm_browser_compose_text(ws: dict[str, str]) -> str:
+def vm_browser_compose_text(ws: dict[str, str], pol: dict) -> str:
     """The AIO container inside the VM, as compose.workspace.yaml has it on the
     host, but on the guest's Docker bridge, through the guest's relay."""
     return f"""# Generated by agent-sandboxes (Access tab -> Browser container in the VM). Don't edit.
@@ -2798,8 +2901,9 @@ services:
     security_opt:
       - seccomp:unconfined
     restart: unless-stopped
-    shm_size: "2gb"
-    mem_limit: "2g"
+    shm_size: "{browser_memory_mb(pol)}m"
+    mem_limit: "{browser_memory_mb(pol)}m"
+    cpus: "{pol['limits']['browser_cpus'] or min(BROWSER_CPUS, vm_vcpus(pol))}"
     network_mode: bridge
     ports:
       - "127.0.0.1:{VM_BROWSER_PORT}:8080"
@@ -2911,7 +3015,7 @@ def vm_prepare(name: str) -> None:
     if pol["vm_browser"]:
         ensure_mcp_json(ws["WS_DIR"])
         der = ssl.PEM_cert_to_DER_cert(pem)
-        write_if_changed(browser[0], vm_browser_compose_text(ws))
+        write_if_changed(browser[0], vm_browser_compose_text(ws, pol))
         write_if_changed(browser[1], container_env_text(ws, pol, VM_BRIDGE, VM_RELAY_PORT))
         write_if_changed(browser[2], json.dumps({"CACertificates": [base64.b64encode(der).decode()]}) + "\n")
     else:
@@ -2919,8 +3023,8 @@ def vm_prepare(name: str) -> None:
             p.unlink(missing_ok=True)
     write_if_changed(d / "host-profile.json", json.dumps(vm_host_profile(ws), indent=2) + "\n")
     write_if_changed(d / "vm.env", f"VM_CID={vm_cid(ws)}\nVM_MEMORY_MB={vm_memory_mb(pol)}\n"
-                                   f"VM_VCPUS={VM_VCPUS}\nWS_DIR={shlex.quote(ws['WS_DIR'])}\n"
-                                   f"VM_DISK_GB={VM_BROWSER_DISK_GB if pol['vm_browser'] else VM_DISK_GB}\n"
+                                   f"VM_VCPUS={vm_vcpus(pol)}\nWS_DIR={shlex.quote(ws['WS_DIR'])}\n"
+                                   f"VM_DISK_GB={vm_disk_gb(pol)}\n"
                                    f"VM_BROWSER={int(pol['vm_browser'])}\n"
                                    f"VM_BROWSER_IMAGE={shlex.quote(aio_image())}\n")
 
@@ -2954,10 +3058,12 @@ async def apply_vm_policy(ws: dict[str, str], old: dict, pol: dict) -> list[str]
     name = ws["WS_NAME"]
     write_container_files(ws)
     notes = await sync_proxies(name, restart=True)
-    if (old["tokens"] != pol["tokens"] or old["limits"]["memory"] != pol["limits"]["memory"]
+    sized = {k: v for k, v in old["limits"].items() if k != "pids"} != \
+        {k: v for k, v in pol["limits"].items() if k != "pids"}
+    if (old["tokens"] != pol["tokens"] or sized
             or old["vm_browser"] != pol["vm_browser"]) and (await vm_states()).get(name) == "active":
-        notes.append("Network changes apply now; restart the VM (Stop, then Start) for token, memory or "
-                     "browser container changes.")
+        notes.append("Network changes apply now; restart the VM (Stop, then Start) for token, memory, CPU, "
+                     "disk or browser container changes.")
     if pol["vm_browser"] and not old["vm_browser"]:
         notes.append("The first start with the browser container copies its image (about 13 GB) into the VM: "
                      "the Browser tab works a few minutes after that.")
@@ -3070,6 +3176,7 @@ def cli_prepare(name: str, aux: bool = False):
     print(f"WS_PROFILE={shlex.quote(info['profile'])}")
     print(f"WS_MEMORY={shlex.quote(info['memory'])}")
     print(f"WS_PIDS={int(info['pids'])}")
+    print(f"WS_CPUS={int(info['cpus'])}")
     print(f"WS_PROMPT={shlex.quote(info['prompt'])}")
 
 

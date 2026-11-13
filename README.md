@@ -167,6 +167,10 @@ Screenshots are from a demo setup (made-up workspaces, keys and tokens).
 
 Per workspace: which pool keys and tokens it gets, its network allowlist and the
 container's network, resource limits, the CLAUDE.md notes, and workspace-only SSH keys.
+The resource limits include the AIO browser container's memory and CPUs (default 2G and 2;
+`workspaces/<name>.compose-limits.yaml`, layered over `compose.workspace.yaml`). Chromium's
+`/dev/shm` gets the same size as the memory, which it counts against. Saving a change
+recreates a running container.
 
 ![The Access tab: SSH keys, API tokens, network allowlist, container network, limits, notes and remote terminal](docs/screenshots/workspace-access.png)
 
@@ -247,8 +251,12 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
   live in the VM, not in the host's shared `~/.claude`.
 - **Config:** at each start `bin/microvm` writes a read-only config disk (hostname, the
   host's ssh key for the VM, proxy settings and token placeholders, the proxy CA), which
-  `aio-config.service` applies at boot. Token and memory changes need a VM restart.
-  Memory: the *Memory* limit (default 2G); 2 vCPUs.
+  `aio-config.service` applies at boot. Token and size changes need a VM restart.
+- **Size** (*Access* tab → *Resource limits*): *Memory* (default 2G), *vCPUs* (default
+  2, at most the host's count) and *Disk* (default 16G, up to 4096G). The disk is a sparse
+  file that `bin/microvm start` grows and the guest's filesystem follows at boot; it never
+  shrinks, so a smaller size than the disk already has is refused. With the browser container, the
+  default memory is the container's plus 3G.
 - **Lifecycle:** *Start* / *Stop* in the toolbar (`bin/microvm start|stop <name>`; stop
   shuts the guest down cleanly). VMs don't start by themselves after the host reboots.
   *Remove* deletes the VM's disk, and keeps the project folder.
@@ -262,8 +270,9 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
   through the UI as usual; the Files tab runs `docker exec` over the VM's ssh. The first
   start copies the image from the host's Docker (`docker save | docker load`, about
   13 GB, a few minutes; `bin/microvm load-image`), so no registry needs allowing. With it,
-  the VM's memory default is 5G and its disk 48G (sparse; the guest grows its filesystem
-  at boot). Off by default.
+  the VM's memory default is 5G (the container's 2G plus 3G) and its disk 48G (sparse; the
+  guest grows its filesystem at boot). Off by default. Its size is set as for a sandbox
+  workspace's container (below).
 
 ### Keys & tokens
 

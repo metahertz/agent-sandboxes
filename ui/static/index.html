@@ -193,15 +193,23 @@
           <section class="card vm-only">
             <h2>Browser container</h2>
             <label class="check"><input type="checkbox" name="vm_browser"> <span>Run the AIO browser container in the VM <span class="muted">(Chromium, VS Code, terminal; Claude's MCP tools)</span></span></label>
-            <p class="hint">The same container as a sandbox workspace's, inside the VM: its network is the VM's (this allowlist, through the proxy), and the Browser, VS Code, Terminal and Files tabs reach it over vsock. Its image (about 13 GB) is copied from this host into the VM's disk on the first start, which takes a few minutes; the VM's memory default goes up to 5G and its disk to 48G (sparse). Restart the VM to apply.</p>
+            <p class="hint">The same container as a sandbox workspace's, inside the VM: its network is the VM's (this allowlist, through the proxy), and the Browser, VS Code, Terminal and Files tabs reach it over vsock. Its image (about 13 GB) is copied from this host into the VM's disk on the first start, which takes a few minutes; the VM's memory default goes up to the container's memory plus 3G (5G) and its disk to 48G (sparse). Restart the VM to apply.</p>
           </section>
           <section class="card">
             <h2>Resource limits</h2>
-            <p class="hint sandbox-only">Applied to Claude's whole process tree via cgroups. Leave empty for no limit. Restart Claude to apply.</p>
-            <p class="hint vm-only">Memory is the VM's (default 2G, or 5G with the browser container; 2 vCPUs). Restart the VM to apply.</p>
+            <p class="hint sandbox-only">Applied to Claude's whole process tree via cgroups (CPUs as a CPU quota: 2 = two cores' worth). Leave empty for no limit. Restart Claude to apply.</p>
+            <p class="hint vm-only">The VM's size. Empty means the default: 2G of memory (with the browser container, its memory plus 3G), 2 vCPUs, and a 16G disk (48G with the browser container). The disk is sparse, so it only takes the space the VM writes, and it can grow but never shrink. Restart the VM (Stop, then Start) to apply.</p>
             <div class="two narrow">
               <label>Memory <input name="memory" placeholder="e.g. 4G" autocomplete="off"></label>
+              <label><span class="sandbox-only">CPUs</span><span class="vm-only">vCPUs</span> <input name="cpus" type="number" min="0" autocomplete="off"></label>
               <label class="sandbox-only">Max processes <input name="pids" type="number" min="0" placeholder="0 = no limit"></label>
+              <label class="vm-only">Disk <input name="disk" placeholder="e.g. 64G" autocomplete="off"></label>
+            </div>
+            <h3>Browser container</h3>
+            <p class="hint">The AIO container's memory (Chromium's shared memory is the same size, inside it) and CPUs. Empty means 2G and 2 CPUs. <span class="sandbox-only">Saving a change recreates a running container, so its browser session restarts.</span><span class="vm-only">Only used with the browser container ticked; at most the VM's vCPUs, and the VM needs 1G more memory than the container. Restart the VM to apply.</span></p>
+            <div class="two narrow">
+              <label>Memory <input name="browser_memory" placeholder="default: 2G" autocomplete="off"></label>
+              <label>CPUs <input name="browser_cpus" type="number" min="0" placeholder="default: 2" autocomplete="off"></label>
             </div>
           </section>
           <section class="card sandbox-only">

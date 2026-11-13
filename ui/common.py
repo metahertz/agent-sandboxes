@@ -50,7 +50,8 @@ PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("
 
 DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False, "vm_browser": False,
                   "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open", "listen": []},
-                  "limits": {"memory": "", "pids": 0}}
+                  "limits": {"memory": "", "pids": 0, "cpus": 0, "disk": "",
+                             "browser_memory": "", "browser_cpus": 0}}
 
 
 def die_with_parent():

@@ -532,6 +532,17 @@ async def collect(audit: Audit, du: dict[str, int]) -> str:
               int(mem[:-1]) * (1 << (30 if mem.endswith("G") else 20)) if mem else 0, workspace=n)
         m.add("aio_workspace_pids_limit", "gauge", "Claude process limit (0 = none).",
               int(lim.get("pids") or 0), workspace=n)
+        m.add("aio_workspace_cpus_limit", "gauge", "CPU limit: Claude's CPU quota, or the microVM's vCPUs "
+              "(0 = none / the default).", int(lim.get("cpus") or 0), workspace=n)
+        if not vm or pol["vm_browser"]:
+            m.add("aio_browser_memory_limit_bytes", "gauge", "The AIO browser container's memory limit.",
+                  server.browser_memory_mb(pol) << 20, workspace=n)
+            m.add("aio_browser_cpus_limit", "gauge", "The AIO browser container's CPU limit.",
+                  lim.get("browser_cpus") or (min(server.BROWSER_CPUS, server.vm_vcpus(pol)) if vm
+                                              else server.BROWSER_CPUS), workspace=n)
+        if vm:
+            m.add("aio_vm_disk_limit_bytes", "gauge", "Size the microVM's disk grows to (0 = the default).",
+                  int((lim.get("disk") or "0G")[:-1]) << 30, workspace=n)
         if n in du:
             m.add("aio_workspace_dir_bytes", "gauge", "Disk used by the project folder.",
                   du[n], workspace=n)

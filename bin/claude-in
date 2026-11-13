@@ -47,7 +47,7 @@ fi
 
 # Loads the agent's SSH keys and writes workspaces/<name>.profile.json
 # (.aux-profile.json for --shell / --exec);
-# sets WS_PROFILE, WS_MEMORY, WS_PIDS, and WS_PROMPT (how to use its API tokens).
+# sets WS_PROFILE, WS_MEMORY, WS_PIDS, WS_CPUS, and WS_PROMPT (how to use its API tokens).
 aux=(); [[ $mode == claude ]] || aux=(--aux)   # don't overwrite what Claude started with
 eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${aux[@]}")"
 
@@ -85,9 +85,10 @@ cd "$WS_DIR"
 # the metrics exporter reads usage from it (claude-<workspace>-<pid>.scope).
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
 if systemctl --user show-environment >/dev/null 2>&1; then
-  exec systemd-run --user --scope --quiet --collect --unit "$unit" -- "${cmd[@]}"
+  cpu=(); [[ "${WS_CPUS:-0}" != 0 ]] && cpu=(-p "CPUQuota=$((WS_CPUS * 100))%")   # systemd's, not nono's
+  exec systemd-run --user --scope --quiet --collect --unit "$unit" "${cpu[@]}" -- "${cmd[@]}"
 fi
-if [[ -n "$WS_MEMORY" || "$WS_PIDS" != 0 ]]; then
+if [[ -n "$WS_MEMORY" || "$WS_PIDS" != 0 || "${WS_CPUS:-0}" != 0 ]]; then
   echo "No systemd --user instance: can't apply this workspace's resource limits." >&2
   exit 1
 fi

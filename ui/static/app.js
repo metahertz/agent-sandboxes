@@ -568,6 +568,11 @@ async function loadAccess() {
     form.elements.listen.value = (policy.network.listen || []).join(", ");
     form.elements.memory.value = policy.limits.memory;
     form.elements.pids.value = policy.limits.pids || "";
+    form.elements.cpus.value = policy.limits.cpus || "";
+    form.elements.cpus.placeholder = w.kind === "microvm" ? "default: 2" : "0 = no limit";
+    form.elements.disk.value = policy.limits.disk || "";
+    form.elements.browser_memory.value = policy.limits.browser_memory || "";
+    form.elements.browser_cpus.value = policy.limits.browser_cpus || "";
     form.elements.claude_md.checked = policy.claude_md;
     form.elements.vm_browser.checked = !!policy.vm_browser;
     form.elements.container.value = policy.network.container;
@@ -589,7 +594,9 @@ async function saveAccess(restart) {
     tokens: $$('input[name="token"]:checked', form).map((i) => i.value),
     network: { mode: form.elements.mode?.value || "claude-code", allow: lines(form.elements.allow.value), deny: lines(form.elements.deny.value),
       container: form.elements.container.value || "open", listen: lines(form.elements.listen.value) },
-    limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0) },
+    limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0),
+      cpus: Number(form.elements.cpus.value || 0), disk: form.elements.disk.value.trim(),
+      browser_memory: form.elements.browser_memory.value.trim(), browser_cpus: Number(form.elements.browser_cpus.value || 0) },
     claude_md: form.elements.claude_md.checked,
     vm_browser: form.elements.vm_browser.checked,
   };
