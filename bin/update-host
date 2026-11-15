@@ -47,6 +47,12 @@ for u in agent-sandboxes-ui agent-sandboxes-proxy; do
 done
 (( reload )) && sudo systemctl daemon-reload
 
+# The web UI's PAM service (password sign-in)
+if ! cmp -s pam.d/agent-sandboxes /etc/pam.d/agent-sandboxes; then
+  say "Installing pam.d/agent-sandboxes"
+  sudo install -m 644 pam.d/agent-sandboxes /etc/pam.d/
+fi
+
 # nono's profile and hook, as the install copies them
 if [[ -d ~/.config/nono/profiles ]] && ! cmp -s nono/claude-browser.jsonc ~/.config/nono/profiles/claude-browser.jsonc; then
   say "Updating ~/.config/nono/profiles/claude-browser.jsonc"

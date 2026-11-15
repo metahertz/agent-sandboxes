@@ -1065,7 +1065,129 @@ function fillMonForm(st) {
   syncStackFields();
 }
 
+// ------------------------------------------------------------------ sign-in (Settings)
+
+const b64u = {
+  enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+  dec: (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4)), (c) => c.charCodeAt(0)),
+};
+const METHOD_LABEL = { password: "your password", passkey: "a passkey", token: "the login token" };
+const when = (t) => (t ? new Date(t * 1000).toLocaleString() : "never");
+
+function authMsg(sel, text, isErr = false) {
+  $(sel).textContent = text;
+  $(sel).classList.toggle("err", isErr);
+}
+
+async function loadAuth() {
+  let a;
+  try {
+    a = await api("GET", "auth");
+  } catch (e) {
+    return authMsg("#auth-msg", e.message, true);
+  }
+  $("#auth-summary").textContent = `Signed in as ${a.user} with ${METHOD_LABEL[a.method] || a.method} since ${when(a.since)}. `
+    + `${a.sessions} signed-in session${a.sessions === 1 ? "" : "s"} in all. `
+    + (a.tokenLogin ? "The login token link also works (turn it off with AIO_TOKEN_LOGIN=0)." : "Token sign-in is off.");
+  $("#auth-rp").textContent = a.rpId || "a hostname";
+  $("#pk-pw").hidden = a.fresh;
+  const rows = a.passkeys.map((p) => {
+    const ren = el("button", { className: "btn ghost", type: "button", textContent: "Rename" });
+    ren.addEventListener("click", async () => {
+      const name = prompt("Passkey name", p.name);
+      if (!name) return;
+      try { await api("PATCH", `auth/passkeys/${encodeURIComponent(p.id)}`, { name }); } catch (e) { alert(e.message); }
+      loadAuth();
+    });
+    const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Remove" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Remove the passkey "${p.name}"? It stops working here at once (delete it from the device too).`)) return;
+      try { await api("DELETE", `auth/passkeys/${encodeURIComponent(p.id)}`); } catch (e) { alert(e.message); }
+      loadAuth();
+    });
+    const other = p.rp_id !== a.rpId ? ` · for ${p.rp_id}` : "";
+    return el("div", { className: "keyrow" },
+      el("div", {}, el("strong", { textContent: p.name }),
+        el("div", { className: "muted", textContent: `Added ${when(p.created)} · last used ${when(p.last_used)}${other}` })),
+      el("div", { className: "row" }, ren, del));
+  });
+  if (!rows.length) rows.push(el("p", { className: "muted", textContent: "No passkeys yet." }));
+  $("#auth-passkeys").replaceChildren(...rows);
+  const form = $("#pk-form");
+  form.querySelector("button").disabled = !a.rpId || !window.PublicKeyCredential;
+  if (a.rpError) authMsg("#pk-msg", a.rpError, true);
+  else if (!window.PublicKeyCredential) authMsg("#pk-msg", "This browser can't create passkeys (or the page isn't on HTTPS).", true);
+}
+
+// The options call needs a recent password check: on 403 needPassword, ask for it
+async function passkeyOptions(password) {
+  const res = await fetch("/api/auth/passkeys/options", {
+    method: "POST",
+    headers: { "X-Requested-With": "sbui", "Content-Type": "application/json" },
+    body: JSON.stringify(password ? { password } : {}),
+  });
+  if (res.status === 401) { location.reload(); throw new Error("Signed out"); }
+  const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { needPassword: !!data.needPassword });
+  return data;
+}
+
+$("#pk-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const btn = form.querySelector("button");
+  btn.disabled = true;
+  authMsg("#pk-msg", "Follow your browser's prompt…");
+  try {
+    const opts = await passkeyOptions(form.elements.password.value);
+    form.elements.password.value = "";
+    $("#pk-pw").hidden = true;
+    const pk = opts.publicKey;
+    const cred = await navigator.credentials.create({ publicKey: {
+      ...pk,
+      challenge: b64u.dec(pk.challenge),
+      user: { ...pk.user, id: b64u.dec(pk.user.id) },
+      excludeCredentials: pk.excludeCredentials.map((c) => ({ ...c, id: b64u.dec(c.id) })),
+    } });
+    const r = cred.response;
+    const res = await api("POST", "auth/passkeys", {
+      challengeId: opts.challengeId,
+      name: form.elements.name.value,
+      credential: { id: cred.id, response: {
+        clientDataJSON: b64u.enc(r.clientDataJSON),
+        attestationObject: b64u.enc(r.attestationObject),
+        transports: r.getTransports?.() || [],
+      } },
+    });
+    form.elements.name.value = "";
+    authMsg("#pk-msg", `Added "${res.passkey.name}". Sign in with it from the sign-in page on ${res.passkey.rp_id}.`);
+  } catch (e) {
+    if (e.needPassword) {
+      $("#pk-pw").hidden = false;
+      form.elements.password.focus();
+    }
+    const cancelled = e.name === "NotAllowedError" || e.name === "AbortError";
+    const exists = e.name === "InvalidStateError";
+    authMsg("#pk-msg", cancelled ? "Cancelled." : exists ? "This device already has a passkey here." : e.message, !cancelled);
+  }
+  btn.disabled = false;
+  loadAuth();
+});
+
+$("#auth-logout").addEventListener("click", async () => {
+  try { await api("POST", "auth/logout"); } catch { /* signed out anyway */ }
+  location.reload();
+});
+$("#auth-logout-others").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "auth/logout-others");
+    authMsg("#auth-msg", `Signed out ${r.ended} other session${r.ended === 1 ? "" : "s"}.`);
+  } catch (e) { authMsg("#auth-msg", e.message, true); }
+  loadAuth();
+});
+
 async function loadSettings() {
+  loadAuth();
   try {
     const st = await api("GET", "settings/monitoring");
     loadClaudeMd();

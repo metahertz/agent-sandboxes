@@ -57,6 +57,7 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
                     container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
                     load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version, read_env,
                     token_meta, vm_browser, vm_cid)
+import auth  # noqa: E402
 
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
 CLAUDE_IN = ROOT / "bin" / "claude-in"
@@ -276,7 +277,67 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
 # --------------------------------------------------------------- UI
 
 def ui_authed(req: Request) -> bool:
-    return hmac.compare_digest(req.cookies().get("asui", ""), session_value("ui"))
+    return auth.session(req.cookies().get(auth.COOKIE, "")) is not None
+
+
+def peer_ip(w) -> str:
+    peer = w.get_extra_info("peername")
+    return str(peer[0]) if peer else ""
+
+
+def ui_origin(req: Request) -> str:
+    return f"{SCHEME}://{req.host}"
+
+
+async def signed_in(w, req: Request, method: str, extra: dict | None = None):
+    sid = auth.new_session(method, peer_ip(w), req.headers.get("user-agent", ""))
+    print(f"sign-in: {auth.USER} with {method} from {peer_ip(w)}", flush=True)
+    await respond(w, 200, json.dumps({"ok": True, **(extra or {})}), "application/json",
+                  {"Set-Cookie": auth.cookie_header(sid, TLS_CTX is not None)})
+
+
+async def auth_public(req: Request, reader, w):
+    """The sign-in endpoints (before there's a session): password, passkey."""
+    if req.method != "POST" or not same_origin(req) or req.headers.get("x-requested-with") != "sbui":
+        return await respond(w, 403, "Forbidden\n")
+    length = int(req.headers.get("content-length", "0") or 0)
+    if length > 64 * 1024:
+        return await respond(w, 400, "Body too large\n")
+    try:
+        body = json.loads(await reader.readexactly(length) if length else b"{}")
+        if not isinstance(body, dict):
+            raise ValueError
+    except ValueError:
+        return await send_json(w, {"error": "Bad request"}, 400)
+    ip = peer_ip(w)
+    if req.path == "/auth/password":
+        if auth.limited(ip):
+            return await send_json(w, {"error": "Too many failed sign-ins: wait a few minutes"}, 429)
+        ok, err = await auth.check_password(str(body.get("username", "")), str(body.get("password", "")), ip)
+        if err:
+            print(f"sign-in: PAM couldn't check the password: {err}", flush=True)
+            return await send_json(w, {"error": f"Password sign-in isn't working on this host: {err}"}, 500)
+        if not ok:
+            auth.failed(ip)
+            print(f"sign-in: wrong username or password from {ip}", flush=True)
+            return await send_json(w, {"error": "Wrong username or password"}, 401)
+        return await signed_in(w, req, "password")
+    if req.path == "/auth/passkey/options":
+        try:
+            return await send_json(w, auth.login_options(auth.rp_id_for(req.hostname)))
+        except ValueError as e:
+            return await send_json(w, {"error": str(e)}, 400)
+    if req.path == "/auth/passkey/verify":
+        if auth.limited(ip):
+            return await send_json(w, {"error": "Too many failed sign-ins: wait a few minutes"}, 429)
+        try:
+            name = await asyncio.to_thread(auth.authenticate, body, ui_origin(req))
+        except Exception as e:      # malformed input of any kind: a failed sign-in
+            auth.failed(ip)
+            print(f"sign-in: passkey refused from {ip}: {e}", flush=True)
+            return await send_json(w, {"error": str(e) if isinstance(e, ValueError) else "Bad passkey response"}, 401)
+        return await signed_in(w, req, "passkey", {"passkey": name})
+    return await respond(w, 404, "Not found\n")
 
 
 def same_origin(req: Request) -> bool:
@@ -300,15 +361,20 @@ async def handle_ui(req: Request, reader, w):
     if req.path == "/ca.crt" and TLS_CTX:     # public cert, for importing on your laptop
         return await respond(w, 200, (TLS_DIR / "ca.crt").read_bytes(), "application/x-x509-ca-cert",
                              {"Content-Disposition": 'attachment; filename="agent-sandboxes-ca.crt"'})
-    if req.path == "/login":
-        if hmac.compare_digest(req.query.get("token", ""), TOKEN):
-            await respond(w, 303, headers={
-                "Location": "/",
-                "Set-Cookie": f"asui={session_value('ui')}; HttpOnly; SameSite=Strict; Path=/"
-                              + ("; Secure" if TLS_CTX else "")})
+    if req.path == "/login" and "token" in req.query:      # break-glass: the token link
+        if auth.TOKEN_LOGIN and hmac.compare_digest(req.query.get("token", ""), TOKEN):
+            sid = auth.new_session("token", peer_ip(w), req.headers.get("user-agent", ""))
+            print(f"sign-in: {auth.USER} with the login token from {peer_ip(w)}", flush=True)
+            await respond(w, 303, headers={"Location": "/",
+                                           "Set-Cookie": auth.cookie_header(sid, TLS_CTX is not None)})
         else:
-            await respond(w, 401, "Bad token.\n")
+            await respond(w, 401, "Bad token, or token sign-in is turned off (AIO_TOKEN_LOGIN=0).\n")
         return
+    if req.path.startswith("/auth/"):
+        return await auth_public(req, reader, w)
+    if req.path == "/static/login.js" and req.method == "GET":
+        return await respond(w, 200, (STATIC / "login.js").read_bytes(), "text/javascript; charset=utf-8",
+                             {"Content-Security-Policy": ui_csp(req)})
 
     if not ui_authed(req):
         await respond(w, 401, (STATIC / "login.html").read_bytes(), "text/html; charset=utf-8",
@@ -376,6 +442,8 @@ async def api(req: Request, w):
         return await settings_api(req, parts[1:], w)
     if parts == ["host"] and m == "GET":
         return await send_json(w, await host_status())
+    if parts and parts[0] == "auth":
+        return await auth_api(req, parts[1:], w)
     if parts and parts[0] == "access":
         return await access_api(req, parts[1:], w)
     if parts and parts[0] == "inbox":
@@ -2107,7 +2175,8 @@ def backup_sources(cfg: dict) -> dict[str, list[str]]:
     inc, home = cfg["include"], Path.home()
     src = {"projects": [ws["WS_DIR"] for ws in all_ws()] if inc["projects"] else [],
            "config": [str(p) for p in (WS_ROOT, STATE_ROOT, SECRETS, TOKEN_FILE, TLS_DIR,
-                                       ROOT / "ui" / "extra-hostnames", MONITORING_ENV)] if inc["config"] else [],
+                                       ROOT / "ui" / "extra-hostnames", auth.PASSKEYS_FILE,
+                                       MONITORING_ENV)] if inc["config"] else [],
            "claude": [str(CLAUDE_HOME), str(home / ".claude.json")] if inc["claude"] else []}
     return {k: [p for p in v if os.path.lexists(p)] for k, v in src.items()}
 
@@ -2484,6 +2553,68 @@ async def attach_pty(req: Request, reader, w, argv: list[str]):
         except TimeoutError:
             proc.kill()
         os.close(master)
+
+
+# --------------------------------------------------------------- sign-in settings
+
+async def auth_api(req: Request, parts: list[str], w):
+    """Signed in: this session, the passkeys, signing out."""
+    m, sid = req.method, req.cookies().get(auth.COOKIE, "")
+    sess = auth.session(sid) or {}
+    body = json.loads(req.body or b"{}") if m in ("POST", "PATCH") else {}
+    secure = TLS_CTX is not None
+    if parts == [] and m == "GET":
+        try:
+            rp_id, rp_err = auth.rp_id_for(req.hostname), ""
+        except ValueError as e:
+            rp_id, rp_err = "", str(e)
+        return await send_json(w, {
+            "user": auth.USER, "method": sess.get("method"), "since": sess.get("created"),
+            "fresh": auth.now() - sess.get("pw_at", 0) < auth.FRESH, "sessions": auth.session_count(),
+            "passkeys": auth.public_passkeys(), "rpId": rp_id, "rpError": rp_err,
+            "tokenLogin": auth.TOKEN_LOGIN})
+    if parts == ["logout"] and m == "POST":
+        auth.end_session(sid)
+        return await respond(w, 200, '{"ok": true}', "application/json",
+                             {"Set-Cookie": auth.clear_cookie_header(secure)})
+    if parts == ["logout-others"] and m == "POST":
+        return await send_json(w, {"ended": auth.end_other_sessions(sid)})
+    if parts == ["passkeys", "options"] and m == "POST":
+        # Adding a passkey needs the password, checked within the last few minutes
+        if auth.now() - sess.get("pw_at", 0) >= auth.FRESH:
+            ip = peer_ip(w)
+            if not body.get("password"):
+                return await send_json(w, {"error": "Enter your password to add a passkey", "needPassword": True}, 403)
+            if auth.limited(ip):
+                return await send_json(w, {"error": "Too many failed attempts: wait a few minutes"}, 429)
+            ok, err = await auth.check_password(auth.USER, str(body["password"]), ip)
+            if err:
+                return await send_json(w, {"error": f"PAM couldn't check the password: {err}"}, 500)
+            if not ok:
+                auth.failed(ip)
+                return await send_json(w, {"error": "Wrong password", "needPassword": True}, 403)
+            auth.mark_password(sid)
+        try:
+            return await send_json(w, auth.registration_options(auth.rp_id_for(req.hostname), auth._key(sid)))
+        except ValueError as e:
+            return await send_json(w, {"error": str(e)}, 400)
+    if parts == ["passkeys"] and m == "POST":
+        try:
+            p = await asyncio.to_thread(auth.register, body, ui_origin(req), auth._key(sid))
+        except Exception as e:
+            return await send_json(w, {"error": str(e) if isinstance(e, ValueError) else "Bad passkey response"}, 400)
+        print(f"passkey added: {p['name']} ({p['rp_id']})", flush=True)
+        return await send_json(w, {"passkey": p}, 201)
+    if len(parts) == 2 and parts[0] == "passkeys" and m == "DELETE":
+        if not auth.remove_passkey(parts[1]):
+            return await send_json(w, {"error": "No such passkey"}, 404)
+        print(f"passkey removed: {parts[1][:16]}…", flush=True)
+        return await send_json(w, {"ok": True})
+    if len(parts) == 2 and parts[0] == "passkeys" and m == "PATCH":
+        if not auth.rename_passkey(parts[1], body.get("name", "")):
+            return await send_json(w, {"error": "No such passkey"}, 404)
+        return await send_json(w, {"ok": True})
+    return await respond(w, 404, "Not found\n")
 
 
 # --------------------------------------------------------------- host shell

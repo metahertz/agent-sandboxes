@@ -58,7 +58,8 @@ flowchart LR
   UI and injected into Claude via a nono hook. Never in the repo. Its network is
   unfiltered unless *Container network* is *Same as Claude* (see Usage).
 - **Monitoring (optional):** Alloy → Prometheus + Loki → Grafana, see below.
-- **UI:** token login, same-origin API, per-workspace capability URLs for sandbox views.
+- **UI:** sign-in with the host user's password (PAM) or passkeys, server-side sessions,
+  same-origin API, per-workspace capability URLs for sandbox views.
   Runs as your user with only `CAP_NET_BIND_SERVICE`, which it clears from the
   inheritable set once 443 is bound.
 - **MicroVM workspaces:** Claude in a KVM guest with root and Docker, no network
@@ -97,7 +98,9 @@ flowchart LR
 | `secrets/ssh/`, `secrets/tokens/` ✱ | Key / token pool (0600; never readable inside nono) |
 | `state/<name>/` ✱ | Workspace `ssh_config` and `known_hosts` (Claude-writable) |
 | `$XDG_RUNTIME_DIR/agent-sandboxes/<name>/agent.sock` ✱ | Workspace ssh-agent |
-| `ui/token` ✱, `ui/tls/` ✱, `ui/extra-hostnames` ✱ | Login token, TLS keys, extra DNS names |
+| `ui/token` ✱, `ui/tls/` ✱, `ui/extra-hostnames` ✱ | Break-glass login token, TLS keys, extra DNS names |
+| `ui/passkeys.json` ✱, `ui/sessions.json` ✱ | Registered passkeys (public keys); signed-in sessions |
+| `ui/auth.py`, `ui/pam_check.py`, `pam.d/agent-sandboxes` | Sign-in: sessions, passkeys; the PAM password check and its service |
 | `bin/export-claude-project` | Run on another machine: sends a project + its Claude history to the inbox |
 | `bin/ws-ssh` | SSH forced command for upload and per-workspace keys |
 | `inbox/<folder>/` ✱ | Uploaded projects waiting for *Import* |
@@ -129,6 +132,8 @@ docker pull ghcr.io/agent-infra/sandbox:1.11.0
 cp ui/extra-hostnames.example ui/extra-hostnames   # optional: add the host's DNS name
 
 sudo install -m 644 systemd/agent-sandboxes-{ui,proxy}.service /etc/systemd/system/
+sudo install -m 644 pam.d/agent-sandboxes /etc/pam.d/   # password sign-in
+sudo loginctl enable-linger $USER                        # also needed for password sign-in
 sudo systemctl daemon-reload && sudo systemctl enable --now agent-sandboxes-proxy agent-sandboxes-ui
 sudo ufw allow from <your-subnet> to any port 443,9101:9199 proto tcp
 ```
@@ -144,7 +149,8 @@ bin/microvm-image            # as you, from Ubuntu's archive: vm/base/, about 1.
 
 Then, on the machine you browse from, import `ui/tls/ca.crt` as a trusted CA (it's also
 at `https://<host>/ca.crt`; check the fingerprint in `journalctl -u agent-sandboxes-ui`)
-and open `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`.
+and open `https://<host>/`: sign in as this user with their system password. Add passkeys
+under *Settings* (see [Signing in](#signing-in)).
 
 ## Usage
 
@@ -340,9 +346,41 @@ The UI's service runs with `NoNewPrivileges`, so the shell is started by your
 one (no lingering) it falls back to a child of the service, and the page says sudo won't
 work there.
 
-Anyone with the login token gets this shell: an unsandboxed shell as your user, who is
-in the docker group, so effectively root. Keep the token as safe as an SSH key. To turn
-the page off, add `Environment=AIO_HOST_SHELL=0` to the UI's unit.
+Anyone who can sign in gets this shell: an unsandboxed shell as your user, who is in the
+docker group, so effectively root. To turn the page off, add
+`Environment=AIO_HOST_SHELL=0` to the UI's unit.
+
+### Signing in
+
+One account: the user the UI runs as. Nobody else can sign in, even with their own
+system password.
+
+- **Password:** the user's system password, checked by PAM (service `agent-sandboxes`,
+  `pam.d/agent-sandboxes`; PAM's `other` until that's installed). The UI's service runs with
+  `NoNewPrivileges`, which stops PAM's password helper (`unix_chkpwd`, setgid shadow), so
+  `ui/pam_check.py` runs from your `systemd --user` instance instead (`systemd-run --user
+  --pipe`): password sign-in needs lingering, as Claude's sessions do. An expired password
+  is refused: change it on the host. Failed attempts are logged (`journalctl -u
+  agent-sandboxes-ui`, and the auth log with the client's address).
+- **Passkeys:** *Settings → Sign-in → Add a passkey*, after entering the password (unless
+  you signed in with it in the last 10 minutes). Add one per device or password manager
+  (iCloud Keychain, Google Password Manager, 1Password, a security key...); synced
+  passkeys work on your other devices, and a phone can sign in a laptop by QR code. Then
+  *Sign in with a passkey* on the sign-in page, or pick it from the username field's
+  autofill. Each is bound to the hostname it was added on, and browsers refuse passkeys
+  on an IP address, so open the UI by a hostname (a DNS name or `/etc/hosts` entry, listed
+  in `ui/extra-hostnames` so the certificate covers it) whose certificate the device
+  trusts without a warning (import the CA, on phones too). Only the public keys are
+  stored (`ui/passkeys.json`, backed up with the settings); they're checked with the
+  `openssl` CLI. Removing one here stops it working at once.
+- **Sessions:** a week idle or 30 days at most, then sign in again. *Sign out* and *Sign
+  out other sessions* are under *Settings*. Restarting the UI keeps them
+  (`ui/sessions.json`, which holds only hashes of the cookies).
+- **Rate limit:** 5 failed sign-ins per address in 15 minutes, 20 in all, then a wait.
+- **Login token (break-glass):** `https://<host>/login?token=$(cat ~/agent-sandboxes/ui/token)`
+  still signs in, for when PAM or passkeys aren't working. Once passkeys work, you can
+  turn it off with `Environment=AIO_TOKEN_LOGIN=0` in the UI's unit. The token also keys
+  the sandbox views' capability links, so keep the file either way.
 
 ## Importing projects
 
@@ -404,7 +442,7 @@ needs no root.
   never readable inside nono), and the password is never sent back to the browser.
   *Save & test connection* checks the login and folder and shows the free space.
 - **What goes in:** any of the workspace folders; this app's settings and secrets
-  (`workspaces/`, `state/`, `secrets/`, `ui/token`, `ui/tls/`, `ui/extra-hostnames`,
+  (`workspaces/`, `state/`, `secrets/`, `ui/token`, `ui/passkeys.json`, `ui/tls/`, `ui/extra-hostnames`,
   `monitoring/.env`); and Claude Code's config (`~/.claude`, `~/.claude.json`: sessions,
   memory, settings, login). `node_modules`, `.venv` and `__pycache__` are left out
   unless you untick that. The NAS password itself isn't included.

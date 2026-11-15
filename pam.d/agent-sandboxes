@@ -1,0 +1,6 @@
+# PAM for the Agent Sandboxes web UI's password sign-in (ui/pam_check.py): the
+# system password of the user the UI runs as, and nobody else's. Without this
+# file PAM uses /etc/pam.d/other, which on Ubuntu is the same thing.
+# Install: sudo install -m 644 ~/agent-sandboxes/pam.d/agent-sandboxes /etc/pam.d/
+@include common-auth
+@include common-account

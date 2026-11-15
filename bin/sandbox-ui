@@ -17,9 +17,9 @@ if [[ ! -s "$TOKEN_FILE" ]]; then
   (umask 077; openssl rand -hex 24 > "$TOKEN_FILE")
 fi
 if [[ -t 1 ]]; then
-  echo "Login: ${SCHEME}://${HOSTPORT}/login?token=$(cat "$TOKEN_FILE")"
+  echo "Sign in at ${SCHEME}://${HOSTPORT}/ with your password or a passkey (break-glass: ${SCHEME}://${HOSTPORT}/login?token=$(cat "$TOKEN_FILE"))"
 else   # e.g. under systemd: keep the token out of the journal
-  echo "Login: ${SCHEME}://${HOSTPORT}/login?token=<contents of $TOKEN_FILE>"
+  echo "Sign in at ${SCHEME}://${HOSTPORT}/ with your password or a passkey (break-glass: /login?token=<contents of $TOKEN_FILE>)"
 fi
 
 export PATH="$HOME/.local/bin:$PATH"   # claude, for sessions started via tmux

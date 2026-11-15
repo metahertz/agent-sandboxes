@@ -5,24 +5,52 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent Sandboxes</title>
 <style>
-  :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --code: #e9e9e5; }
-  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --code: #252523; } }
+  :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --code: #e9e9e5;
+    --surface: #ffffff; --line: #dcdcd6; --accent: #c2410c; --accent-fg: #ffffff; --bad: #b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #e8e8e3; --muted: #9a9a93; --code: #252523;
+    --surface: #1c1c1a; --line: #33332f; --accent: #ea580c; --bad: #f87171; } }
+  * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
-  main { max-width: 34rem; margin: 12vh auto; padding: 0 1.25rem; }
-  h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+  main { max-width: 24rem; margin: 12vh auto; padding: 0 16px; }
+  h1 { font-size: 1.4rem; margin: 0 0 1.25rem; }
+  form { display: flex; flex-direction: column; gap: 12px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; font-weight: 550; }
+  input { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--fg); }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { font: inherit; font-size: 14px; padding: 8px 12px; border-radius: 6px; cursor: pointer; border: 1px solid var(--line); background: var(--surface); color: var(--fg); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 560; }
+  button:disabled { opacity: .55; cursor: default; }
+  .or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12.5px; margin: 16px 0; }
+  .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+  #passkey { width: 100%; }
+  .msg { min-height: 1.4em; margin: 12px 0 0; font-size: 13.5px; color: var(--muted); }
+  .msg.err { color: var(--bad); }
+  details { margin-top: 2rem; font-size: 13.5px; color: var(--muted); }
+  summary { cursor: pointer; }
   pre, code { background: var(--code); border-radius: 6px; font: 13px ui-monospace, monospace; }
-  pre { padding: .75rem 1rem; overflow-x: auto; }
+  pre { padding: .6rem .8rem; overflow-x: auto; }
   code { padding: .1rem .3rem; }
-  .muted { color: var(--muted); }
 </style>
+<script src="/static/login.js" defer></script>
 </head>
 <body>
   <main>
     <h1>Agent Sandboxes</h1>
-    <p>Open the login link that <code>bin/sandbox-ui</code> printed when it started:</p>
-    <pre>https://&lt;host&gt;/login?token=…</pre>
-    <p class="muted">The token is in <code>~/agent-sandboxes/ui/token</code>.
-      Certificate warning? Import <a href="/ca.crt">this host's CA certificate</a> (see the README).</p>
+    <form id="pw-form">
+      <label>Username <input name="username" autocomplete="username webauthn" autocapitalize="none" spellcheck="false" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+    <div class="or">or</div>
+    <button id="passkey" type="button">Sign in with a passkey</button>
+    <p class="msg" id="msg" role="status"></p>
+    <details>
+      <summary>Other ways in</summary>
+      <p>The account is the one this host runs Agent Sandboxes as, with its system password. Passkeys are added under Settings once you're signed in.</p>
+      <p>Break-glass: the token link, unless it's turned off (<code>AIO_TOKEN_LOGIN=0</code>):</p>
+      <pre>https://&lt;host&gt;/login?token=$(cat ~/agent-sandboxes/ui/token)</pre>
+      <p>Certificate warning? Import <a href="/ca.crt">this host's CA certificate</a> (see the README).</p>
+    </details>
   </main>
 </body>
 </html>

@@ -54,7 +54,7 @@
         <span class="n">Host</span><span class="sub">A shell on this host; update and restart the setup</span>
       </button>
       <button id="settings-btn" class="ws-item pool-item" type="button" aria-current="false">
-        <span class="n">Settings</span><span class="sub">Monitoring, backups and sandbox notes</span>
+        <span class="n">Settings</span><span class="sub">Sign-in, monitoring, backups and sandbox notes</span>
       </button>
     </div>
   </aside>
@@ -396,6 +396,28 @@
       </div></header>
 
       <div class="pool-body">
+      <div class="settings-form">
+        <section class="card" id="auth-card">
+          <h2>Sign-in</h2>
+          <p class="hint" id="auth-summary"></p>
+          <h3>Passkeys</h3>
+          <p class="hint">Sign in with your device's fingerprint, face or PIN instead of the password: add one per device or password manager. Passkeys belong to the hostname you add them on (<span id="auth-rp"></span>), so open the UI by that name to use them.</p>
+          <div class="keylist" id="auth-passkeys"></div>
+          <form id="pk-form" class="add-form" autocomplete="off">
+            <div class="row">
+              <label>Name <input name="name" placeholder="e.g. MacBook, iPhone, YubiKey" maxlength="60"></label>
+              <label id="pk-pw" hidden>Your password <input name="password" type="password" autocomplete="current-password"></label>
+            </div>
+            <div class="row"><button class="btn primary" type="submit">Add a passkey</button></div>
+            <p class="form-msg" id="pk-msg" role="status"></p>
+          </form>
+          <div class="row">
+            <button class="btn" type="button" id="auth-logout">Sign out</button>
+            <button class="btn ghost" type="button" id="auth-logout-others">Sign out other sessions</button>
+          </div>
+          <p class="form-msg" id="auth-msg" role="status"></p>
+        </section>
+      </div>
       <form id="mon-form" class="settings-form">
         <section class="card" id="ca-card" hidden>
           <div class="card-head"><h2>HTTPS certificate</h2>

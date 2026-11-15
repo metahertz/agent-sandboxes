@@ -6,6 +6,8 @@ vm/
 ui/token
 ui/tls/
 ui/extra-hostnames
+ui/passkeys.json
+ui/sessions.json
 
 __pycache__/
 monitoring/.env
