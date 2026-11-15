@@ -312,6 +312,22 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
   Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+- **Tokens in WebSockets (Discord, Slack):** nono swaps placeholders in HTTP requests, but
+  never in WebSocket messages, and Discord's gateway sends the bot token in its first
+  message (IDENTIFY). Slack's bot and app tokens share `slack.com`. So the proxy service
+  swaps these itself, in the workspace's port filter (`ui/proxyd.py`), which nono hands
+  the connections to (its `upstream_proxy`).
+  - For the token's hosts (`discord.com`, `*.discord.gg`, `slack.com`), the port filter
+    terminates TLS with a certificate from the workspace's proxy CA. Under nono, the CA
+    reaches the sandbox through `SSL_CERT_FILE`, which nono merges into its own bundle;
+    containers and VMs already trust it.
+  - It replaces the placeholder in the request head, and in the client's WebSocket frames.
+    It refuses `permessage-deflate`, so frames stay readable.
+  - The placeholder is as long as the token and keeps its prefix (`xoxb-…`), so no length
+    changes: Content-Length, binary frames.
+  - The sandbox sees only the placeholder. The real token is never sent to any other host.
+  - Slack's Socket Mode WebSocket hosts (`wss-primary.slack.com`) are allowed without
+    interception, since they carry a ticket, not the token.
 
 ### Hermes workspaces
 
@@ -341,9 +357,11 @@ Hermes gets the same isolation as Claude, in either kind:
   `aio-hermes-gw-<name>` on the host, or `aio-hermes-gateway` in the VM. A VM's gateway
   doesn't survive a VM restart; start it again. Its output is in the Logs tab. A
   *Telegram Bot API* token in the pool sets up its Telegram channel: the bot token stays a
-  placeholder, which nono swaps into the Bot API's URL path (`/bot<token>/`). Who may talk
-  to the bot is Hermes' own setting (`TELEGRAM_ALLOWED_USERS`; `hermes gateway setup` in the
-  Hermes tab).
+  placeholder, which nono swaps into the Bot API's URL path (`/bot<token>/`). *Discord bot*
+  and *Slack bot / app* tokens work the same way for those channels, swapped by the proxy
+  service (see Keys & tokens: tokens in WebSockets). Who may talk to the bot is Hermes' own
+  setting (`TELEGRAM_ALLOWED_USERS`, `DISCORD_ALLOWED_USERS`, …; `hermes gateway setup` in
+  the Hermes tab).
 - **Install and updates:** `bin/update-host` reinstalls Hermes when the pin in `hermes.lock`
   changes. Hermes' own `hermes update` can't write the read-only install.
 
@@ -630,10 +648,10 @@ telemetry's `workspace` label is set by the sandbox, so a workspace could mislab
 own Claude metrics (nono and container data are labelled outside it); Alloy has the
 Docker socket (root-equivalent, as any container monitor does); imported history lands in
 that shared `~/.claude` too; upload and workspace SSH keys log in as this account (their
-forced command is the boundary), and an upload key can fill the disk. Hermes: a Slack or
-Discord token for its gateway can't be a placeholder (Socket Mode and Discord's gateway
-carry it in the WebSocket protocol), so it goes, in plain text, in that workspace's
-`HERMES_HOME/.env`, which only that workspace can read; mail and chat messages are
-untrusted input to the agent, so keep its allowlist narrow; Google grants' presets are
-per request: the one-label preset checks each message, but the others let the agent read
-everything the preset covers.
+forced command is the boundary), and an upload key can fill the disk. Substituted tokens
+(Discord, Slack) are swapped only within one WebSocket frame: a client that split a
+placeholder across fragments would send it unswapped (and the request would fail), and the
+server's frames pass through unread. Mail and chat messages are untrusted input to the
+agent, so keep a Hermes workspace's allowlist narrow. Google grants' presets are per request:
+the one-label preset checks each message, but the others let the agent read everything the
+preset covers.

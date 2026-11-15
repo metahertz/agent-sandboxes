@@ -75,11 +75,20 @@ fi
 # Loads the agent's SSH keys and writes workspaces/<name>.profile.json
 # (.aux-profile.json for --shell / --exec, .gateway-profile.json for --gateway);
 # sets WS_PROFILE, WS_MEMORY, WS_PIDS, WS_CPUS, WS_PROMPT (how to use its API
-# tokens) and WS_HERMES_BIN; for Hermes, writes its managed settings.
+# tokens), WS_HERMES_BIN and WS_TRUST; for Hermes, writes its managed settings.
 eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${prep[@]}")"
 if [[ $agent == hermes && ! -x $WS_HERMES_BIN ]]; then
   echo "Hermes isn't installed on this host: run bin/install-hermes (the Host page's shell will do)." >&2
   exit 1
+fi
+
+# Tokens the proxy service swaps in itself (Discord, Slack): their hosts'
+# certificates come from the workspace's proxy CA. nono adds the CAs of
+# SSL_CERT_FILE to the bundle it gives the sandbox.
+trust=()
+if [[ -n ${WS_TRUST:-} ]]; then
+  export SSL_CERT_FILE="$WS_TRUST"
+  trust=(-E "SSL_CERT_FILE=$WS_TRUST")
 fi
 
 # AIO_NONO: another nono build (e.g. one from source, for testing);
@@ -131,7 +140,7 @@ if systemctl --user show-environment >/dev/null 2>&1; then
     [[ "$WS_PIDS" != 0 ]] && lim+=(-p "TasksMax=$WS_PIDS")
     systemctl --user reset-failed "$unit" 2>/dev/null || true
     exec systemd-run --user --quiet --collect --unit "$unit" -p WorkingDirectory="$WS_DIR" \
-      -p Restart=on-failure -p RestartSec=10 "${cpu[@]}" "${lim[@]}" -- "${cmd[@]}"
+      -p Restart=on-failure -p RestartSec=10 "${cpu[@]}" "${lim[@]}" "${trust[@]}" -- "${cmd[@]}"
   fi
   exec systemd-run --user --scope --quiet --collect --unit "$unit" "${cpu[@]}" -- "${cmd[@]}"
 fi

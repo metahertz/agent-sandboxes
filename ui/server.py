@@ -57,7 +57,7 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
                     AGENTS, WS_ROOT, all_ws, container_ca_paths, container_filtered, container_net,
                     container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
                     load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version, read_env,
-                    token_meta, vm_browser, vm_cid, ws_agent)
+                    substituted, token_meta, token_placeholder, vm_browser, vm_cid, ws_agent)
 import auth  # noqa: E402
 import gbroker  # noqa: E402
 
@@ -884,6 +884,26 @@ TOKEN_SERVICES = {
                  "inject_mode": "url_path", "path_pattern": "/bot{}/",
                  "inject_header": "", "credential_format": "{}", "env_var": "TELEGRAM_BOT_TOKEN"},
 }
+# Swapped in by the proxy service, not nono (ui/common.py: substituted): the
+# token also travels inside WebSocket messages (Discord's gateway), or two
+# tokens share one host (Slack). The client calls the real URL; its port
+# filter terminates TLS for substitute_hosts with the workspace's proxy CA.
+# allow_hosts: reached without substitution (Slack's Socket Mode WebSockets,
+# which carry a ticket, not the token).
+SUBST_SERVICES = {
+    "discord": {"label": "Discord bot", "upstream": "https://discord.com/api",
+                "inject_header": "Authorization", "credential_format": "Bot {}", "env_var": "DISCORD_BOT_TOKEN",
+                "substitute_hosts": ["discord.com", "gateway.discord.gg", "*.discord.gg"],
+                "allow_hosts": ["cdn.discordapp.com", "media.discordapp.net"]},
+    "slack-bot": {"label": "Slack bot token", "upstream": "https://slack.com/api",
+                  "inject_header": "Authorization", "credential_format": "Bearer {}", "env_var": "SLACK_BOT_TOKEN",
+                  "substitute_hosts": ["slack.com"], "allow_hosts": ["files.slack.com"]},
+    "slack-app": {"label": "Slack app token (Socket Mode)", "upstream": "https://slack.com/api",
+                  "inject_header": "Authorization", "credential_format": "Bearer {}", "env_var": "SLACK_APP_TOKEN",
+                  "substitute_hosts": ["slack.com"],
+                  "allow_hosts": ["wss-primary.slack.com", "wss-backup.slack.com"]},
+}
+TOKEN_SERVICES.update(SUBST_SERVICES)
 # What a pool token's route may carry over to nono's custom_credentials
 ROUTE_EXTRAS = ("inject_mode", "path_pattern", "endpoint_rules")
 
@@ -1069,7 +1089,7 @@ def validate_policy(body: dict) -> dict:
     llm = str(h.get("llm", "") or "")
     if llm and llm not in pol["tokens"]:
         raise ValueError("Hermes model provider: tick that token for this workspace too")
-    if llm and token_meta(llm)["service"] in ("google", "telegram", "github", "gitlab"):
+    if llm and token_meta(llm)["service"] in ("google", "telegram", "github", "gitlab", *SUBST_SERVICES):
         raise ValueError("Hermes model provider: pick an LLM API token")
     base_url = str(h.get("base_url", "") or "").strip()
     if base_url:
@@ -1177,6 +1197,8 @@ def add_token(body: dict) -> dict:
     secret = str(body.get("secret", "")).strip()
     if not secret or len(secret) > 8192 or any(c in secret for c in "\r\n\0"):
         raise ValueError("Paste the token (single line)")
+    if service in SUBST_SERVICES and len(secret) < 20:
+        raise ValueError("That's too short for this kind of token")
     if service in TOKEN_SERVICES:
         meta = {"service": service, **TOKEN_SERVICES[service]}
     elif service == "custom":
@@ -1412,9 +1434,13 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
         # its own servers (on any address: nono can't limit that), and connecting to them
         net["listen_port"] = ports
         net["open_port"] += ports
-    creds, capture = {}, {}
+    creds, capture, subst_env, subst_hosts = {}, {}, {}, []
     for tid in pol["tokens"]:
         meta = token_meta(tid)
+        if substituted(meta):
+            subst_env[meta["env_var"]] = token_placeholder(name, tid)
+            subst_hosts += meta["substitute_hosts"] + meta.get("allow_hosts", [])
+            continue
         route = "pool_" + tid.replace("-", "_")
         creds[route] = {
             "upstream": bridge_upstream(tid, meta["upstream"], meta.get("broker", False)),
@@ -1433,6 +1459,11 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
     if creds:
         net["credentials"] = sorted(creds)
         net["custom_credentials"] = creds
+    if subst_hosts:
+        # Their hosts through the port filter, which swaps the placeholders
+        if mode != "open":
+            net["allow_domain"] = list(dict.fromkeys(net.get("allow_domain", []) + subst_hosts))
+        net["upstream_proxy"] = f"127.0.0.1:{egress_port(ws)}"
     env = {"SSH_AUTH_SOCK": str(agent_sock(name)),
            "GIT_SSH_COMMAND": f"ssh -F {st / 'ssh_config'}"}
     if telemetry:
@@ -1445,7 +1476,10 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
                     "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{OTLP_PORT}",
                     "OTEL_RESOURCE_ATTRIBUTES": f"workspace={name}",
                     "OTEL_METRIC_EXPORT_INTERVAL": "30000"})
+    env.update(subst_env)
     fs = {"unix_socket": [str(agent_sock(name))], "read": [str(LIBEXEC)], "allow": [str(st)]}
+    if subst_env:
+        fs["read"].append(str(proxy_trust_path(name)))     # bin/claude-in: SSL_CERT_FILE
     if hermes:
         # Its own HERMES_HOME (in state/<name>, writable), the install and the
         # managed settings read-only; the AIO container's port and key, which
@@ -1487,6 +1521,33 @@ def write_ssh_config(name: str):
         "  ServerAliveInterval 30\n")
 
 
+SYSTEM_CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
+
+
+def proxy_trust_path(name: str) -> Path:
+    return RUNTIME / name / "proxy-trust.pem"
+
+
+def write_proxy_trust(ws: dict[str, str], pol: dict) -> str:
+    """For substituted tokens under nono: the system CAs plus the workspace's
+    proxy CA, which the port filter's certificates for their hosts chain to.
+    bin/claude-in exports it as SSL_CERT_FILE; nono merges that into the
+    bundle it gives the sandbox. Returns the path, or "" when not needed."""
+    name = ws["WS_NAME"]
+    path = proxy_trust_path(name)
+    if is_microvm(ws) or not any(substituted(token_meta(t)) for t in pol["tokens"]):
+        path.unlink(missing_ok=True)
+        return ""
+    crt, _ = container_ca(name)
+    try:
+        system = SYSTEM_CA_BUNDLE.read_text()
+    except OSError:
+        system = ""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_if_changed(path, system.rstrip() + "\n" + crt.read_text())
+    return str(path)
+
+
 async def prepare(name: str, aux: bool = False, gateway: bool = False) -> dict:
     """Everything Claude needs before nono starts: agent with its keys,
     ssh config, and the rendered profile (what's now 'applied'). aux: for a
@@ -1502,6 +1563,7 @@ async def prepare(name: str, aux: bool = False, gateway: bool = False) -> dict:
     pol = load_policy(name)
     if ws_agent(ws) == "hermes":
         write_hermes_files(ws, pol)       # a VM's: bin/claude-in copies it in
+    trust = write_proxy_trust(ws, pol)
     prompt = ""
     if not aux:
         if ws_agent(ws) == "claude":
@@ -1510,7 +1572,7 @@ async def prepare(name: str, aux: bool = False, gateway: bool = False) -> dict:
             except (OSError, ValueError) as e:
                 print(f"CLAUDE.md not updated: {e}", file=sys.stderr)
         prompt = session_prompt(ws, pol)
-    return {"profile": str(target), "prompt": prompt, "agent": ws_agent(ws), **pol["limits"]}
+    return {"profile": str(target), "prompt": prompt, "agent": ws_agent(ws), "trust": trust, **pol["limits"]}
 
 
 # ---- sandbox notes for Claude: CLAUDE.md block (opt-in per workspace) and,
@@ -1545,6 +1607,11 @@ def token_lines(pol: dict) -> str:
             out.append(f"- Google, {meta['label']}: {how}, with the header `Authorization: Bearer ${env}`. "
                        f"Allowed: {gbroker.grant_summary(meta)} Anything else is refused with 403; "
                        "don't try other Google endpoints or ask for more access.")
+            continue
+        if substituted(meta):
+            out.append(f"- `${env}` ({tid}) for {meta['upstream']}: use it as the token, at the service's real "
+                       "URL (and in its WebSocket messages); the proxy swaps the placeholder for the real token "
+                       f"on {', '.join(meta['substitute_hosts'])}.")
             continue
         if meta.get("inject_mode") == "url_path":
             out.append(f"- `${env}` ({tid}) for {meta['upstream']}: call `${var}` plus the path, with "
@@ -3447,7 +3514,9 @@ def container_env_text(ws: dict[str, str], pol: dict, gw: str | None = None,
            "NODE_EXTRA_CA_CERTS": CONTAINER_CA_MOUNT, "REQUESTS_CA_BUNDLE": bundle, "PIP_CERT": bundle,
            "NODE_USE_ENV_PROXY": "1"}      # Node's own fetch honours HTTPS_PROXY (as nono sets for Claude)
     for tid in pol["tokens"]:
-        if meta := token_meta(tid):
+        if substituted(meta := token_meta(tid)):
+            env[meta["env_var"]] = token_placeholder(ws["WS_NAME"], tid)
+        elif meta:
             env[meta["env_var"]] = pw
             env[base_url_var(tid)] = f"http://{gw}:{port}/pool_{tid.replace('-', '_')}"
     return "# Generated by agent-sandboxes (Access tab -> Container network). Don't edit.\n" + \
@@ -3561,7 +3630,9 @@ def vm_proxy_env_text(ws: dict[str, str], pol: dict) -> str:
     if pol["vm_browser"]:     # .mcp.json's aio-sandbox server: the container in the VM
         env.update({"AIO_PORT": str(VM_BROWSER_PORT), "AIO_KEY": ws["WS_KEY"]})
     for tid in pol["tokens"]:
-        if meta := token_meta(tid):
+        if substituted(meta := token_meta(tid)):
+            env[meta["env_var"]] = token_placeholder(ws["WS_NAME"], tid)
+        elif meta:
             env[meta["env_var"]] = pw
             env[base_url_var(tid)] = f"http://{relay}/pool_{tid.replace('-', '_')}"
     return "".join(f"{k}={v}\n" for k, v in env.items())
@@ -3867,6 +3938,7 @@ def cli_prepare(name: str, aux: bool = False, gateway: bool = False):
     print(f"WS_CPUS={int(info['cpus'])}")
     print(f"WS_PROMPT={shlex.quote(info['prompt'])}")
     print(f"WS_HERMES_BIN={shlex.quote(str(HERMES_BIN))}")
+    print(f"WS_TRUST={shlex.quote(info['trust'])}")
 
 
 if __name__ == "__main__":

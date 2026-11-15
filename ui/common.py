@@ -8,6 +8,7 @@ the connections open through it); the UI warns when the two differ.
 
 import ctypes
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -153,6 +154,57 @@ def parse_net_entry(x: str, what: str, ports_ok: bool) -> tuple[str, int, int]:
             raise ValueError(f"{what}: {x!r} is this host or link-local; use the workspace's own ports instead")
         host = ip.compressed      # the proxy matches IPv6 in canonical form only
     return host, lo, hi
+
+
+# Tokens the proxy service swaps in itself (not nono): ones a client also sends
+# inside WebSocket messages (Discord's gateway IDENTIFY), or several on one host
+# (Slack's bot and app tokens). For their hosts, the workspace's port filter
+# terminates TLS with the workspace's proxy CA and replaces the placeholder in
+# request headers and in the client's WebSocket frames (ui/proxyd.py).
+PLACEHOLDER_KEY = SECRETS / "placeholder.key"
+
+
+def substituted(meta: dict | None) -> bool:
+    return bool(meta and meta.get("substitute_hosts"))
+
+
+def token_placeholder(name: str, tid: str) -> str:
+    """The workspace's stand-in for a substituted token: as long as the real
+    one, with its prefix (xoxb-…), so swapping it changes no lengths (binary
+    WebSocket frames, Content-Length) and clients that check the prefix accept it."""
+    real = (TOKEN_POOL / tid).read_text().strip()
+    try:
+        key = PLACEHOLDER_KEY.read_bytes()
+    except FileNotFoundError:
+        try:
+            fd = os.open(PLACEHOLDER_KEY, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(os.urandom(32))
+        except FileExistsError:
+            pass
+        key = PLACEHOLDER_KEY.read_bytes()
+    prefix = (re.match(r"^[A-Za-z]{2,8}-", real) or [""])[0]
+    fill, i = "", 0
+    while len(prefix) + len(fill) < len(real):     # add_token: at least 20 characters
+        fill += hmac.new(key, f"{name}:{tid}:{i}".encode(), hashlib.sha256).hexdigest()
+        i += 1
+    return (prefix + "aio" + fill)[:len(real)]
+
+
+def substitutions(name: str, pol: dict | None = None) -> list[tuple[str, bytes, bytes]]:
+    """(host pattern, placeholder, real token) for the workspace's substituted tokens."""
+    out = []
+    for tid in (pol or load_policy(name))["tokens"]:
+        meta = token_meta(tid)
+        if substituted(meta):
+            try:
+                real = (TOKEN_POOL / tid).read_text().strip().encode()
+                ph = token_placeholder(name, tid).encode()
+            except OSError:
+                continue
+            if len(ph) == len(real):
+                out += [(h, ph, real) for h in meta["substitute_hosts"]]
+    return out
 
 
 def token_meta(tid: str) -> dict | None:

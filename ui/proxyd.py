@@ -8,7 +8,10 @@ containers' connections:
     for Google grants whose checks need more than nono's endpoint rules
     (ui/gbroker.py: one Gmail label), which it sends on to Google over TLS;
   - each workspace's port filter (127.0.0.1:<sandbox port - 1000>), nono's
-    upstream_proxy when the allowlist has host:port entries;
+    upstream_proxy when the allowlist has host:port entries or the workspace
+    has tokens this service swaps in itself (Discord, Slack): for their
+    hosts it terminates TLS and replaces the placeholder in request headers
+    and in the client's WebSocket frames;
   - for Container network "Same as Claude": the container's nono proxy on
     its Docker gateway, and 127.0.0.1:<sandbox port> forwarded to the
     container (MCP and the UI's sandbox view);
@@ -34,6 +37,8 @@ import re
 import signal
 import socket
 import ssl
+import struct
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -45,6 +50,7 @@ from common import (CONTAINER_PROXY_PORT, HTTP_BRIDGE, MAX_HEAD, NAME_RE, NONO_L
                     container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
                     load_policy, load_ws, parse_net_entry, proxyd_source_version, token_meta, unsafe_ip,
                     vm_browser, vm_cid, vm_proxy_port, wants_ws_proxy)
+from common import CONTAINER_PROXY_SECRETS, substitutions  # noqa: E402
 import gbroker  # noqa: E402
 
 BROKER_LOG = NONO_LOGS.parent / "google-broker.log"   # one JSON line per decision (no tokens, no query values)
@@ -132,6 +138,10 @@ async def handle_egress(reader, w, name: str):
             print(f"port-filter workspace={name} decision=deny host={host} port={port}", flush=True)
             w.write(f"HTTP/1.1 403 Forbidden: port {port} is not allowed for {host}\r\n\r\n".encode())
             return
+        subs = {ph: real for pattern, ph, real in substitutions(name) if host_matches(pattern, host)}
+        if subs and port == 443:
+            await substitute_tunnel(reader, w, name, host, subs)
+            return
         try:
             up_r, up_w = await egress_connect(host, port)
         except OSError as e:
@@ -157,6 +167,162 @@ async def handle_egress(reader, w, name: str):
     except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
         pass
     finally:
+        w.close()
+
+
+# --------------------------------------------------------------- token substitution
+# For a substituted token's hosts (ui/common.py): TLS terminated here with a
+# certificate from the workspace's proxy CA (which the sandbox, container or
+# VM trusts), then one HTTP/1.1 request per connection with the placeholder
+# swapped in its head, or a WebSocket whose client frames get the same swap
+# (the placeholder is as long as the token, so no frame or body changes size).
+# The server's frames pass through untouched.
+
+leaf_contexts: dict[tuple[str, str], tuple[float, ssl.SSLContext]] = {}
+MAX_WS_FRAME = 16 << 20
+
+
+def leaf_context(name: str, host: str) -> ssl.SSLContext:
+    """A server context with a certificate for host, from the workspace's CA
+    (made at most once a day per host and kept in memory)."""
+    key = (name, host)
+    if (hit := leaf_contexts.get(key)) and hit[0] > time.time():
+        return hit[1]
+    ca_crt, ca_key = container_ca_paths(name)
+    d = CONTAINER_PROXY_SECRETS / f"{name}.leaf"
+    d.mkdir(mode=0o700, exist_ok=True)
+    crt, lkey, conf = d / f"{host}.crt", d / f"{host}.key", d / f"{host}.cnf"
+    if not crt.is_file() or time.time() - crt.stat().st_mtime > 7 * 86400:
+        conf.write_text(f"subjectAltName=DNS:{host}\nbasicConstraints=CA:FALSE\n"
+                        "keyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n")
+        old = os.umask(0o077)
+        try:
+            subprocess.run(["openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                            "-nodes", "-keyout", str(lkey), "-subj", f"/CN={host}", "-out", str(d / f"{host}.csr")],
+                           check=True, capture_output=True, timeout=30)
+            subprocess.run(["openssl", "x509", "-req", "-in", str(d / f"{host}.csr"), "-CA", str(ca_crt),
+                            "-CAkey", str(ca_key), "-CAcreateserial", "-days", "30", "-sha256",
+                            "-extfile", str(conf), "-out", str(crt)], check=True, capture_output=True, timeout=30)
+        finally:
+            os.umask(old)
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(crt, lkey)
+    ctx.set_alpn_protocols(["http/1.1"])
+    leaf_contexts[key] = (time.time() + 86400, ctx)
+    return ctx
+
+
+def xor_mask(data: bytes, mask: bytes) -> bytes:
+    if not data:
+        return data
+    m = (mask * (len(data) // 4 + 1))[:len(data)]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(m, "big")).to_bytes(len(data), "big")
+
+
+def swap(data: bytes, subs: dict[bytes, bytes]) -> tuple[bytes, int]:
+    n = 0
+    for ph, real in subs.items():
+        if ph in data:
+            n += data.count(ph)
+            data = data.replace(ph, real)
+    return data, n
+
+
+async def relay_client_frames(reader, up_w, subs: dict[bytes, bytes]) -> int:
+    """Client -> server WebSocket frames, unmasked, swapped, masked again."""
+    swapped = 0
+    while True:
+        h = await reader.readexactly(2)
+        length = h[1] & 0x7F
+        ext = b""
+        if length == 126:
+            ext = await reader.readexactly(2)
+            length = struct.unpack("!H", ext)[0]
+        elif length == 127:
+            ext = await reader.readexactly(8)
+            length = struct.unpack("!Q", ext)[0]
+        if length > MAX_WS_FRAME:
+            raise ValueError("WebSocket frame too large")
+        masked = h[1] & 0x80
+        mask = await reader.readexactly(4) if masked else b""
+        payload = await reader.readexactly(length)
+        if masked:
+            payload = xor_mask(payload, mask)
+        payload, n = swap(payload, subs)
+        swapped += n
+        if masked:
+            mask = os.urandom(4)
+            payload = xor_mask(payload, mask)
+        up_w.write(h + ext + mask + payload)
+        await up_w.drain()
+        if h[0] & 0x0F == 0x8:          # close
+            return swapped
+
+
+async def substitute_tunnel(reader, w, name: str, host: str, subs: dict[bytes, bytes]):
+    up_w = None
+    try:
+        ctx = await asyncio.to_thread(leaf_context, name, host)
+    except (OSError, subprocess.SubprocessError, ssl.SSLError) as e:
+        problem(name, "substitute", f"No certificate for {host} (workspace '{name}'): {e}")
+        w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        return
+    problem(name, "substitute", None)
+    w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    await w.drain()
+    try:
+        await w.start_tls(ctx)
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 60)
+        lines = head[:-4].decode("latin-1").split("\r\n")
+        upgrade = any(x.lower().startswith("upgrade:") and "websocket" in x.lower() for x in lines[1:])
+        headers = {k.strip().lower(): v.strip() for k, _, v in (x.partition(":") for x in lines[1:])}
+        out = [lines[0]]
+        for x in lines[1:]:
+            k = x.partition(":")[0].strip().lower()
+            # no compressed frames (they couldn't be searched); one request per connection
+            if k in ("sec-websocket-extensions", "proxy-connection", "keep-alive") or \
+                    (k == "connection" and not upgrade):
+                continue
+            out.append(x)
+        if not upgrade:
+            out.append("Connection: close")
+        new_head, n = swap(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"), subs)
+        up_r, up_w = await egress_connect(host, 443, tls=True)
+        up_w.write(new_head)
+        if not upgrade:
+            await copy_body(reader, up_w, headers)
+        print(f"substitute workspace={name} host={host} {lines[0].split(' ')[0]} "
+              f"{'websocket' if upgrade else 'http'} swapped={n}", flush=True)
+
+        async def down():
+            try:
+                while data := await up_r.read(65536):
+                    w.write(data)
+                    await w.drain()
+            except OSError:
+                pass
+            finally:
+                w.close()
+
+        if not upgrade:
+            await down()
+            return
+        task = asyncio.create_task(down())
+        try:
+            # Only after the server accepted the upgrade are the client's bytes frames
+            swapped = await relay_client_frames(reader, up_w, subs)
+            print(f"substitute workspace={name} host={host} websocket closed swapped={swapped}", flush=True)
+        except (asyncio.IncompleteReadError, ValueError):
+            pass
+        finally:
+            up_w.close()
+            await task
+    except (OSError, ssl.SSLError, ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError,
+            asyncio.TimeoutError):
+        pass
+    finally:
+        if up_w:
+            up_w.close()
         w.close()
 
 
