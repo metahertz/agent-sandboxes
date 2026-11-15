@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Print one of the repo's host files (systemd units, nono/claude-browser.jsonc)
+# for this host: the repo's copies assume user metahertz (uid 1000) with the
+# clone at /home/metahertz/agent-sandboxes. bin/install-host installs them
+# this way, and bin/update-host compares against this, so a host with another
+# user or clone location stays updatable.
+#
+#   render-host-file <repo file>
+set -euo pipefail
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+src="${1:?usage: render-host-file <repo file>}"
+user=$(id -un) uid=$(id -u) group=$(id -gn)
+sed -e "s|/home/metahertz/agent-sandboxes|$ROOT|g" \
+    -e "s|/home/metahertz|$HOME|g" \
+    -e "s|^User=metahertz\$|User=$user|" \
+    -e "s|^Group=metahertz\$|Group=$group|" \
+    -e "s|runs as metahertz|runs as $user|" \
+    -e "s|/run/user/1000|/run/user/$uid|g" \
+    -e "s|user-runtime-dir@1000\.service|user-runtime-dir@$uid.service|g" \
+    "$src"

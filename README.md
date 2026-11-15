@@ -123,6 +123,17 @@ Requires Linux with Landlock, Docker + compose, nono, tmux, python3 (3.11+), ope
 Claude Code; `smbclient` and `zstd` for backups. Paths assume a clone at `~/agent-sandboxes` and the unit's user `metahertz`
 (uid 1000); edit the unit and `nono/claude-browser.jsonc` hook path otherwise.
 
+On a fresh Ubuntu host (24.04+), `bin/install-host` does all of the below for the user that
+runs it (another name than `metahertz` is fine: it renders the units and the nono profile for
+that user and clone with `bin/render-host-file`, and `bin/update-host` keeps them that way).
+Run it from a clone elsewhere over SSH, e.g. for a test machine on a branch:
+
+```bash
+bin/install-host --ssh you@test-host --branch hermes-agents --hermes   # --microvm, --no-claude, --no-image
+```
+
+By hand:
+
 ```bash
 git clone https://github.com/metahertz/agent-sandboxes.git ~/agent-sandboxes && cd ~/agent-sandboxes
 

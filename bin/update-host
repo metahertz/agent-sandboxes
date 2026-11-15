@@ -38,10 +38,12 @@ changed() { (( all )) || ! git diff --quiet "$old" "$new" -- "$@"; }
 
 # System units: reinstall the ones that differ from the installed copies
 reload=0
+# (rendered for this host's user and clone: bin/render-host-file)
 for u in agent-sandboxes-ui agent-sandboxes-proxy; do
-  if [[ -f /etc/systemd/system/$u.service ]] && ! cmp -s "systemd/$u.service" "/etc/systemd/system/$u.service"; then
+  if [[ -f /etc/systemd/system/$u.service ]] && \
+      ! bin/render-host-file "systemd/$u.service" | cmp -s - "/etc/systemd/system/$u.service"; then
     say "Installing systemd/$u.service"
-    sudo install -m 644 "systemd/$u.service" /etc/systemd/system/
+    bin/render-host-file "systemd/$u.service" | sudo tee "/etc/systemd/system/$u.service" >/dev/null
     reload=1
   fi
 done
@@ -55,9 +57,10 @@ fi
 
 # nono's profile and hook, as the install copies them
 for prof in claude-browser hermes-sandbox; do
-  if [[ -d ~/.config/nono/profiles ]] && ! cmp -s "nono/$prof.jsonc" ~/.config/nono/profiles/$prof.jsonc; then
+  if [[ -d ~/.config/nono/profiles ]] && \
+      ! bin/render-host-file "nono/$prof.jsonc" | cmp -s - ~/.config/nono/profiles/$prof.jsonc; then
     say "Updating ~/.config/nono/profiles/$prof.jsonc"
-    cp "nono/$prof.jsonc" ~/.config/nono/profiles/
+    bin/render-host-file "nono/$prof.jsonc" > ~/.config/nono/profiles/$prof.jsonc
   fi
 done
 # Hermes (sandbox-kind Hermes workspaces): the pinned release, once installed
