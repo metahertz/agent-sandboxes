@@ -162,8 +162,15 @@ Screenshots are from a demo setup (made-up workspaces, keys and tokens).
   Creates the folder, `.mcp.json`, key and port, and starts the container.
 - **Tabs:** *Claude* (sandboxed session, survives closing the tab) · *Browser* (live VNC,
   shared with Claude) · *VS Code* and *Terminal* (inside the container) · *Access* (SSH
-  keys, API tokens, network allowlist, memory/process limits) · *Files* (browse/download
-  from the container) · *Logs*.
+  keys, API tokens, network allowlist, memory/process limits) · *Files* (browse, download
+  and upload files in the container) · *Logs*.
+- **Uploads** (*Files* tab): *Upload files*, *Upload folder* (keeps its subfolders), or
+  drop files and folders on the list. They go into the folder shown, as the container's
+  user (`gem`), streamed through `docker exec` (over the VM's ssh for a microVM's browser
+  container). Each file goes to a hidden temp file first and is renamed into place only
+  when every byte has arrived, so a cancelled or broken upload leaves nothing behind.
+  Names already in the folder are asked about first. Up to 20 GB per file
+  (`AIO_UPLOAD_MAX_GB`).
 
 ![A workspace's Browser tab: the sandbox's Chromium over VNC](docs/screenshots/workspace-browser.png)
 

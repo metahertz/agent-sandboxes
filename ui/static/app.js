@@ -640,6 +640,133 @@ $("#f-zip").addEventListener("click", () => {
   a.click();
 });
 
+// Uploads: one request per file, streamed into the container (PUT
+// .../upload?path=<folder>&name=<file or relative path>). XHR, not fetch,
+// for upload progress.
+const upload = { xhr: null, cancelled: false };
+
+function putFile(w, folder, rel, file, overwrite, onProgress) {
+  return new Promise((resolve, reject) => {
+    const q = `path=${encodeURIComponent(folder)}&name=${encodeURIComponent(rel)}${overwrite ? "&overwrite=1" : ""}`;
+    const xhr = new XMLHttpRequest();
+    upload.xhr = xhr;
+    xhr.open("PUT", `/api/${wsPath(w.name, "/upload")}?${q}`);
+    xhr.setRequestHeader("X-Requested-With", "sbui");
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.onprogress = (ev) => onProgress(ev.loaded);
+    xhr.onload = () => {
+      if (xhr.status === 401) { location.reload(); return reject(new Error("Signed out")); }
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch { data = { error: xhr.responseText || `HTTP ${xhr.status}` }; }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(Object.assign(new Error(data.error || `HTTP ${xhr.status}`), { exists: !!data.exists }));
+    };
+    xhr.onerror = () => reject(new Error("Upload failed (connection lost)"));
+    xhr.onabort = () => reject(Object.assign(new Error("Cancelled"), { cancelled: true }));
+    xhr.send(file);
+  });
+}
+
+// items: [{ file, rel }] (rel: the name, or a path inside an uploaded folder)
+async function uploadFiles(items) {
+  const w = current();
+  if (!w || !items.length) return;
+  if (w.container !== "running") return alert("Start the container first.");
+  const folder = state.filesPath[w.name] || $("#f-path").value.trim();
+  // Ask about names already in this folder before sending anything
+  const res = await api("GET", `${wsPath(w.name, "/files")}?path=${encodeURIComponent(folder)}`).catch(() => ({ entries: [] }));
+  const here = new Set(res.entries.map((e) => e.name));
+  const clash = [...new Set(items.map((i) => i.rel.split("/")[0]).filter((n) => here.has(n)))];
+  let overwrite = false;
+  if (clash.length) {
+    const list = clash.slice(0, 8).join(", ") + (clash.length > 8 ? ` and ${clash.length - 8} more` : "");
+    if (!confirm(`Already in ${folder}: ${list}.\n\nReplace ${clash.length === 1 ? "it" : "them"}?`)) return;
+    overwrite = true;
+  }
+  const total = items.reduce((n, i) => n + i.file.size, 0);
+  let done = 0, sent = 0;
+  const failed = [];
+  upload.cancelled = false;
+  $("#f-progress").hidden = false;
+  const bar = $("#f-progress-bar");
+  for (const [n, { file, rel }] of items.entries()) {
+    if (upload.cancelled) break;
+    const show = (loaded) => {
+      $("#f-progress-text").textContent = `Uploading ${n + 1} of ${items.length}: ${rel} (${fmtSize(sent + loaded)} of ${fmtSize(total)})`;
+      bar.value = total ? (sent + loaded) / total : (n + 1) / items.length;
+    };
+    show(0);
+    try {
+      await putFile(w, folder, rel, file, overwrite, show);
+      done += 1;
+    } catch (e) {
+      if (e.cancelled) break;
+      failed.push(`${rel}: ${e.message}`);
+    }
+    sent += file.size;
+  }
+  upload.xhr = null;
+  $("#f-progress").hidden = true;
+  msg(failed.length
+    ? `Uploaded ${done} of ${items.length}. Failed: ${failed.slice(0, 3).join("; ")}${failed.length > 3 ? "…" : ""}`
+    : upload.cancelled ? `Cancelled after ${done} of ${items.length}.` : `Uploaded ${done} file${done === 1 ? "" : "s"} to ${folder}.`,
+  failed.length > 0);
+  if (state.tab === "files" && current()?.name === w.name) loadFiles(folder);
+}
+
+$("#f-upload").addEventListener("click", () => $("#f-pick").click());
+$("#f-upload-dir").addEventListener("click", () => $("#f-pick-dir").click());
+$("#f-pick").addEventListener("change", (ev) => {
+  uploadFiles([...ev.target.files].map((file) => ({ file, rel: file.name })));
+  ev.target.value = "";
+});
+$("#f-pick-dir").addEventListener("change", (ev) => {
+  uploadFiles([...ev.target.files].map((file) => ({ file, rel: file.webkitRelativePath || file.name })));
+  ev.target.value = "";
+});
+$("#f-cancel").addEventListener("click", () => {
+  upload.cancelled = true;
+  upload.xhr?.abort();
+});
+
+// Drag and drop: files, and folders (walked with the entries API)
+async function droppedItems(dt) {
+  const entries = [...dt.items].map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  if (!entries.length) return [...dt.files].map((file) => ({ file, rel: file.name }));
+  const out = [];
+  const walk = async (entry, prefix) => {
+    if (entry.isFile) {
+      out.push({ file: await new Promise((ok, bad) => entry.file(ok, bad)), rel: prefix + entry.name });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {                          // readEntries returns them in batches
+        const batch = await new Promise((ok, bad) => reader.readEntries(ok, bad));
+        if (!batch.length) break;
+        for (const e of batch) await walk(e, `${prefix}${entry.name}/`);
+      }
+    }
+  };
+  for (const e of entries) await walk(e, "");
+  return out;
+}
+const drop = $("#f-drop");
+drop.addEventListener("dragover", (ev) => {
+  if (![...ev.dataTransfer.types].includes("Files")) return;
+  ev.preventDefault();
+  drop.classList.add("dropping");
+});
+drop.addEventListener("dragleave", (ev) => { if (!drop.contains(ev.relatedTarget)) drop.classList.remove("dropping"); });
+drop.addEventListener("drop", async (ev) => {
+  if (![...ev.dataTransfer.types].includes("Files")) return;
+  ev.preventDefault();
+  drop.classList.remove("dropping");
+  try {
+    uploadFiles(await droppedItems(ev.dataTransfer));
+  } catch (e) {
+    msg(`Couldn't read the dropped files: ${e.message}`, true);
+  }
+});
+
 // ------------------------------------------------------------------ logs
 
 async function loadLogs() {

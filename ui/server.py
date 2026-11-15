@@ -116,6 +116,7 @@ SCHEME, WS_SCHEME = "http", "ws"
 CA_FINGERPRINT = ""                          # SHA-256 of ui/tls/ca.crt, when TLS is on
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_BODY = 1024 * 1024
+MAX_UPLOAD = int(os.environ.get("AIO_UPLOAD_MAX_GB", "20")) << 30   # one file, in the Files tab
 
 USER_GID = pwd.getpwuid(os.getuid()).pw_gid
 TOKEN = ""
@@ -405,6 +406,8 @@ async def handle_ui(req: Request, reader, w):
         if req.method != "GET" and req.headers.get("x-requested-with") != "sbui":
             await respond(w, 403, "Missing X-Requested-With\n")
             return
+        if req.method == "PUT" and (m := re.fullmatch(r"/api/workspaces/([^/]+)/upload", req.path)):
+            return await upload(m[1], req, reader, w)      # streamed: no MAX_BODY
         length = int(req.headers.get("content-length", "0") or 0)
         if length > MAX_BODY:
             await respond(w, 400, "Body too large\n")
@@ -2344,9 +2347,9 @@ def clean_container_path(p: str) -> str | None:
     return posixpath.normpath(p)
 
 
-def sandbox_exec(ws: dict[str, str], *args: str) -> list[str]:
+def sandbox_exec(ws: dict[str, str], *args: str, stdin: bool = False) -> list[str]:
     """A command in the workspace's AIO container (as gem): on the host, or in its microVM."""
-    cmd = ["docker", "exec", "-u", "1000"]
+    cmd = ["docker", "exec", *(["-i"] if stdin else []), "-u", "1000"]
     if is_microvm(ws):
         return [str(MICROVM), "ssh", ws["WS_NAME"], "--", shlex.join(cmd + ["aio-browser", *args])]
     return cmd + [container(ws["WS_NAME"]), *args]
@@ -2402,6 +2405,95 @@ async def download(ws, req: Request, w):
         if proc.returncode is None:
             proc.kill()
         await proc.wait()
+
+
+# Into the container as gem: the body goes to a hidden temp file next to the
+# target, renamed into place only once it has every byte (an upload cut off
+# ends the stream early too, so the size is what tells), so a broken upload
+# leaves no half file. A file that's there already is only replaced with
+# overwrite=1; folders on the way (an uploaded folder's subfolders) are created.
+UPLOAD_SH = r"""set -eu
+dir=$1 rel=$2 tmp=$3 overwrite=$4 size=$5
+dest="$dir/$rel"
+parent=$(dirname -- "$dest")
+[ -d "$dir" ] || { echo "No such folder: $dir" >&2; exit 2; }
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+  [ -d "$dest" ] && { echo "A folder has that name" >&2; exit 3; }
+  [ "$overwrite" = 1 ] || { echo "exists" >&2; exit 17; }
+fi
+mkdir -p -- "$parent" 2>/dev/null || { echo "Can't create the folder ${parent#$dir/}" >&2; exit 2; }
+[ -w "$parent" ] || { echo "No permission to write in $parent" >&2; exit 2; }
+part="$parent/$tmp"
+trap 'rm -f -- "$part"' EXIT
+cat > "$part"
+got=$(wc -c < "$part")
+[ "$got" -eq "$size" ] || { echo "Upload incomplete ($got of $size bytes)" >&2; exit 4; }
+mv -f -- "$part" "$dest"
+trap - EXIT
+"""
+
+
+def clean_upload_name(rel: str) -> str | None:
+    """A file name, or a relative path (a folder upload): no '..', no empty parts."""
+    parts = rel.split("/")
+    if not rel or len(rel) > 1024 or "\0" in rel or "\n" in rel or len(parts) > 32:
+        return None
+    if any(p in ("", ".", "..") or len(p.encode()) > 255 for p in parts):
+        return None
+    return rel
+
+
+async def upload(name: str, req: Request, reader, w):
+    ws = load_ws(name)
+    if not ws:
+        return await send_json(w, {"error": "No such workspace"}, 404)
+    if is_microvm(ws) and not vm_browser(ws):
+        return await send_json(w, {"error": "This microVM has no browser container (Access tab)"}, 404)
+    folder = clean_container_path(req.query.get("path", ""))
+    rel = clean_upload_name(req.query.get("name", ""))
+    if not folder or not rel:
+        return await send_json(w, {"error": "Bad folder or file name"}, 400)
+    if "chunked" in req.headers.get("transfer-encoding", "").lower():
+        return await send_json(w, {"error": "Uploads need a Content-Length"}, 411)
+    try:
+        length = int(req.headers.get("content-length", ""))
+    except ValueError:
+        return await send_json(w, {"error": "Uploads need a Content-Length"}, 411)
+    if not 0 <= length <= MAX_UPLOAD:
+        return await send_json(w, {"error": f"Files up to {MAX_UPLOAD >> 30} GB (AIO_UPLOAD_MAX_GB)"}, 413)
+    tmp = f".{posixpath.basename(rel)[:200]}.aio-upload-{secrets.token_hex(4)}"
+    overwrite = "1" if req.query.get("overwrite") == "1" else "0"
+    proc = await asyncio.create_subprocess_exec(
+        *sandbox_exec(ws, "sh", "-c", UPLOAD_SH, "sh", folder, rel, tmp, overwrite, str(length), stdin=True),
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    left, broken = length, False
+    try:
+        while left:
+            chunk = await reader.read(min(left, 256 * 1024))
+            if not chunk:
+                raise ConnectionError("upload cut short")
+            left -= len(chunk)
+            if broken:
+                continue            # the command failed: drain the body, then report
+            try:
+                proc.stdin.write(chunk)
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                broken = True
+        proc.stdin.close()
+        err = (await proc.stderr.read()).decode(errors="replace").strip()
+        rc = await proc.wait()
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()             # its trap can't run: remove the temp file ourselves
+            await proc.wait()
+        await run(*sandbox_exec(ws, "sh", "-c", 'rm -f -- "$(dirname -- "$1/$2")/$3"', "sh", folder, rel, tmp))
+        raise
+    if rc == 17:
+        return await send_json(w, {"error": f"{rel} already exists", "exists": True}, 409)
+    if rc != 0:
+        return await send_json(w, {"error": err.splitlines()[-1] if err else f"Upload failed ({rc})"}, 500)
+    return await send_json(w, {"ok": True, "path": posixpath.join(folder, rel), "size": length})
 
 
 # --------------------------------------------------------------- terminal (WebSocket <-> tmux)

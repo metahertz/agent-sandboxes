@@ -257,8 +257,17 @@
           <button class="btn ghost" data-jump="/home/gem/workspace/Downloads">Downloads</button>
           <button class="btn ghost" data-jump="/home/gem">Home</button>
           <button class="btn" id="f-zip">Download folder (.tar)</button>
+          <button class="btn" id="f-upload" title="Upload files into this folder (or drop them on the list)">Upload files</button>
+          <button class="btn" id="f-upload-dir" title="Upload a folder, with its subfolders, into this folder">Upload folder</button>
+          <input type="file" id="f-pick" multiple hidden>
+          <input type="file" id="f-pick-dir" webkitdirectory hidden>
         </div>
-        <div class="files-wrap">
+        <div class="upload-bar" id="f-progress" hidden>
+          <span id="f-progress-text"></span>
+          <progress id="f-progress-bar" max="1" value="0"></progress>
+          <button class="btn ghost" type="button" id="f-cancel">Cancel</button>
+        </div>
+        <div class="files-wrap" id="f-drop">
           <table class="files">
             <thead><tr><th>Name</th><th class="num">Size</th><th>Modified</th><th></th></tr></thead>
             <tbody id="f-body"></tbody>
