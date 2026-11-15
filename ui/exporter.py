@@ -36,7 +36,7 @@ from common import NONO_LOGS  # noqa: E402
 NONO_STATE = Path.home() / ".local" / "state" / "nono"
 CGROUP_APP = Path(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/"
                   f"user@{os.getuid()}.service/app.slice")
-SCOPE_RE = re.compile(r"^claude-(.+)-\d+\.scope$")
+SCOPE_RE = re.compile(r"^(?:claude|hermes)-(.+)-\d+\.scope$")   # bin/claude-in's, either agent
 VM_UNIT_RE = re.compile(r"^aio-vm-(.+)\.service$")    # bin/microvm's systemd --user units
 INTERVAL = float(os.environ.get("AIO_EXPORTER_INTERVAL", "15"))
 DU_EVERY = 300                       # seconds between workspace disk-usage scans
@@ -113,7 +113,7 @@ def kv_file(p: Path) -> dict[str, int]:
 
 
 def claude_scopes() -> dict[str, dict[str, int]]:
-    """Sum the cgroup usage of each workspace's claude-<ws>-<pid>.scope(s)."""
+    """Sum the cgroup usage of each workspace's <agent>-<ws>-<pid>.scope(s)."""
     usage: dict[str, dict[str, int]] = {}
     try:
         scopes = list(CGROUP_APP.iterdir())

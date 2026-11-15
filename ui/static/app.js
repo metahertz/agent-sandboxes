@@ -40,6 +40,9 @@ const wsPath = (name, rest = "") => `workspaces/${encodeURIComponent(name)}${res
 
 const CONTAINER_TONE = { running: "ok", restarting: "warn", created: "warn", paused: "warn", exited: "bad", dead: "bad" };
 const CLAUDE_TONE = { running: "ok", exited: "warn" };
+const GATEWAY_TONE = { running: "ok", failed: "bad" };
+const AGENT_NAME = { claude: "Claude", hermes: "Hermes" };
+const agentName = (w) => AGENT_NAME[w?.agent] || "Claude";
 
 async function refresh() {
   try {
@@ -69,12 +72,13 @@ function renderList() {
     b.setAttribute("aria-current", String(state.view === "ws" && w.name === state.selected));
     b.innerHTML = `<span class="n"></span><span class="dots"><span class="dot" title="container"></span><span class="dot" title="Claude"></span></span><span class="sub"></span>`;
     $(".n", b).textContent = w.name;
-    $(".sub", b).textContent = w.dir.replace(/^\/home\/[^/]+/, "~") + (w.kind === "microvm" ? " · microVM" : "");
+    $(".sub", b).textContent = w.dir.replace(/^\/home\/[^/]+/, "~") + (w.kind === "microvm" ? " · microVM" : "")
+      + (w.agent === "hermes" ? " · Hermes" : "");
     const [dc, dl] = $$(".dot", b);
     dc.classList.add(CONTAINER_TONE[w.container] || "none");
     dc.title = `${w.kind === "microvm" ? "VM" : "Container"}: ${w.container}`;
     dl.classList.add(CLAUDE_TONE[w.claude] || "none");
-    dl.title = `Claude: ${w.claude}`;
+    dl.title = `${agentName(w)}: ${w.claude}`;
     b.addEventListener("click", () => select(w.name));
     list.append(b);
   }
@@ -101,7 +105,10 @@ function renderDetail() {
   $("#d-dir").textContent = w.dir;
   $$(".d-dir-inline").forEach((el) => (el.textContent = w.dir));
   const vm = w.kind === "microvm";
+  const agent = agentName(w);
   $("#detail").classList.toggle("is-vm", vm);
+  $("#detail").classList.toggle("is-hermes", w.agent === "hermes");
+  $$("#detail .agent-name").forEach((e) => (e.textContent = agent));
   $("#d-port-label").textContent = vm ? "microVM, slot" : "sandbox port";
   $("#d-port").textContent = w.port;
   $("#d-runtime").textContent = vm ? "VM" : "Container";
@@ -110,8 +117,17 @@ function renderDetail() {
   const views = !vm || w.browser;
   for (const tab of VM_HIDDEN_TABS) $(`.tabs [data-tab="${tab}"]`).hidden = !views;
   if (!views && VM_HIDDEN_TABS.includes(state.tab)) selectTab("claude");
-  setPill($("#d-claude"), "Claude", w.claude, CLAUDE_TONE[w.claude]);
+  setPill($("#d-claude"), agent, w.claude, CLAUDE_TONE[w.claude]);
   $("#d-pending").hidden = !w.policyPending;
+  // Hermes' gateway (a VM's state comes from GET .../gateway: an ssh round trip)
+  const gw = w.gateway === "unknown" ? gatewayState[w.name] : w.gateway;
+  $("#d-gateway").hidden = w.agent !== "hermes";
+  if (w.agent === "hermes") {
+    setPill($("#d-gateway"), "gateway", gw || "…", GATEWAY_TONE[gw]);
+    if (w.gateway === "unknown" && !(w.name in gatewayState)) fetchGateway(w);
+    $('[data-act="gateway/start"]').disabled = gw === "running";
+    $('[data-act="gateway/stop"]').disabled = gw === "stopped";
+  }
 
   const up = w.container === "running";
   for (const b of $$('[data-act="container/start"]')) b.disabled = up;
@@ -125,9 +141,9 @@ function renderDetail() {
   const overlay = $("#term-overlay");
   overlay.hidden = w.claude !== "stopped";
   $("#term-overlay-msg").textContent = up
-    ? "Claude isn't running in this workspace."
-    : vm ? "Claude isn't running. Start the VM first: Claude runs inside it."
-      : "Claude isn't running. Start the container first so it can use the browser.";
+    ? `${agent} isn't running in this workspace.`
+    : vm ? `${agent} isn't running. Start the VM first: ${agent} runs inside it.`
+      : `${agent} isn't running. Start the container first so it can use the browser.`;
   if (state.tab === "claude" && w.claude !== "stopped") ensureTerm(w);
   if (w.claude === "stopped" && term.for === w.name) disconnectTerm();
 
@@ -182,8 +198,22 @@ const VM_HIDDEN_TABS = ["browser", "vscode", "shell", "files"];
 
 const ACT_LABEL = {
   "container/start": "Starting container…", "container/stop": "Stopping container…",
-  "claude/start": "Starting Claude…", "claude/restart": "Restarting Claude…", "claude/stop": "Stopping Claude…",
+  "claude/start": "Starting {}…", "claude/restart": "Restarting {}…", "claude/stop": "Stopping {}…",
+  "gateway/start": "Starting the gateway (in a VM, the first start installs Hermes: minutes)…",
+  "gateway/stop": "Stopping the gateway…",
 };
+
+// microVM workspaces' gateway states, fetched on demand
+const gatewayState = {};
+async function fetchGateway(w) {
+  gatewayState[w.name] = "…";
+  try {
+    gatewayState[w.name] = (await api("GET", wsPath(w.name, "/gateway"))).state;
+  } catch (e) {
+    gatewayState[w.name] = "unknown";
+  }
+  if (current()?.name === w.name) renderDetail();
+}
 
 document.addEventListener("click", async (ev) => {
   const btn = ev.target.closest("[data-act]");
@@ -193,10 +223,11 @@ document.addEventListener("click", async (ev) => {
   const act = btn.dataset.act;
   $$("[data-act]").forEach((b) => (b.disabled = true));
   msg(w.kind === "microvm" && act.startsWith("container/")
-    ? (act === "container/start" ? "Starting VM…" : "Stopping VM…") : ACT_LABEL[act] || "Working…");
+    ? (act === "container/start" ? "Starting VM…" : "Stopping VM…") : (ACT_LABEL[act] || "Working…").replace("{}", agentName(w)));
   try {
     await api("POST", wsPath(w.name, `/${act}`));
-    msg("");
+    msg(act === "gateway/start" ? "Gateway started; its output is in the Logs tab." : "");
+    if (act.startsWith("gateway/") || act.startsWith("container/")) delete gatewayState[w.name];
     if (act.startsWith("claude/")) disconnectTerm();
     if (act !== "claude/stop" && act.startsWith("claude/")) selectTab("claude");
   } catch (e) {
@@ -210,7 +241,7 @@ $("#remove-btn").addEventListener("click", () => {
   $("#rm-name").textContent = w.name;
   $("#rm-dir").textContent = w.dir;
   $("#rm-what").textContent = w.kind === "microvm"
-    ? "VM and its disk (Claude's login there, Docker images, anything outside /project)" : "container and its key";
+    ? `VM and its disk (${agentName(w)}'s login there, Docker images, anything outside /project)` : "container and its key";
   $("#remove-confirm").hidden = false;
 });
 const hideConfirm = () => ($("#remove-confirm").hidden = true);
@@ -243,6 +274,9 @@ $("#new-toggle").addEventListener("click", () => {
 newForm.elements.kind.addEventListener("change", () => {
   $("#new-kind-hint").hidden = newForm.elements.kind.value !== "microvm";
 });
+newForm.elements.agent.addEventListener("change", () => {
+  $("#new-agent-hint").hidden = newForm.elements.agent.value !== "hermes";
+});
 $("#new-cancel").addEventListener("click", () => {
   newForm.hidden = true;
   $("#new-toggle").hidden = false;
@@ -253,6 +287,7 @@ newForm.addEventListener("submit", async (ev) => {
   const name = newForm.elements.name.value.trim();
   const dir = newForm.elements.dir.value.trim();
   const kind = newForm.elements.kind.value;
+  const agent = newForm.elements.agent.value;
   const out = $("#new-msg");
   out.classList.remove("err");
   out.textContent = kind === "microvm"
@@ -260,15 +295,18 @@ newForm.addEventListener("submit", async (ev) => {
     : "Creating workspace and starting its container…";
   $$("button", newForm).forEach((b) => (b.disabled = true));
   try {
-    const res = await api("POST", "workspaces", { name, dir: dir || undefined, kind });
+    const res = await api("POST", "workspaces", { name, dir: dir || undefined, kind, agent });
     newForm.reset();
     $("#new-kind-hint").hidden = true;
+    $("#new-agent-hint").hidden = true;
     newForm.hidden = true;
     $("#new-toggle").hidden = false;
     out.textContent = "";
     await refresh();
     select(res.name);
-    msg(res.notes?.length ? res.notes.join(" · ") : `Created ${res.name}. Start Claude when you're ready.`);
+    msg(res.notes?.length ? res.notes.join(" · ") : agent === "hermes"
+      ? `Created ${res.name}. Pick its model provider in the Access tab, then start Hermes.`
+      : `Created ${res.name}. Start Claude when you're ready.`);
   } catch (e) {
     out.classList.add("err");
     out.textContent = e.message;
@@ -775,8 +813,16 @@ async function loadLogs() {
   $("#logs").textContent = "Loading…";
   try {
     const { log } = await api("GET", wsPath(w.name, "/logs"));
+    let text = log || "(no output)";
+    if (w.agent === "hermes") {
+      try {
+        const g = await api("GET", wsPath(w.name, "/gateway"));
+        gatewayState[w.name] = g.state;
+        text += `\n\n──── Hermes gateway (${g.state}) ────\n${g.log || "(no output)"}`;
+      } catch (e) { text += `\n\n──── Hermes gateway ────\n${e.message}`; }
+    }
     const el = $("#logs");
-    el.textContent = log || "(no output)";
+    el.textContent = text;
     el.scrollTop = el.scrollHeight;
   } catch (e) {
     $("#logs").textContent = e.message;
@@ -832,6 +878,14 @@ async function loadAccess() {
     form.elements.browser_memory.value = policy.limits.browser_memory || "";
     form.elements.browser_cpus.value = policy.limits.browser_cpus || "";
     form.elements.claude_md.checked = policy.claude_md;
+    const llm = $("#acc-hermes-llm");
+    llm.replaceChildren(el("option", { value: "", textContent: "No token: a server URL (below)" }),
+      ...pool.tokens.filter((t) => LLM_SERVICES.includes(t.service)).map((t) =>
+        el("option", { value: t.id, textContent: `${t.id} (${t.label})` })));
+    llm.value = policy.hermes?.llm || "";
+    form.elements.hermes_model.value = policy.hermes?.model || "";
+    form.elements.hermes_base_url.value = policy.hermes?.base_url || "";
+    $("#acc-hermes-url").hidden = !!llm.value;
     form.elements.vm_browser.checked = !!policy.vm_browser;
     form.elements.container.value = policy.network.container;
     $("#acc-restart").hidden = w.claude === "stopped";
@@ -857,19 +911,22 @@ async function saveAccess(restart) {
       browser_memory: form.elements.browser_memory.value.trim(), browser_cpus: Number(form.elements.browser_cpus.value || 0) },
     claude_md: form.elements.claude_md.checked,
     vm_browser: form.elements.vm_browser.checked,
+    hermes: { llm: form.elements.hermes_llm.value, model: form.elements.hermes_model.value.trim(),
+      base_url: form.elements.hermes_base_url.value.trim() },
   };
   out.textContent = "Saving…";
   try {
     const res = await api("PUT", wsPath(w.name, "/policy"), body);
     if (restart) {
-      out.textContent = `Saved.${res.notes?.length ? ` ${res.notes.join(" ")}` : ""} Restarting Claude…`;
+      out.textContent = `Saved.${res.notes?.length ? ` ${res.notes.join(" ")}` : ""} Restarting ${agentName(w)}…`;
       await api("POST", wsPath(w.name, "/claude/restart"));
       disconnectTerm();
-      out.textContent = "Saved and Claude restarted with the new policy.";
+      out.textContent = `Saved and ${agentName(w)} restarted with the new policy.`
+        + (w.gateway === "running" ? " Restart the gateway too (Stop, Start) for it." : "");
     } else {
       out.textContent = (res.pending
-        ? "Saved. SSH key changes are live; restart Claude for the rest."
-        : w.claude === "stopped" ? "Saved. Applies when Claude starts." : "Saved and applied.")
+        ? `Saved. SSH key changes are live; restart ${agentName(w)} for the rest.`
+        : w.claude === "stopped" ? `Saved. Applies when ${agentName(w)} starts.` : "Saved and applied.")
         + (res.notes?.length ? ` ${res.notes.join(" ")}` : "");
     }
   } catch (e) {
@@ -879,6 +936,9 @@ async function saveAccess(restart) {
   await refresh();
 }
 $("#access-form").addEventListener("submit", (ev) => { ev.preventDefault(); saveAccess(false); });
+// Pool token services Hermes can use as its model provider
+const LLM_SERVICES = ["openrouter", "openai", "custom"];
+$("#acc-hermes-llm").addEventListener("change", (ev) => ($("#acc-hermes-url").hidden = !!ev.target.value));
 $("#acc-restart").addEventListener("click", () => saveAccess(true));
 
 // ------------------------------------------------------------------ keys & tokens pool
@@ -902,7 +962,7 @@ function renderMatrix(table, kind, items, describe) {
         cb.disabled = true;
         try {
           await api("PUT", `pool/${kind}/${encodeURIComponent(it.id)}/workspaces`, { workspaces: want });
-          poolMsg(kind === "ssh" ? `${it.id}: applied to running sessions.` : `${it.id}: restart Claude in ${n} to apply.`);
+          poolMsg(kind === "ssh" ? `${it.id}: applied to running sessions.` : `${it.id}: restart the agent in ${n} to apply.`);
         } catch (e) {
           cb.checked = !cb.checked;
           poolMsg(e.message, true);
@@ -943,14 +1003,61 @@ async function loadPool() {
     return poolMsg(e.message, true);
   }
   renderMatrix($("#m-ssh"), "ssh", poolData.ssh, (k) => `${k.type} ${k.fingerprint} · ${k.comment}`);
-  renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => `${t.label} (${t.upstream}) → $${t.env_var}`
-    + (t.upstream.startsWith("http://") ? ` · call it via $${baseUrlVar(t.id)}` : ""));
+  renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => t.service === "google"
+    ? `${t.label} → $${baseUrlVar(t.id)} · ${t.detail}`
+    : `${t.label} (${t.upstream}) → $${t.env_var}` + (t.upstream.startsWith("http://") ? ` · call it via $${baseUrlVar(t.id)}` : ""));
   const sel = $("#tok-service");
   if (!sel.options.length) {
     for (const [k, v] of Object.entries(poolData.services)) sel.append(el("option", { value: k, textContent: `${v.label} → $${v.env_var}` }));
     sel.append(el("option", { value: "custom", textContent: "Custom HTTP(S) API…" }));
+    sel.append(el("option", { value: "google", textContent: "Google (Gmail, Calendar): a grant on a connected account…" }));
   }
 }
+
+// ---- Google grants in the token form
+
+let googleData = null;
+
+async function showGoogleFields(on) {
+  $("#tok-google").hidden = !on;
+  $("#tok-secret").hidden = on;
+  $("#add-tokens").elements.secret.required = !on;
+  if (!on) return;
+  try {
+    googleData = await api("GET", "google");
+  } catch (e) {
+    $("#tok-g-detail").textContent = e.message;
+    return;
+  }
+  const acc = $("#tok-g-account");
+  acc.replaceChildren(...googleData.accounts.map((a) => el("option", { value: a.id, textContent: `${a.email} (${a.scopes.join(", ")})` })));
+  if (!googleData.accounts.length) acc.append(el("option", { value: "", textContent: "None yet: connect one under Settings" }));
+  const pre = $("#tok-g-preset");
+  if (!pre.options.length) {
+    for (const [k, v] of Object.entries(googleData.presets)) pre.append(el("option", { value: k, textContent: v.label }));
+  }
+  googlePresetChanged();
+}
+
+async function googlePresetChanged() {
+  const p = googleData?.presets[$("#tok-g-preset").value];
+  if (!p) return;
+  $("#tok-g-detail").textContent = `${p.detail} Needs the account connected with ${p.scope}.`;
+  $("#tok-g-label-wrap").hidden = !p.needsLabel;
+  const aid = $("#tok-g-account").value;
+  if (!p.needsLabel || !aid) return;
+  const sel = $("#tok-g-label");
+  sel.replaceChildren(el("option", { value: "", textContent: "Loading labels…" }));
+  try {
+    const { labels } = await api("GET", `google/accounts/${encodeURIComponent(aid)}/labels`);
+    sel.replaceChildren(...labels.sort((a, b) => a.name.localeCompare(b.name))
+      .map((l) => el("option", { value: l.id, textContent: l.name === l.id ? l.name : `${l.name} (${l.id})` })));
+  } catch (e) {
+    sel.replaceChildren(el("option", { value: "", textContent: e.message }));
+  }
+}
+$("#tok-g-preset").addEventListener("change", googlePresetChanged);
+$("#tok-g-account").addEventListener("change", googlePresetChanged);
 
 $$("[data-add]").forEach((b) => b.addEventListener("click", () => {
   const f = $(`#add-${b.dataset.add}`);
@@ -969,7 +1076,10 @@ $("#add-ssh").addEventListener("change", (ev) => {
 // nono's route for a pool token; http:// APIs can only be reached through it
 const baseUrlVar = (id) => `POOL_${id.replace(/-/g, "_").toUpperCase()}_BASE_URL`;
 
-$("#tok-service").addEventListener("change", (ev) => ($("#tok-custom").hidden = ev.target.value !== "custom"));
+$("#tok-service").addEventListener("change", (ev) => {
+  $("#tok-custom").hidden = ev.target.value !== "custom";
+  showGoogleFields(ev.target.value === "google");
+});
 
 async function submitAdd(form, path, body) {
   const out = $(".form-msg", form);
@@ -981,6 +1091,7 @@ async function submitAdd(form, path, body) {
     form.hidden = true;
     out.textContent = "";
     $("#tok-custom").hidden = true;
+    if (form.id === "add-tokens") showGoogleFields(false);
     form.elements.private_key && (form.elements.private_key.hidden = true);
     poolMsg(res.public ? `Added ${res.id}. Public key: ${res.public}` : `Added ${res.id}.`);
     loadPool();
@@ -1000,9 +1111,12 @@ $("#add-tokens").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const f = ev.currentTarget.elements;
   const service = f.service.value;
+  const label = $("#tok-g-label");
   submitAdd(ev.currentTarget, "pool/tokens", { id: f.id.value.trim(), service, secret: f.secret.value,
     custom: service === "custom" ? { upstream: f.upstream.value.trim(), header: f.header.value.trim(),
-      format: f.format.value.trim(), env_var: f.env_var.value.trim() } : undefined });
+      format: f.format.value.trim(), env_var: f.env_var.value.trim() } : undefined,
+    google: service === "google" ? { account: f.g_account.value, preset: f.g_preset.value,
+      label: label.value, label_name: label.selectedOptions[0]?.textContent || "" } : undefined });
 });
 
 // ------------------------------------------------------------------ SSH access keys (shared widget)
@@ -1313,11 +1427,81 @@ $("#auth-logout-others").addEventListener("click", async () => {
   loadAuth();
 });
 
+// ---- Settings: Google accounts (OAuth client, connected accounts)
+
+function gMsg(text, isErr = false) {
+  $("#g-msg").textContent = text;
+  $("#g-msg").classList.toggle("err", isErr);
+}
+
+async function loadGoogle() {
+  let g;
+  try { g = await api("GET", "google"); } catch (e) { return gMsg(e.message, true); }
+  $("#g-client-state").textContent = g.client ? `OAuth client: ${g.clientId}` : "No OAuth client yet.";
+  $("#g-client-form").elements.client_id.value = g.clientId || "";
+  $("#g-redirect").textContent = g.redirect;
+  $("#g-connect-form").hidden = !g.client;
+  const rows = g.accounts.map((a) => {
+    const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Disconnect" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Disconnect ${a.email}? Google revokes this app's access, and its grants are removed from every workspace.`)) return;
+      try { await api("DELETE", `google/accounts/${encodeURIComponent(a.id)}`); gMsg(`Disconnected ${a.email}.`); }
+      catch (e) { gMsg(e.message, true); }
+      loadGoogle();
+    });
+    return el("div", { className: "keyrow" },
+      el("div", {}, el("strong", { textContent: a.email || a.id }),
+        el("div", { className: "muted mono", textContent: `${a.id} · ${a.scopes.join(", ") || "no API scopes"}` })), del);
+  });
+  if (!rows.length) rows.push(el("p", { className: "muted", textContent: "No Google accounts connected." }));
+  $("#g-accounts").replaceChildren(...rows);
+  const box = $("#g-scopes");
+  if (!box.children.length) {
+    box.append(...g.scopes.map((sc) => el("label", { className: "check" },
+      el("input", { type: "checkbox", name: "scope", value: sc, checked: sc === "gmail.readonly" }),
+      el("span", { textContent: sc }))));
+  }
+}
+
+let googleConnectState = "";
+$("#g-client-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.currentTarget.elements;
+  try {
+    await api("PUT", "google/client", { client_id: f.client_id.value.trim(), client_secret: f.client_secret.value.trim() });
+    f.client_secret.value = "";
+    gMsg("OAuth client saved.");
+  } catch (e) { gMsg(e.message, true); }
+  loadGoogle();
+});
+$("#g-connect-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const scopes = $$('#g-scopes input:checked').map((i) => i.value);
+  try {
+    const r = await api("POST", "google/connect", { scopes });
+    googleConnectState = r.state;
+    window.open(r.url, "_blank", "noopener");
+    $("#g-finish").hidden = false;
+    gMsg("Allow access in the Google tab, then paste the address it ends on below.");
+  } catch (e) { gMsg(e.message, true); }
+});
+$("#g-finish-btn").addEventListener("click", async () => {
+  const f = $("#g-connect-form").elements;
+  try {
+    const r = await api("POST", "google/finish", { url: f.url.value.trim() });
+    f.url.value = "";
+    $("#g-finish").hidden = true;
+    gMsg(`Connected ${r.email} (${r.scopes.join(", ") || "no API scopes granted"}). Create grants for it under Keys & tokens.`);
+  } catch (e) { gMsg(e.message, true); }
+  loadGoogle();
+});
+
 async function loadSettings() {
   loadAuth();
   try {
     const st = await api("GET", "settings/monitoring");
     loadClaudeMd();
+    loadGoogle();
     loadBackup(true);
     renderMonStatus(st);
     fillMonForm(st);

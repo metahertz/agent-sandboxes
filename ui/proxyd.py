@@ -4,7 +4,9 @@
 The parts of the workspaces' network paths that run outside nono, kept out
 of the web UI so that restarting the UI doesn't cut Claude's or the
 containers' connections:
-  - the HTTP API bridge (127.0.0.2:7100), for tokens on plain-HTTP APIs;
+  - the HTTP API bridge (127.0.0.2:7100), for tokens on plain-HTTP APIs, and
+    for Google grants whose checks need more than nono's endpoint rules
+    (ui/gbroker.py: one Gmail label), which it sends on to Google over TLS;
   - each workspace's port filter (127.0.0.1:<sandbox port - 1000>), nono's
     upstream_proxy when the allowlist has host:port entries;
   - for Container network "Same as Claude": the container's nono proxy on
@@ -31,6 +33,7 @@ import os
 import re
 import signal
 import socket
+import ssl
 import sys
 import time
 import urllib.parse
@@ -42,6 +45,11 @@ from common import (CONTAINER_PROXY_PORT, HTTP_BRIDGE, MAX_HEAD, NAME_RE, NONO_L
                     container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
                     load_policy, load_ws, parse_net_entry, proxyd_source_version, token_meta, unsafe_ip,
                     vm_browser, vm_cid, vm_proxy_port, wants_ws_proxy)
+import gbroker  # noqa: E402
+
+BROKER_LOG = NONO_LOGS.parent / "google-broker.log"   # one JSON line per decision (no tokens, no query values)
+BROKER_HOSTS = {"gmail.googleapis.com", "www.googleapis.com"}
+TLS = ssl.create_default_context()
 
 
 VERSION = proxyd_source_version()
@@ -90,8 +98,9 @@ def egress_allowed(name: str, host: str, port: int) -> bool:
     return not hits or any(not lo or lo <= port <= hi for _, lo, hi in hits)
 
 
-async def egress_connect(host: str, port: int):
-    """Like nono, never this host or link-local, also when a name resolves there."""
+async def egress_connect(host: str, port: int, tls: bool = False):
+    """Like nono, never this host or link-local, also when a name resolves there.
+    tls: verified TLS to host (the bridge's Google requests)."""
     infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
     addrs = [i for i in infos if not unsafe_ip(ipaddress.ip_address(i[4][0].split("%")[0]))]
     if not addrs:
@@ -99,7 +108,8 @@ async def egress_connect(host: str, port: int):
     err = None
     for family, _, _, _, sockaddr in addrs:
         try:
-            return await asyncio.wait_for(asyncio.open_connection(sockaddr[0], port), 15)
+            return await asyncio.wait_for(asyncio.open_connection(
+                sockaddr[0], port, **({"ssl": TLS, "server_hostname": host} if tls else {})), 15)
         except (OSError, asyncio.TimeoutError) as e:
             err = e
     raise OSError(str(err))
@@ -202,6 +212,53 @@ async def copy_body(reader, writer, headers: dict[str, str]):
     await writer.drain()
 
 
+def send_json_error(w, status: int, reason: str, msg: str):
+    body = json.dumps({"error": {"code": status, "message": msg}}).encode()
+    w.write(f"HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+
+
+async def read_response(up_r, method: str, limit: int = 1 << 20) -> tuple[int, bytes]:
+    """A whole (small) response: status and body."""
+    class Buf:
+        def __init__(self):
+            self.data = bytearray()
+
+        def write(self, b):
+            self.data += b
+            if len(self.data) > limit:
+                raise ValueError("response too large")
+
+        async def drain(self):
+            pass
+    while True:
+        resp = await asyncio.wait_for(up_r.readuntil(b"\r\n\r\n"), 60)
+        if not re.match(rb"HTTP/1\.[01] 1\d\d", resp):
+            break
+    rlines = resp[:-4].decode("latin-1").split("\r\n")
+    rheaders = {k.strip().lower(): v.strip() for k, _, v in (x.partition(":") for x in rlines[1:])}
+    buf = Buf()
+    if method != "HEAD":
+        if "content-length" in rheaders or "chunked" in rheaders.get("transfer-encoding", "").lower():
+            await asyncio.wait_for(copy_body(up_r, buf, rheaders), 60)
+        else:
+            while data := await up_r.read(65536):
+                buf.write(data)
+    return int(rlines[0].split()[1]), bytes(buf.data)
+
+
+async def broker_lookup(host: str, auth: str, target: str) -> tuple[int, bytes]:
+    """One GET to Google for the broker's own check (a message's labels)."""
+    up_r, up_w = await egress_connect(host, 443, tls=True)
+    try:
+        up_w.write((f"GET {target} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {auth}\r\n"
+                    "Accept: application/json\r\nConnection: close\r\n\r\n").encode("latin-1"))
+        await up_w.drain()
+        return await read_response(up_r, "GET")
+    finally:
+        up_w.close()
+
+
 async def handle_bridge(reader, w):
     up_w = None
     try:
@@ -209,20 +266,42 @@ async def handle_bridge(reader, w):
         lines = head[:-4].decode("latin-1").split("\r\n")
         m = re.match(r"^([A-Z]+) /([a-z0-9][a-z0-9-]{0,39})(/[^ ]*)? HTTP/1\.[01]$", lines[0])
         meta = token_meta(m[2]) if m else None
-        if not meta or not meta.get("upstream", "").startswith("http://"):
+        broker = bool(meta and meta.get("service") == "google" and meta.get("broker"))
+        if not meta or not (broker or meta.get("upstream", "").startswith("http://")):
             w.write(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
             return
         target = urllib.parse.urlsplit(meta["upstream"])
+        path = m[3] or "/"
         headers = {}
-        out = [f"{m[1]} {m[3] or '/'} HTTP/1.1", f"Host: {target.netloc}"]
         for line in lines[1:]:
             k, _, v = line.partition(":")
             headers[k.strip().lower()] = v.strip()
-            if k.strip().lower() not in HOP_HEADERS:
+        if broker:
+            # A Google grant narrower than nono's rules can say: check, maybe
+            # look the message up, then send it on over TLS (nono added the token)
+            if target.hostname not in BROKER_HOSTS or target.scheme != "https":
+                send_json_error(w, 502, "Bad Gateway", "grant has an unexpected upstream")
+                return
+            log = {"grant": m[2], "method": m[1], "path": path.partition("?")[0]}
+            decision = gbroker.check_request(meta, m[1], path)
+            if decision[0] == "verify":
+                status, body = await broker_lookup(target.hostname, headers.get("authorization", ""), decision[2])
+                if status != 200 or not gbroker.lookup_allows(meta, decision[3], body):
+                    decision = ("deny", "not in this grant's label" if status == 200
+                                else f"lookup failed ({status})")
+            if decision[0] == "deny":
+                gbroker.audit({**log, "decision": "deny", "reason": decision[1]}, BROKER_LOG)
+                send_json_error(w, 403, "Forbidden", f"agent-sandboxes Google grant '{m[2]}': {decision[1]}")
+                return
+            gbroker.audit({**log, "decision": "allow"}, BROKER_LOG)
+            path = decision[1]
+        out = [f"{m[1]} {path} HTTP/1.1", f"Host: {target.netloc}"]
+        for line in lines[1:]:
+            if line.partition(":")[0].strip().lower() not in HOP_HEADERS:
                 out.append(line)
         out.append("Connection: close")
         try:
-            up_r, up_w = await egress_connect(target.hostname, target.port or 80)
+            up_r, up_w = await egress_connect(target.hostname, target.port or (443 if broker else 80), tls=broker)
         except OSError as e:
             w.write(f"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\nX-Bridge-Error: {e}\r\n\r\n"
                     .encode("latin-1", "replace"))
@@ -250,7 +329,8 @@ async def handle_bridge(reader, w):
                 w.write(data)
                 await w.drain()
         await w.drain()
-    except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
+    except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError,
+            ssl.SSLError):
         pass
     finally:
         if up_w:

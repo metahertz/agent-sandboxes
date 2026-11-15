@@ -29,12 +29,19 @@
       <label>Project folder <span class="muted">(optional)</span>
         <input name="dir" placeholder="~/projects/my-app" autocomplete="off">
       </label>
-      <label>Type
-        <select name="kind">
-          <option value="sandbox">Sandbox: Claude under nono, plus a browser container</option>
-          <option value="microvm">MicroVM: Claude with root and Docker, in a VM</option>
+      <label>Agent
+        <select name="agent">
+          <option value="claude">Claude Code</option>
+          <option value="hermes">Hermes Agent (Nous Research): its own model provider, optional messaging gateway</option>
         </select>
       </label>
+      <label>Type
+        <select name="kind">
+          <option value="sandbox">Sandbox: the agent under nono, plus a browser container</option>
+          <option value="microvm">MicroVM: the agent with root and Docker, in a VM</option>
+        </select>
+      </label>
+      <p class="hint muted" id="new-agent-hint" hidden>Hermes starts with network access to LLM provider APIs only. Give it a model provider in the Access tab (an OpenRouter token, or your own OpenAI-compatible server). Sandbox type: run <code>bin/install-hermes</code> on the host once. MicroVM: Hermes installs itself in the VM on first start.</p>
       <p class="hint muted" id="new-kind-hint" hidden>A VM with no network interface: it reaches only this workspace's allowlist, through its proxy on the host. Only the project folder is shared in (at <code>/project</code>). The browser container is optional (Access tab).</p>
       <div class="row">
         <button class="btn primary" type="submit">Create</button>
@@ -74,7 +81,8 @@
         <div class="status">
           <span class="pill" id="d-container"></span>
           <span class="pill" id="d-claude"></span>
-          <span class="pill warn" id="d-pending" hidden title="Access settings changed since Claude started">restart Claude to apply access changes</span>
+          <span class="pill" id="d-gateway" hidden></span>
+          <span class="pill warn" id="d-pending" hidden title="Access settings changed since the agent started">restart <span class="agent-name">Claude</span> to apply access changes</span>
         </div>
       </header>
 
@@ -85,10 +93,15 @@
           <button class="btn" data-act="container/stop">Stop</button>
         </div>
         <div class="group">
-          <span class="group-label">Claude</span>
+          <span class="group-label agent-name">Claude</span>
           <button class="btn primary" data-act="claude/start">Start</button>
           <button class="btn" data-act="claude/restart">Restart</button>
           <button class="btn" data-act="claude/stop">Stop</button>
+        </div>
+        <div class="group hermes-only" title="Hermes' messaging gateway (Telegram and the like): a service that keeps running without the terminal">
+          <span class="group-label">Gateway</span>
+          <button class="btn" data-act="gateway/start">Start</button>
+          <button class="btn" data-act="gateway/stop">Stop</button>
         </div>
         <div class="group end">
           <button class="btn danger ghost" id="remove-btn">Remove…</button>
@@ -104,7 +117,7 @@
       <p class="action-msg" id="action-msg" role="status"></p>
 
       <div class="tabs" role="tablist">
-        <button role="tab" data-tab="claude" aria-selected="true">Claude</button>
+        <button role="tab" data-tab="claude" aria-selected="true" class="agent-name">Claude</button>
         <button role="tab" data-tab="browser">Browser</button>
         <button role="tab" data-tab="vscode">VS Code</button>
         <button role="tab" data-tab="shell">Terminal</button>
@@ -117,7 +130,7 @@
         <div id="term" class="term"></div>
         <div class="overlay" id="term-overlay" hidden>
           <p id="term-overlay-msg"></p>
-          <button class="btn primary" data-act="claude/start">Start Claude</button>
+          <button class="btn primary" data-act="claude/start">Start <span class="agent-name">Claude</span></button>
         </div>
       </div>
 
@@ -215,7 +228,18 @@
               <label>CPUs <input name="browser_cpus" type="number" min="0" placeholder="default: 2" autocomplete="off"></label>
             </div>
           </section>
-          <section class="card sandbox-only">
+          <section class="card hermes-only">
+            <h2>Hermes model</h2>
+            <p class="hint">Hermes' model provider, pinned over its own <code>config.yaml</code> (managed settings). Either an API token from the pool, ticked above (OpenRouter, OpenAI, or a custom OpenAI-compatible API, e.g. your own server over <code>http://</code>, through the bridge): Hermes gets only its placeholder. Or the URL of a server that needs no key, which the network allowlist must let through (e.g. <code>192.168.1.20:11434</code>). Restart Hermes (and its gateway) to apply.</p>
+            <div class="two">
+              <label>Provider <select name="hermes_llm" id="acc-hermes-llm"></select></label>
+              <label>Model <input name="hermes_model" placeholder="e.g. anthropic/claude-sonnet-4.5" autocomplete="off" spellcheck="false"></label>
+            </div>
+            <label id="acc-hermes-url">Server URL <span class="muted">(no key; OpenAI-compatible)</span>
+              <input name="hermes_base_url" placeholder="http://192.168.1.20:11434/v1" autocomplete="off" spellcheck="false"></label>
+            <p class="hint">A Telegram Bot API token ticked above sets up Hermes' Telegram gateway (its token stays a placeholder, swapped into the Bot API's URL by the proxy); who may talk to the bot is Hermes' own setting (<code>TELEGRAM_ALLOWED_USERS</code>, <code>hermes gateway setup</code> in the Hermes tab). Google grants appear above like tokens: create them under Keys &amp; tokens. Hermes reads mail as untrusted input, so keep this workspace's network narrow.</p>
+          </section>
+          <section class="card sandbox-only claude-only">
             <h2>Notes for Claude</h2>
             <label class="check"><input type="checkbox" name="claude_md"> <span>Keep the sandbox notes in this project's <code>CLAUDE.md</code> <span class="muted">(edit them under Settings)</span></span></label>
             <p class="hint">A marked block at the end of the file, refreshed whenever Claude starts and removed when you untick this; the rest of the file is left alone. It's part of the project, so it shows up in git. Whether or not this is on, Claude is told at startup how to call this workspace's API tokens.</p>
@@ -243,7 +267,7 @@
           </section>
           <div class="row sticky-save">
             <button class="btn primary" type="submit">Save</button>
-            <button class="btn" type="button" id="acc-restart" hidden>Save &amp; restart Claude</button>
+            <button class="btn" type="button" id="acc-restart" hidden>Save &amp; restart <span class="agent-name">Claude</span></button>
             <p class="form-msg" id="acc-msg" role="status"></p>
           </div>
         </form>
@@ -327,7 +351,16 @@
               <label>Env var <input name="env_var" placeholder="EXAMPLE_API_KEY"></label>
               <p class="hint">For an <code>http://</code> API, Claude calls <code>$POOL_&lt;NAME&gt;_BASE_URL</code> (e.g. <code>$POOL_GRAFANA_RO_BASE_URL/api/search</code>) instead of the real URL; the token is added on the way and travels unencrypted from this host to the API. HTTPS APIs work at their own URL too.</p>
             </div>
-            <label>Token <input name="secret" type="password" required autocomplete="off"></label>
+            <div id="tok-google" hidden>
+              <div class="row">
+                <label>Google account <select name="g_account" id="tok-g-account"></select></label>
+                <label>Access <select name="g_preset" id="tok-g-preset"></select></label>
+                <label id="tok-g-label-wrap" hidden>Label <select name="g_label" id="tok-g-label"></select></label>
+              </div>
+              <p class="hint" id="tok-g-detail"></p>
+              <p class="hint">The workspace gets a placeholder and a base URL; nono's proxy adds a fresh access token from the account (the refresh token never leaves this host) and refuses every request the access above doesn't cover. Connect accounts under Settings → Google accounts.</p>
+            </div>
+            <label id="tok-secret">Token <input name="secret" type="password" required autocomplete="off"></label>
             <div class="row"><button class="btn primary" type="submit">Add</button>
               <button class="btn ghost" type="button" data-cancel>Cancel</button></div>
             <p class="form-msg" role="status"></p>
@@ -428,6 +461,28 @@
         </section>
       </div>
       <form id="mon-form" class="settings-form">
+        <section class="card" id="google-card">
+          <h2>Google accounts</h2>
+          <p class="hint">For Google grants (Keys &amp; tokens): read-only access to Gmail or Calendar for a workspace, narrower than Google's own scopes. Uses your own OAuth client: in Google Cloud Console, enable the Gmail and Calendar APIs, set up the OAuth consent screen (you as a test user is enough), and create an OAuth client of type <strong>Desktop app</strong>. Its refresh tokens stay in <code>secrets/google/</code> on this host.</p>
+          <form id="g-client-form" class="row">
+            <label>Client ID <input name="client_id" placeholder="….apps.googleusercontent.com" autocomplete="off" spellcheck="false"></label>
+            <label>Client secret <input name="client_secret" type="password" autocomplete="off"></label>
+            <button class="btn" type="submit">Save client</button>
+          </form>
+          <p class="hint" id="g-client-state"></p>
+          <div class="keylist" id="g-accounts"></div>
+          <form id="g-connect-form">
+            <h3>Connect an account</h3>
+            <div class="checks" id="g-scopes"></div>
+            <div class="row"><button class="btn" type="submit">Open Google consent ↗</button></div>
+            <div id="g-finish" hidden>
+              <p class="hint">After you allow access, the browser goes to an address that doesn't load (<code id="g-redirect"></code>…). Copy that whole address from the address bar and paste it here.</p>
+              <div class="row"><input name="url" placeholder="http://127.0.0.1:1/?state=…&amp;code=…" autocomplete="off" spellcheck="false">
+                <button class="btn primary" type="button" id="g-finish-btn">Finish</button></div>
+            </div>
+          </form>
+          <p class="form-msg" id="g-msg" role="status"></p>
+        </section>
         <section class="card" id="ca-card" hidden>
           <div class="card-head"><h2>HTTPS certificate</h2>
             <a class="btn" href="/ca.crt" download="agent-sandboxes-ca.crt">Download CA certificate</a></div>

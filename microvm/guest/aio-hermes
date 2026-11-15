@@ -1,0 +1,34 @@
+#!/bin/bash
+# Inside a microVM workspace: start Hermes Agent, installing it first if this VM
+# doesn't have it yet. Comes on the config disk (/run/aio-config/aio-hermes,
+# run with bash: that disk is mounted noexec), with the host's pin
+# (hermes.lock). The install goes through the workspace's proxy (the hosts it
+# needs are always allowed for Hermes VMs).
+#
+#   aio-hermes [hermes args...]
+#   aio-hermes --install-only       install if needed, then exit (the gateway's start)
+#
+# The web UI's managed settings (model, provider route, the browser's MCP
+# server) are in ~/.aio-hermes, copied in by the host before each start; they
+# win over ~/.hermes/config.yaml key by key.
+set -euo pipefail
+lock=/run/aio-config/hermes.lock
+[[ -r $lock ]] || { echo "No Hermes pin on the config disk: restart the VM from the web UI." >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$lock"
+dir=$HOME/.local/share/hermes-agent
+hermes=$dir/.hermes/bin/hermes
+if [[ ! -x $hermes || $(cat "$dir/.aio-installed" 2>/dev/null) != "$HERMES_COMMIT" ]]; then
+  echo "Installing Hermes $HERMES_TAG in this VM (first start: a few minutes)…"
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL -o "$tmp/install.sh" \
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
+  HERMES_INSTALL_CHANNEL=stable bash "$tmp/install.sh" --commit "$HERMES_COMMIT" --dir "$dir" \
+    --hermes-home "$HOME/.hermes" --non-interactive --skip-browser --skip-computer-use
+  [[ $(git -C "$dir" rev-parse HEAD) == "$HERMES_COMMIT" ]] || { echo "Installed the wrong commit" >&2; exit 1; }
+  echo "$HERMES_COMMIT" > "$dir/.aio-installed"
+fi
+[[ ${1:-} == --install-only ]] && exit 0
+export HERMES_MANAGED_DIR=$HOME/.aio-hermes
+exec "$hermes" "$@"

@@ -1,0 +1,6 @@
+# The Hermes Agent release that Hermes workspaces install: on the host
+# (bin/install-hermes) and in microVMs (microvm/guest/aio-hermes, first start).
+# Bump both lines together; HERMES_COMMIT is the tag's commit, checked after
+# the clone so a moved tag doesn't install something else.
+HERMES_TAG=v0.23.1
+HERMES_COMMIT=b65acf3fdc1d43bd889211ea8e37032974b395a5

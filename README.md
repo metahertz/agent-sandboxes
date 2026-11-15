@@ -82,12 +82,15 @@ flowchart LR
 | `ui/common.py` | Paths, workspace / policy files and network helpers both services use |
 | `bin/sandbox-ui` | UI launcher (systemd `ExecStart`) |
 | `bin/sandbox-ui-cert` | Private, name-constrained CA + server cert in `ui/tls/` |
-| `bin/claude-in <name>` | Claude Code inside nono for one workspace (prepares agent + profile); nono's log goes to `monitoring/data/nono-logs/<name>.log`, outside the sandbox |
+| `bin/claude-in <name>` | The workspace's agent (Claude Code or Hermes) inside nono, or in its VM (prepares agent + profile); `--gateway` starts Hermes' gateway service; nono's log goes to `monitoring/data/nono-logs/<name>.log`, outside the sandbox |
+| `bin/install-hermes`, `hermes.lock`, `opt/hermes/` ✱ | Hermes for sandbox-kind Hermes workspaces: the pinned release, installed read-only for the sandboxes |
+| `ui/gbroker.py`, `bin/google-token` | Google grants: presets, OAuth, the bridge's per-message checks; the access-token helper nono's proxy runs |
+| `secrets/google/` ✱ | Your OAuth client, connected accounts' refresh tokens, cached access tokens (0600; never readable inside nono) |
 | `libexec/ssh-proxy-connect` | SSH `ProxyCommand` through nono's proxy (readable in the sandbox) |
 | `compose.workspace.yaml` | Container template (compose project `aio-<name>`) |
 | `bin/microvm`, `bin/microvm-image`, `microvm/guest/` | MicroVM workspaces: start / stop / ssh a VM (systemd `--user` unit `aio-vm-<name>`); build the base image; the guest's own scripts and units |
 | `vm/base/` ✱, `vm/<name>/` ✱ | The base image; each VM's disk, kernel, ssh key, config disk, QEMU's nono profile, console log |
-| `nono/claude-browser.jsonc` → `~/.config/nono/profiles/` | nono profile |
+| `nono/claude-browser.jsonc`, `nono/hermes-sandbox.jsonc` → `~/.config/nono/profiles/` | nono profiles (Claude's, Hermes') |
 | `nono/aio-env.sh` → `~/.config/nono/hooks/` | nono hook: gives Claude its sandbox port/key |
 | `systemd/agent-sandboxes-ui.service`, `agent-sandboxes-proxy.service` → `/etc/systemd/system/` | Service units (the UI `Wants=` the proxies) |
 | `$XDG_RUNTIME_DIR/agent-sandboxes/proxyd.sock` ✱ | The proxy service's control socket (UI and exporter only) |
@@ -96,7 +99,7 @@ flowchart LR
 | `workspaces/<name>.env` ✱ | Per-workspace folder, port, API key |
 | `workspaces/<name>.policy.json` ✱, `.profile.json` ✱ | Access settings; nono profile last used to start Claude |
 | `secrets/ssh/`, `secrets/tokens/` ✱ | Key / token pool (0600; never readable inside nono) |
-| `state/<name>/` ✱ | Workspace `ssh_config` and `known_hosts` (Claude-writable) |
+| `state/<name>/` ✱ | Workspace `ssh_config` and `known_hosts` (agent-writable); a Hermes workspace's `HERMES_HOME` (`hermes/`) |
 | `$XDG_RUNTIME_DIR/agent-sandboxes/<name>/agent.sock` ✱ | Workspace ssh-agent |
 | `ui/token` ✱, `ui/tls/` ✱, `ui/extra-hostnames` ✱ | Break-glass login token, TLS keys, extra DNS names |
 | `ui/passkeys.json` ✱, `ui/sessions.json` ✱ | Registered passkeys (public keys); signed-in sessions |
@@ -145,6 +148,15 @@ virtualisation and a CPU type that passes `vmx`/`svm` through), then
 sudo apt install qemu-system-x86 virtiofsd mmdebstrap
 sudo usermod -aG kvm $USER
 bin/microvm-image            # as you, from Ubuntu's archive: vm/base/, about 1.5 GB
+```
+
+For Hermes workspaces of the sandbox kind (optional), install the release pinned in
+`hermes.lock` into `opt/hermes/` (Hermes' own installer, at that commit; read-only inside the
+sandboxes), and nono's base profile for it:
+
+```bash
+cp nono/hermes-sandbox.jsonc ~/.config/nono/profiles/
+bin/install-hermes
 ```
 
 Then, on the machine you browse from, import `ui/tls/ca.crt` as a trusted CA (it's also
@@ -300,6 +312,79 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
   Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+
+### Hermes workspaces
+
+A workspace runs either Claude Code or [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+(Nous Research). You pick the agent when you create it, and it can't be changed later.
+Hermes gets the same isolation as Claude, in either kind:
+
+- **Files:** under nono, the project folder and its own `HERMES_HOME`
+  (`state/<name>/hermes`: memory, skills, sessions, its `.env`). The install in `opt/hermes`
+  is read-only. In a microVM, Hermes installs itself in the VM on first start (the hosts
+  that needs are always allowed for Hermes VMs).
+- **Network:** the workspace's allowlist. A new Hermes workspace starts with *minimal*
+  (LLM provider APIs only), because an agent that reads mail or chats with people on
+  Telegram is exposed to prompt injection, and every allowed host is a way out.
+- **Model:** the Access tab's *Hermes model* card. Either a pool token (OpenRouter, OpenAI,
+  or a custom OpenAI-compatible API such as your own server over `http://`, through the
+  bridge), of which Hermes sees only the placeholder. Or the URL of a server that needs no
+  key, which the allowlist must let through.
+- **Managed settings:** these are written to a Hermes *managed scope* (`HERMES_MANAGED_DIR`,
+  read-only in the sandbox). They win over Hermes' own `config.yaml` key by key: the model
+  and its route, the terminal backend (`local`: the agent's commands run in the same
+  sandbox), and the AIO container as the `aio-sandbox` MCP server (Hermes' browser). The
+  sandbox notes reach Hermes as `HERMES_EPHEMERAL_SYSTEM_PROMPT`, so the project's own
+  `AGENTS.md` is left alone.
+- **Gateway:** Hermes' messaging gateway (Telegram, Slack, …) runs as a service of its own
+  under the same profile and limits, from the toolbar's *Gateway* buttons:
+  `aio-hermes-gw-<name>` on the host, or `aio-hermes-gateway` in the VM. A VM's gateway
+  doesn't survive a VM restart; start it again. Its output is in the Logs tab. A
+  *Telegram Bot API* token in the pool sets up its Telegram channel: the bot token stays a
+  placeholder, which nono swaps into the Bot API's URL path (`/bot<token>/`). Who may talk
+  to the bot is Hermes' own setting (`TELEGRAM_ALLOWED_USERS`; `hermes gateway setup` in the
+  Hermes tab).
+- **Install and updates:** `bin/update-host` reinstalls Hermes when the pin in `hermes.lock`
+  changes. Hermes' own `hermes update` can't write the read-only install.
+
+### Google access (grants)
+
+A **Google grant** gives a workspace read access to Gmail or Calendar that is narrower than
+Google's OAuth scopes allow. It works for Claude workspaces too.
+
+1. **OAuth client.** Under *Settings → Google accounts*, add your own OAuth client from
+   Google Cloud Console. It must be of type *Desktop app*, with the Gmail and/or Calendar API
+   enabled, and you as a test user on the consent screen.
+2. **Connect an account.** Tick the access you'll want (`gmail.readonly`, `gmail.metadata`,
+   `calendar.readonly`) and click Connect. After Google's consent the browser lands on an
+   address that doesn't load (`http://127.0.0.1:1/?…`); paste it back in. This works
+   whatever name the UI has. The refresh token stays in `secrets/google/` and never enters
+   a sandbox.
+3. **Create a grant.** Under *Keys & tokens*, add a token of service *Google* with an
+   account and a preset, then tick it for workspaces like any token. The presets:
+
+   | Preset | What the workspace can do |
+   |---|---|
+   | Gmail: read messages and threads | GET messages, threads, labels and the profile. No send, drafts, modify, trash, settings, history or attachments. |
+   | Gmail: headers only | The same through the `gmail.metadata` scope: no bodies, no search. |
+   | Gmail: read one label only | As *read*, limited to one label. Lists and searches are narrowed to it, and a message or thread is fetched only if it carries the label (every message of the thread). |
+   | Calendar: read events | GET the calendar list and events. |
+
+Inside the sandbox the agent sees a placeholder (`$GMAIL_<GRANT>_TOKEN`) and
+`$POOL_<GRANT>_BASE_URL`. nono's proxy does the rest:
+
+- It gets an access token from `bin/google-token`, which runs outside the sandbox as a
+  `cmd://` credential, cached for 45 minutes.
+- It injects that token, and refuses with 403 anything the preset's method and path rules
+  (`endpoint_rules`, default-deny) don't allow.
+- The *one label* preset also goes through the proxy service's bridge (`ui/gbroker.py`).
+  The bridge narrows queries, asks Google for a message's labels before fetching it, and
+  sends the request on over verified TLS.
+
+Each of the bridge's decisions is logged to `monitoring/data/google-broker.log` (grant,
+method, path, allow/deny; no tokens or query values). Google's API hosts are never added to
+the allowlist, so a token the agent finds elsewhere is no use to it. *Disconnect* revokes
+the account at Google and removes its grants from every workspace.
 
 ### Import
 
@@ -545,4 +630,10 @@ telemetry's `workspace` label is set by the sandbox, so a workspace could mislab
 own Claude metrics (nono and container data are labelled outside it); Alloy has the
 Docker socket (root-equivalent, as any container monitor does); imported history lands in
 that shared `~/.claude` too; upload and workspace SSH keys log in as this account (their
-forced command is the boundary), and an upload key can fill the disk.
+forced command is the boundary), and an upload key can fill the disk. Hermes: a Slack or
+Discord token for its gateway can't be a placeholder (Socket Mode and Discord's gateway
+carry it in the WebSocket protocol), so it goes, in plain text, in that workspace's
+`HERMES_HOME/.env`, which only that workspace can read; mail and chat messages are
+untrusted input to the agent, so keep its allowlist narrow; Google grants' presets are
+per request: the one-label preset checks each message, but the others let the agent read
+everything the preset covers.

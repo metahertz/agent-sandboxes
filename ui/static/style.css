@@ -222,3 +222,4 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 
 /* microVM workspaces: their own Access-tab notes; no container-only parts */
 #detail.is-vm .sandbox-only, #detail:not(.is-vm) .vm-only { display: none !important; }
+#detail.is-hermes .claude-only, #detail:not(.is-hermes) .hermes-only { display: none !important; }

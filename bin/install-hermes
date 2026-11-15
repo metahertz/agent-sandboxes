@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Install (or update to) the Hermes Agent release pinned in hermes.lock, for
+# Hermes workspaces of the sandbox kind. Everything goes under
+# $ROOT/opt/hermes, apart from your own ~/.hermes:
+#
+#   opt/hermes/hermes-agent   the checkout, its venv and the `hermes` command
+#   opt/hermes/home           the installer's HERMES_HOME (bundled skills, tools)
+#   opt/hermes/python         the Python uv fetches for it
+#   opt/hermes/read-paths     anything else Hermes needs to read at runtime,
+#                             granted read-only in the workspaces' nono profiles
+#
+# Each workspace gets its own HERMES_HOME (state/<name>/hermes), writable; this
+# install is read-only inside the sandboxes, so the agent can't change Hermes.
+# Uses Hermes's own installer (scripts/install.sh at the pinned commit), without
+# the browser and computer-use tools: the AIO container is the browser.
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+OPT="$ROOT/opt/hermes"
+# shellcheck source=../hermes.lock
+source "$ROOT/hermes.lock"
+
+installed=$(cat "$OPT/installed-commit" 2>/dev/null || true)
+if [[ $installed == "$HERMES_COMMIT" && ${1:-} != --force ]]; then
+  echo "Hermes $HERMES_TAG is already installed in $OPT (--force reinstalls)."
+  exit 0
+fi
+
+mkdir -p "$OPT"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+echo "==> Hermes $HERMES_TAG ($HERMES_COMMIT) into $OPT"
+curl -fsSL -o "$tmp/install.sh" \
+  "https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
+
+# The installer would add ~/.local/bin to your shell rc files and publish
+# `hermes` there; keep it to opt/ (a HOME of its own for that), but let it use
+# your git and proxy settings.
+export UV_PYTHON_INSTALL_DIR="$OPT/python" UV_CACHE_DIR="$OPT/uv-cache"
+HOME="$OPT/installer-home" HERMES_INSTALL_CHANNEL=stable \
+  bash "$tmp/install.sh" --commit "$HERMES_COMMIT" --dir "$OPT/hermes-agent" \
+    --hermes-home "$OPT/home" --non-interactive --skip-browser --skip-computer-use
+
+got=$(git -C "$OPT/hermes-agent" rev-parse HEAD)
+[[ $got == "$HERMES_COMMIT" ]] || { echo "Installed $got, not $HERMES_COMMIT" >&2; exit 1; }
+hermes="$OPT/hermes-agent/.hermes/bin/hermes"
+[[ -x $hermes ]] || { echo "No hermes command at $hermes after the install" >&2; exit 1; }
+
+# What the command needs outside opt/hermes (the interpreter and PM's tool
+# store may resolve elsewhere): record it for the nono profile
+{
+  readlink -f "$hermes"
+  python=$(sed -n '1s/^#!//p' "$(readlink -f "$hermes")" | awk '{print $1}')
+  [[ -x $python ]] && "$python" -I -c 'import sys; print(sys.base_prefix); print(sys.prefix)'
+  (cd "$OPT/hermes-agent" && [[ -x $python ]] &&
+     "$python" -I -c 'import sys; sys.path.insert(0, "."); from pm.paths import store_root; print(store_root())') 2>/dev/null
+} | while read -r p; do
+  [[ -n $p && -e $p && $p != "$OPT"* ]] && dirname "$p"
+done | sort -u > "$OPT/read-paths.new" || true
+mv "$OPT/read-paths.new" "$OPT/read-paths"
+echo "$HERMES_COMMIT" > "$OPT/installed-commit"
+"$hermes" --version || true
+echo "==> Done. Hermes workspaces use $hermes"
+[[ -s $OPT/read-paths ]] && echo "    Also readable in their sandboxes: $(tr '\n' ' ' < "$OPT/read-paths")"
+exit 0

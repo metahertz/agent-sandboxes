@@ -45,6 +45,7 @@ import subprocess
 import sys
 import termios
 import time
+import urllib.error
 import urllib.parse
 from pathlib import Path
 
@@ -53,14 +54,19 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
                     EGRESS_PORT_OFFSET, HTTP_BRIDGE, ITEM_RE, MAX_HEAD, NAME_RE, PROXYD_SOCK, ROOT, RUNTIME,
                     SANDBOX_PORTS, SECRETS, SSH_POOL, TOKEN_POOL, VM_BROWSER_PORT, VM_PROXY_OFFSET,
                     VM_RELAY_PORT, VM_ROOT,
-                    WS_ROOT, all_ws, container_ca_paths, container_filtered, container_net,
+                    AGENTS, WS_ROOT, all_ws, container_ca_paths, container_filtered, container_net,
                     container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
                     load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version, read_env,
-                    token_meta, vm_browser, vm_cid)
+                    token_meta, vm_browser, vm_cid, ws_agent)
 import auth  # noqa: E402
+import gbroker  # noqa: E402
 
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
-CLAUDE_IN = ROOT / "bin" / "claude-in"
+CLAUDE_IN = ROOT / "bin" / "claude-in"           # starts either agent (and Hermes' gateway)
+HERMES_LOCK = ROOT / "hermes.lock"
+HERMES_OPT = ROOT / "opt" / "hermes"              # bin/install-hermes: read-only inside the sandboxes
+HERMES_BIN = HERMES_OPT / "hermes-agent" / ".hermes" / "bin" / "hermes"
+GOOGLE_TOKEN = ROOT / "bin" / "google-token"      # nono's proxy runs it for Google grants
 MCP_TEMPLATE = ROOT / "mcp.json.template"
 CLAUDE_MD_DEFAULT = ROOT / "ui" / "claude-md-additions.md"   # sandbox notes for workspaces' CLAUDE.md
 CLAUDE_MD_CUSTOM = ROOT / "state" / "claude-md-additions.md"  # the Settings page's edited copy
@@ -88,8 +94,15 @@ VM_VCPUS = 2
 VM_DISK_GB, VM_BROWSER_DISK_GB = 16, 48   # sparse; the browser image alone is about 13 GB
 VM_BRIDGE = "172.17.0.1"                  # Docker's default bridge in the guest: its relay listens there too
 VM_GUEST_CA = "/usr/local/share/ca-certificates/aio-proxy.crt"   # where the guest installs the proxy CA
-# Always allowed for microVM workspaces: the guest installs Claude Code itself
-VM_EXTRA_HOSTS = ["claude.ai", "downloads.claude.ai"]
+# Always allowed for microVM workspaces: the guest installs its agent itself
+# (Claude Code from claude.ai; Hermes from PyPI, bin/aio-hermes)
+VM_EXTRA_HOSTS = {"claude": ["claude.ai", "downloads.claude.ai"],
+                  # Hermes' installer: its checkout, uv and Python, its pinned packages
+                  # and tools (its own mirror), the TUI's Node build
+                  "hermes": ["github.com", "codeload.github.com", "raw.githubusercontent.com",
+                             "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+                             "hermes-assets.nousresearch.com", "pypi.org", "files.pythonhosted.org",
+                             "nodejs.org", "registry.npmjs.org"]}
 # A new microVM workspace's allowlist starts with these (editable): apt in the
 # guest (the mirrors bin/microvm-image used) and Docker Hub
 VM_DEFAULT_ALLOW = ["registry-1.docker.io", "auth.docker.io", "production.cloudflare.docker.com",
@@ -459,6 +472,8 @@ async def api(req: Request, w):
 
     if parts and parts[0] == "pool":
         return await pool_api(req, parts[1:], w)
+    if parts and parts[0] == "google":
+        return await google_api(req, parts[1:], w)
 
     if len(parts) < 2 or parts[0] != "workspaces":
         return await respond(w, 404, "Not found\n")
@@ -478,7 +493,9 @@ async def api(req: Request, w):
         (WS_ROOT / f"{name}.env").unlink()
         kill_agent(name)
         remove_access(lambda scope, _: scope == name)
-        for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_override_path(name),
+        await gateway_stop(ws)
+        for p in (policy_path(name), profile_path(name), aux_profile_path(name), gateway_profile_path(name),
+                  container_override_path(name),
                   container_limits_path(name),
                   container_env_path(name), container_profile_path(name), *container_ca_files(name),
                   *(CONTAINER_PROXY_SECRETS / f"{name}{x}" for x in ("", ".ca.crt", ".ca.key"))):
@@ -508,6 +525,9 @@ async def api(req: Request, w):
     if action == ["claude", "stop"] and m == "POST":
         await run(*TMUX, "kill-session", "-t", f"cl-{name}")
         return await send_json(w, {"ok": True})
+
+    if action and action[0] == "gateway" and ws_agent(ws) == "hermes":
+        return await gateway_api(ws, action[1:], m, w)
 
     if action == ["policy"] and m in ("GET", "PUT"):
         return await policy_api(ws, req, w)
@@ -539,8 +559,8 @@ async def vm_api(ws: dict[str, str], action: list[str], m: str, w):
         (WS_ROOT / f"{name}.env").unlink()
         kill_agent(name)
         remove_access(lambda scope, _: scope == name)
-        for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_profile_path(name),
-                  *(CONTAINER_PROXY_SECRETS / f"{name}{x}" for x in ("", ".ca.crt", ".ca.key"))):
+        for p in (policy_path(name), profile_path(name), aux_profile_path(name), gateway_profile_path(name),
+                  container_profile_path(name), *(CONTAINER_PROXY_SECRETS / f"{name}{x}" for x in ("", ".ca.crt", ".ca.key"))):
             p.unlink(missing_ok=True)
         shutil.rmtree(vm_dir(name), ignore_errors=True)      # the VM's disk: its Claude login, Docker images
         shutil.rmtree(STATE_ROOT / name, ignore_errors=True)
@@ -584,6 +604,7 @@ async def status_all() -> list[dict]:
         if s.startswith("cl-"):
             claude[s[3:]] = "exited" if dead == "1" else "running"
     vms = await vm_states()
+    gateways = await gateway_states()
     out = []
     for ws in all_ws():
         n = ws.get("WS_NAME", "")
@@ -594,9 +615,13 @@ async def status_all() -> list[dict]:
             state, detail = states.get(container(n), ("absent", ""))
         pol = load_policy(n)
         out.append({"name": n, "dir": ws.get("WS_DIR"), "port": ws.get("WS_PORT"),
-                    "kind": "microvm" if vm else "sandbox", "browser": not vm or pol["vm_browser"],
+                    "kind": "microvm" if vm else "sandbox", "agent": ws_agent(ws),
+                    "browser": not vm or pol["vm_browser"],
                     "container": state, "containerDetail": detail,
                     "claude": claude.get(n, "stopped"),
+                    # a VM's: GET .../gateway (it takes an ssh round trip)
+                    "gateway": (None if ws_agent(ws) != "hermes" else "unknown" if vm
+                                else gateway_word(gateways.get(n))),
                     "sshKeys": len(pol["ssh_keys"]), "tokens": len(pol["tokens"]),
                     "network": pol["network"]["mode"],
                     "policyPending": not vm and claude.get(n) == "running" and policy_pending(ws)})
@@ -609,10 +634,14 @@ class WsError(Exception):
         self.status = status
 
 
-def check_new_ws(name: str, raw_dir: str | None, kind: str = "sandbox") -> str:
+def check_new_ws(name: str, raw_dir: str | None, kind: str = "sandbox", agent: str = "claude") -> str:
     """Validate a new workspace's name and folder; returns the real folder path."""
     if kind not in ("sandbox", "microvm"):
         raise WsError("Type: sandbox or microvm")
+    if agent not in AGENTS:
+        raise WsError("Agent: " + " or ".join(AGENTS))
+    if agent == "hermes" and kind == "sandbox" and (missing := hermes_problems()):
+        raise WsError("Hermes can't run here yet: " + "; ".join(missing))
     if kind == "microvm" and (missing := vm_problems()):
         raise WsError("MicroVM workspaces can't run here yet: " + "; ".join(missing))
     if not NAME_RE.match(name):
@@ -660,10 +689,21 @@ def ensure_mcp_json(d: str) -> list[str]:
     return notes
 
 
-async def provision_ws(name: str, d: str, kind: str = "sandbox") -> dict:
+def new_ws_policy(name: str, agent: str, vm: bool):
+    """A new workspace's starting policy. Hermes: nono's LLM APIs only (it
+    gets to its provider through a pool token's route either way)."""
+    pol = load_policy(name)
+    if vm:
+        pol["network"]["allow"] = list(dict.fromkeys(vm_apt_hosts() + VM_DEFAULT_ALLOW))
+    if agent == "hermes":
+        pol["network"]["mode"] = "minimal"
+    save_policy(name, validate_policy(pol))
+
+
+async def provision_ws(name: str, d: str, kind: str = "sandbox", agent: str = "claude") -> dict:
     """Create (or adopt) the folder, link it to a new sandbox and start that."""
     if kind == "microvm":
-        return await provision_vm(name, d)
+        return await provision_vm(name, d, agent)
     used = {int(o["WS_PORT"]) for o in all_ws()}
     port = next((p for p in SANDBOX_PORTS if p not in used and port_free(p)), None)
     if port is None:
@@ -671,17 +711,19 @@ async def provision_ws(name: str, d: str, kind: str = "sandbox") -> dict:
 
     created_dir = not os.path.exists(d)
     os.makedirs(d, exist_ok=True)
-    notes = ensure_mcp_json(d)
+    notes = ensure_mcp_json(d) if agent == "claude" else []    # Hermes: its config.yaml (prepare)
     mcp = Path(d) / ".mcp.json"
 
     env_path = WS_ROOT / f"{name}.env"
     fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(f"WS_NAME={name}\nWS_DIR={d}\nWS_PORT={port}\nWS_KEY={secrets.token_hex(32)}\n")
+        f.write(f"WS_NAME={name}\nWS_DIR={d}\nWS_PORT={port}\nWS_KEY={secrets.token_hex(32)}\n"
+                f"WS_AGENT={agent}\n")
 
     # Under `sg docker` new files get group docker; give them the user's own group.
-    for p in [env_path, mcp] + ([d] if created_dir else []):
+    for p in [env_path] + ([mcp] if mcp.exists() else []) + ([d] if created_dir else []):
         os.chown(p, -1, USER_GID)
+    new_ws_policy(name, agent, False)
 
     ws = read_env(env_path)
     rc, out, err = await run(*compose(ws, "up", "-d"), timeout=600)
@@ -694,7 +736,7 @@ async def provision_ws(name: str, d: str, kind: str = "sandbox") -> dict:
     return {"ok": True, "name": name, "dir": d, "port": port, "notes": notes}
 
 
-async def provision_vm(name: str, d: str) -> dict:
+async def provision_vm(name: str, d: str, agent: str = "claude") -> dict:
     """A microVM workspace: the folder (shared into the VM at /project), its
     proxy, and the VM, which copies the image the first time."""
     used = {int(o["WS_PORT"]) for o in all_ws()}
@@ -706,13 +748,12 @@ async def provision_vm(name: str, d: str) -> dict:
     env_path = WS_ROOT / f"{name}.env"
     fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(f"WS_NAME={name}\nWS_DIR={d}\nWS_PORT={port}\nWS_KEY={secrets.token_hex(32)}\nWS_KIND=microvm\n")
+        f.write(f"WS_NAME={name}\nWS_DIR={d}\nWS_PORT={port}\nWS_KEY={secrets.token_hex(32)}\nWS_KIND=microvm\n"
+                f"WS_AGENT={agent}\n")
     for p in [env_path] + ([d] if created_dir else []):
         os.chown(p, -1, USER_GID)
     ws = read_env(env_path)
-    pol = load_policy(name)
-    pol["network"]["allow"] = list(dict.fromkeys(vm_apt_hosts() + VM_DEFAULT_ALLOW))
-    save_policy(name, validate_policy(pol))
+    new_ws_policy(name, agent, True)
     notes = await sync_proxies(name)
     await refresh_cert()          # <name>.localhost, for the browser container's views
     if err := await open_sandbox_listener(ws):
@@ -731,10 +772,74 @@ async def create_ws(req: Request, w):
     try:
         name = str(body.get("name", "")).strip()
         kind = str(body.get("kind") or "sandbox")
-        d = check_new_ws(name, body.get("dir"), kind)
-        return await send_json(w, await provision_ws(name, d, kind), 201)
+        agent = str(body.get("agent") or "claude")
+        d = check_new_ws(name, body.get("dir"), kind, agent)
+        return await send_json(w, await provision_ws(name, d, kind, agent), 201)
     except WsError as e:
         return await send_json(w, {"error": str(e)}, e.status)
+
+
+# ---- Hermes' messaging gateway: a service of its own (bin/claude-in --gateway),
+# a user unit on the host, or a unit in the VM
+
+def gateway_unit(name: str) -> str:
+    return f"aio-hermes-gw-{name}"
+
+
+async def gateway_states() -> dict[str, str]:
+    """The sandbox-kind gateways' unit states, by workspace (one systemctl call)."""
+    rc, out, _ = await run("systemctl", "--user", "list-units", "--all", "--plain", "--no-legend",
+                           "--type=service", "aio-hermes-gw-*")
+    states = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[0].startswith("aio-hermes-gw-") and f[0].endswith(".service"):
+            states[f[0][len("aio-hermes-gw-"):-len(".service")]] = f[2]
+    return states
+
+
+def gateway_word(unit_state: str | None) -> str:
+    if unit_state in ("active", "activating", "reloading"):
+        return "running"
+    return "failed" if unit_state == "failed" else "stopped"
+
+
+async def vm_gateway(ws: dict[str, str], cmd: str, timeout: float = 30) -> tuple[int, str, str]:
+    return await run(str(MICROVM), "ssh", ws["WS_NAME"], "--", cmd, timeout=timeout)
+
+
+async def gateway_stop(ws: dict[str, str]):
+    if ws_agent(ws) != "hermes":
+        return
+    if is_microvm(ws):
+        if (await vm_states()).get(ws["WS_NAME"]) == "active":
+            await vm_gateway(ws, "sudo systemctl stop aio-hermes-gateway")
+    else:
+        await run("systemctl", "--user", "stop", gateway_unit(ws["WS_NAME"]))
+
+
+async def gateway_api(ws: dict[str, str], action: list[str], m: str, w):
+    name, vm = ws["WS_NAME"], is_microvm(ws)
+    if action == [] and m == "GET":
+        if vm:
+            if (await vm_states()).get(name) != "active":
+                return await send_json(w, {"state": "stopped", "log": "(the VM isn't running)"})
+            _, st, _ = await vm_gateway(ws, "systemctl is-active aio-hermes-gateway")
+            _, log, err = await vm_gateway(ws, "sudo journalctl -u aio-hermes-gateway -n 300 --no-pager -o short-iso")
+        else:
+            _, st, _ = await run("systemctl", "--user", "is-active", gateway_unit(name))
+            _, log, err = await run("journalctl", "--user", "-u", gateway_unit(name), "-n", "300",
+                                    "--no-pager", "-o", "short-iso")
+        return await send_json(w, {"state": gateway_word(st.strip()), "log": log or err})
+    if action == ["start"] and m == "POST":
+        if vm and (await vm_states()).get(name) != "active":
+            return await send_json(w, {"error": "Start the VM first"}, 409)
+        rc, out, err = await run(str(CLAUDE_IN), "--gateway", name, timeout=900)   # a VM's first: installs Hermes
+        return await send_json(w, {"ok": rc == 0, "error": (err or out).strip()[-800:]}, 200 if rc == 0 else 500)
+    if action == ["stop"] and m == "POST":
+        await gateway_stop(ws)
+        return await send_json(w, {"ok": True})
+    return await respond(w, 404, "Not found\n")
 
 
 async def claude_start(ws: dict[str, str], w):
@@ -753,7 +858,7 @@ async def claude_start(ws: dict[str, str], w):
 # --------------------------------------------------------------- policy, key & token pool
 
 NET_MODES = {
-    "minimal": "Claude's own APIs only",
+    "minimal": "LLM provider APIs only (Anthropic, OpenAI, OpenRouter, Gemini…)",
     "claude-code": "Claude APIs, package registries, GitHub, GitLab, docs (default)",
     "enterprise": "As above, plus Google Cloud, Azure and AWS Bedrock",
     "open": "Unfiltered internet (raw TCP still blocked when tokens or blocked domains are set)",
@@ -770,7 +875,17 @@ TOKEN_SERVICES = {
                "inject_header": "Authorization", "credential_format": "Bearer {}", "env_var": "OPENAI_API_KEY"},
     "gemini": {"label": "Gemini API", "upstream": "https://generativelanguage.googleapis.com",
                "inject_header": "x-goog-api-key", "credential_format": "{}", "env_var": "GEMINI_API_KEY"},
+    "openrouter": {"label": "OpenRouter API", "upstream": "https://openrouter.ai/api/v1",
+                   "inject_header": "Authorization", "credential_format": "Bearer {}",
+                   "env_var": "OPENROUTER_API_KEY"},
+    # The Bot API carries the token in the path (/bot<token>/method): nono swaps
+    # the placeholder there. Hermes' gateway uses it through its base_url.
+    "telegram": {"label": "Telegram Bot API", "upstream": "https://api.telegram.org",
+                 "inject_mode": "url_path", "path_pattern": "/bot{}/",
+                 "inject_header": "", "credential_format": "{}", "env_var": "TELEGRAM_BOT_TOKEN"},
 }
+# What a pool token's route may carry over to nono's custom_credentials
+ROUTE_EXTRAS = ("inject_mode", "path_pattern", "endpoint_rules")
 
 
 def private_write(path: Path, data: str | bytes):
@@ -795,6 +910,10 @@ def profile_path(name: str) -> Path:
 
 def aux_profile_path(name: str) -> Path:
     return WS_ROOT / f"{name}.aux-profile.json"
+
+
+def gateway_profile_path(name: str) -> Path:
+    return WS_ROOT / f"{name}.gateway-profile.json"
 
 
 def agent_sock(name: str) -> Path:
@@ -946,6 +1065,23 @@ def validate_policy(body: dict) -> dict:
                      "browser_memory": bmem, "browser_cpus": bcpus}
     pol["claude_md"] = body.get("claude_md") is True
     pol["vm_browser"] = body.get("vm_browser") is True
+    h = body.get("hermes", {}) or {}
+    llm = str(h.get("llm", "") or "")
+    if llm and llm not in pol["tokens"]:
+        raise ValueError("Hermes model provider: tick that token for this workspace too")
+    if llm and token_meta(llm)["service"] in ("google", "telegram", "github", "gitlab"):
+        raise ValueError("Hermes model provider: pick an LLM API token")
+    base_url = str(h.get("base_url", "") or "").strip()
+    if base_url:
+        u = urllib.parse.urlsplit(base_url)
+        if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password or u.query \
+                or any(c in base_url for c in " \"'$\\"):
+            raise ValueError("Hermes model URL: an http(s):// URL of an OpenAI-compatible API, e.g. "
+                             "http://192.168.1.20:11434/v1")
+    model = str(h.get("model", "") or "").strip()
+    if model and not re.fullmatch(r"[A-Za-z0-9._:/@+-]{1,200}", model):
+        raise ValueError("Hermes model: a model name such as anthropic/claude-sonnet-4.5")
+    pol["hermes"] = {"llm": llm, "base_url": "" if llm else base_url, "model": model}
     return pol
 
 
@@ -974,6 +1110,8 @@ async def pool_listing() -> dict:
         tid = p.name.removesuffix(".json")
         if (meta := token_meta(tid)) and (TOKEN_POOL / tid).is_file():
             tokens.append({"id": tid, **{k: meta[k] for k in ("service", "upstream", "env_var", "label")},
+                           **({"detail": gbroker.grant_summary(meta), "account": meta.get("account")}
+                              if meta["service"] == "google" else {}),
                            "workspaces": [n for n, pol in policies.items() if tid in pol["tokens"]]})
     return {"ssh": keys, "tokens": tokens, "workspaces": sorted(policies),
             "services": {k: {"label": v["label"], "env_var": v["env_var"], "upstream": v["upstream"]}
@@ -1027,10 +1165,18 @@ def add_token(body: dict) -> dict:
         raise ValueError("Token name: lowercase letters, digits and dashes, max 40")
     if (TOKEN_POOL / f"{tid}.json").exists():
         raise ValueError(f"Token '{tid}' already exists")
+    service = str(body.get("service", ""))
+    if service == "google":
+        g = body.get("google", {}) or {}
+        meta = gbroker.grant_meta(tid, str(g.get("account", "")), str(g.get("preset", "")),
+                                  str(g.get("label", "")), str(g.get("label_name", ""))[:100])
+        # No secret here: nono's proxy gets an access token from bin/google-token
+        private_write(TOKEN_POOL / tid, "")
+        private_write(TOKEN_POOL / f"{tid}.json", json.dumps(meta, indent=2) + "\n")
+        return {"id": tid, **meta}
     secret = str(body.get("secret", "")).strip()
     if not secret or len(secret) > 8192 or any(c in secret for c in "\r\n\0"):
         raise ValueError("Paste the token (single line)")
-    service = str(body.get("service", ""))
     if service in TOKEN_SERVICES:
         meta = {"service": service, **TOKEN_SERVICES[service]}
     elif service == "custom":
@@ -1160,16 +1306,100 @@ async def sync_agent(name: str):
 
 # ---- nono profile per workspace
 
+# ---- Hermes workspaces: its install (bin/install-hermes), a HERMES_HOME of
+# their own, and a managed settings layer (Hermes' HERMES_MANAGED_DIR, which
+# wins over its own config.yaml key by key): the model provider's route, the
+# model, the AIO container's MCP server, the local terminal backend.
+
+def hermes_lock() -> dict[str, str]:
+    try:
+        return read_env(HERMES_LOCK)
+    except OSError:
+        return {}
+
+
+def hermes_problems() -> list[str]:
+    """What's missing on this host for Hermes in a sandbox-kind workspace."""
+    if not HERMES_BIN.exists():
+        return ["Hermes isn't installed (run bin/install-hermes on the host)"]
+    try:
+        installed = (HERMES_OPT / "installed-commit").read_text().strip()
+    except OSError:
+        installed = ""
+    if installed and installed != hermes_lock().get("HERMES_COMMIT"):
+        return [f"Hermes {hermes_lock().get('HERMES_TAG')} is pinned but another is installed (run bin/install-hermes)"]
+    return []
+
+
+def hermes_home(name: str) -> Path:
+    return STATE_ROOT / name / "hermes"
+
+
+def hermes_managed_dir(name: str) -> Path:
+    """Outside anything the sandbox can write (it reads it)."""
+    return RUNTIME / name / "hermes-managed"
+
+
+def hermes_read_paths() -> list[str]:
+    """What bin/install-hermes found Hermes needs outside opt/hermes."""
+    try:
+        lines = (HERMES_OPT / "read-paths").read_text().splitlines()
+    except OSError:
+        return []
+    return [x for x in lines if x.startswith("/") and os.path.isdir(x)]
+
+
+def hermes_managed_config(ws: dict[str, str], pol: dict) -> dict:
+    """Hermes' managed config.yaml (as JSON, which YAML reads). ${VAR}s are
+    Hermes' own expansion, of what nono (or the VM's proxy.env) sets."""
+    h = pol["hermes"]
+    cfg: dict = {"terminal": {"backend": "local"}}
+    model: dict = {}
+    if h["llm"] and (meta := token_meta(h["llm"])):
+        model = {"provider": "openrouter" if meta["service"] == "openrouter" else "custom",
+                 "base_url": "${" + base_url_var(h["llm"]) + "}", "api_key": "${" + meta["env_var"] + "}"}
+    elif h["base_url"]:
+        model = {"provider": "custom", "base_url": h["base_url"]}
+    if h["model"]:
+        model["default"] = h["model"]
+    if model:
+        cfg["model"] = model
+    if not is_microvm(ws) or pol["vm_browser"]:
+        cfg["mcp_servers"] = {"aio-sandbox": {"url": "http://127.0.0.1:${AIO_PORT}/mcp",
+                                              "headers": {"X-AIO-API-Key": "${AIO_KEY}"}}}
+    for tid in pol["tokens"]:
+        if (meta := token_meta(tid)) and meta["service"] == "telegram":
+            var = "${" + base_url_var(tid) + "}"
+            cfg["platforms"] = {"telegram": {"extra": {"base_url": f"{var}/bot", "base_file_url": f"{var}/file/bot"}}}
+    return cfg
+
+
+def hermes_managed_text(ws: dict[str, str], pol: dict) -> str:
+    return ("# Generated by agent-sandboxes (the workspace's Access tab). Pinned over your config.yaml.\n"
+            + json.dumps(hermes_managed_config(ws, pol), indent=2) + "\n")
+
+
+def write_hermes_files(ws: dict[str, str], pol: dict):
+    """Before Hermes starts (sandbox kind): its home and the managed layer."""
+    name = ws["WS_NAME"]
+    home, managed = hermes_home(name), hermes_managed_dir(name)
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    managed.mkdir(mode=0o755, parents=True, exist_ok=True)
+    write_if_changed(managed / "config.yaml", hermes_managed_text(ws, pol))
+    (managed / "config.yaml").chmod(0o644)
+
+
 def render_profile(ws: dict[str, str], pol: dict) -> dict:
     name = ws["WS_NAME"]
     st = STATE_ROOT / name
-    telemetry = telemetry_enabled()
+    hermes = ws_agent(ws) == "hermes"
+    telemetry = telemetry_enabled() and not hermes
     net: dict = {"open_port": [int(ws["WS_PORT"])] + ([OTLP_PORT] if telemetry else [])}
     mode = pol["network"]["mode"]
     net["network_profile"] = None if mode == "open" else mode
     allow = [parse_net_entry(x, "", True) for x in pol["network"]["allow"]]
     if is_microvm(ws) and mode != "open":
-        allow += [(h, 0, 0) for h in VM_EXTRA_HOSTS]
+        allow += [(h, 0, 0) for h in VM_EXTRA_HOSTS[ws_agent(ws)]]
     if allow:
         net["allow_domain"] = list(dict.fromkeys(h for h, _, _ in allow))
         if any(lo for _, lo, _ in allow):
@@ -1182,13 +1412,24 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
         # its own servers (on any address: nono can't limit that), and connecting to them
         net["listen_port"] = ports
         net["open_port"] += ports
-    creds = {}
+    creds, capture = {}, {}
     for tid in pol["tokens"]:
         meta = token_meta(tid)
-        creds["pool_" + tid.replace("-", "_")] = {
-            "upstream": bridge_upstream(tid, meta["upstream"]), "credential_key": f"file://{TOKEN_POOL / tid}",
+        route = "pool_" + tid.replace("-", "_")
+        creds[route] = {
+            "upstream": bridge_upstream(tid, meta["upstream"], meta.get("broker", False)),
+            "credential_key": f"file://{TOKEN_POOL / tid}",
             "inject_header": meta["inject_header"], "credential_format": meta["credential_format"],
             "env_var": meta["env_var"]}
+        creds[route].update({k: meta[k] for k in ROUTE_EXTRAS if meta.get(k)})
+        if not meta["inject_header"]:
+            del creds[route]["inject_header"]
+        if meta["service"] == "google":
+            # An access token from the account's refresh token, fetched by nono
+            # outside the sandbox; the grant's preset is the endpoint_rules
+            creds[route]["credential_key"] = f"cmd://{route}"
+            capture[route] = {"command": ["/usr/bin/python3", "-I", str(GOOGLE_TOKEN), meta["account"]],
+                              "timeout_secs": 20, "cache_ttl_secs": gbroker.CAPTURE_TTL}
     if creds:
         net["credentials"] = sorted(creds)
         net["custom_credentials"] = creds
@@ -1204,18 +1445,28 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
                     "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{OTLP_PORT}",
                     "OTEL_RESOURCE_ATTRIBUTES": f"workspace={name}",
                     "OTEL_METRIC_EXPORT_INTERVAL": "30000"})
-    return {
+    fs = {"unix_socket": [str(agent_sock(name))], "read": [str(LIBEXEC)], "allow": [str(st)]}
+    if hermes:
+        # Its own HERMES_HOME (in state/<name>, writable), the install and the
+        # managed settings read-only; the AIO container's port and key, which
+        # Claude gets from the claude-browser profile's hook
+        fs["read"] += [str(HERMES_OPT), str(hermes_managed_dir(name))] + hermes_read_paths()
+        env.update({"HERMES_HOME": str(hermes_home(name)), "HERMES_MANAGED_DIR": str(hermes_managed_dir(name)),
+                    "AIO_PORT": ws["WS_PORT"], "AIO_KEY": ws.get("WS_KEY", "")})
+    prof = {
         "meta": {"name": f"ws-{name}", "version": "1.0.0",
                  "description": f"Generated by agent-sandboxes for workspace {name}; edit in the web UI"},
-        "extends": "claude-browser",
+        "extends": "hermes-sandbox" if hermes else "claude-browser",
         # Default-deny pathname Unix sockets: no Docker socket, no tmux server
         # (other workspaces' sessions), no D-Bus / systemd --user.
         "linux": {"af_unix_mediation": "pathname"},
-        "filesystem": {"unix_socket": [str(agent_sock(name))],
-                       "read": [str(LIBEXEC)], "allow": [str(st)]},
+        "filesystem": fs,
         "network": net,
         "environment": {"set_vars": env},
     }
+    if capture:
+        prof["credential_capture"] = capture
+    return prof
 
 
 def profile_text(ws: dict[str, str]) -> str:
@@ -1236,7 +1487,7 @@ def write_ssh_config(name: str):
         "  ServerAliveInterval 30\n")
 
 
-async def prepare(name: str, aux: bool = False) -> dict:
+async def prepare(name: str, aux: bool = False, gateway: bool = False) -> dict:
     """Everything Claude needs before nono starts: agent with its keys,
     ssh config, and the rendered profile (what's now 'applied'). aux: for a
     shell / SSH command instead, whose profile mustn't count as Claude's."""
@@ -1246,16 +1497,20 @@ async def prepare(name: str, aux: bool = False) -> dict:
         raise SystemExit(f"No workspace '{name}'")
     await sync_agent(name)
     write_ssh_config(name)
-    target = aux_profile_path(name) if aux else profile_path(name)
+    target = aux_profile_path(name) if aux else gateway_profile_path(name) if gateway else profile_path(name)
     private_write(target, profile_text(ws))
+    pol = load_policy(name)
+    if ws_agent(ws) == "hermes":
+        write_hermes_files(ws, pol)       # a VM's: bin/claude-in copies it in
     prompt = ""
     if not aux:
-        try:
-            sync_claude_md(ws)
-        except (OSError, ValueError) as e:
-            print(f"CLAUDE.md not updated: {e}", file=sys.stderr)
-        prompt = session_prompt(ws, load_policy(name))
-    return {"profile": str(target), "prompt": prompt, **load_policy(name)["limits"]}
+        if ws_agent(ws) == "claude":
+            try:
+                sync_claude_md(ws)
+            except (OSError, ValueError) as e:
+                print(f"CLAUDE.md not updated: {e}", file=sys.stderr)
+        prompt = session_prompt(ws, pol)
+    return {"profile": str(target), "prompt": prompt, "agent": ws_agent(ws), **pol["limits"]}
 
 
 # ---- sandbox notes for Claude: CLAUDE.md block (opt-in per workspace) and,
@@ -1284,6 +1539,17 @@ def token_lines(pol: dict) -> str:
         if not (meta := token_meta(tid)):
             continue
         env, var = meta["env_var"], base_url_var(tid)
+        if meta["service"] == "google":
+            how = (f"call **`${var}`** plus the API path (e.g. `${var}/gmail/v1/users/me/messages`)"
+                   if meta.get("broker") else f"call `{meta['upstream']}` or `${var}`, plus the API path")
+            out.append(f"- Google, {meta['label']}: {how}, with the header `Authorization: Bearer ${env}`. "
+                       f"Allowed: {gbroker.grant_summary(meta)} Anything else is refused with 403; "
+                       "don't try other Google endpoints or ask for more access.")
+            continue
+        if meta.get("inject_mode") == "url_path":
+            out.append(f"- `${env}` ({tid}) for {meta['upstream']}: call `${var}` plus the path, with "
+                       f"`${env}` where the token goes in the path ({meta['path_pattern'].replace('{}', '$' + env)}).")
+            continue
         header = f"{meta['inject_header']}: {meta['credential_format'].replace('{}', '$' + env)}"
         if meta["upstream"].startswith("http://"):
             how = (f"call **`${var}`** plus the path, never `{meta['upstream']}` itself "
@@ -1341,6 +1607,14 @@ def session_prompt(ws: dict[str, str], pol: dict) -> str:
         return vm + (" API token variables hold placeholders; the proxy swaps in the real token only on "
                      "requests that carry the placeholder. Never ask the user for a real token.\n"
                      + token_lines(pol))
+    if ws_agent(ws) == "hermes":
+        return (f"This session runs in the agent-sandboxes workspace {ws['WS_NAME']}, inside a nono sandbox: "
+                f"you can write only the project folder ({ws['WS_DIR']}) and your HERMES_HOME; the network is "
+                f"limited to {network_summary(pol)}. Your terminal tool runs commands in this same sandbox. "
+                "For a web browser, use the aio-sandbox MCP server (the workspace's AIO container). "
+                + ("API token variables hold placeholders; nono's proxy swaps in the real token only on "
+                   "requests that carry the placeholder. Never ask the user for a real token.\n"
+                   + token_lines(pol) if pol["tokens"] else ""))
     if not pol["tokens"]:
         return ""
     return (f"This session runs in the agent-sandboxes workspace {ws['WS_NAME']}, inside a nono sandbox. "
@@ -1404,9 +1678,14 @@ async def claude_md_api(req: Request, w):
 
 
 def policy_pending(ws: dict[str, str]) -> bool:
-    """True if the saved policy differs from what the running Claude got."""
+    """True if the saved policy differs from what the running agent got."""
     try:
-        return profile_path(ws["WS_NAME"]).read_text() != profile_text(ws)
+        if profile_path(ws["WS_NAME"]).read_text() != profile_text(ws):
+            return True
+        if ws_agent(ws) == "hermes":
+            managed = hermes_managed_dir(ws["WS_NAME"]) / "config.yaml"
+            return managed.read_text() != hermes_managed_text(ws, load_policy(ws["WS_NAME"]))
+        return False
     except OSError:
         return True     # started before per-workspace profiles existed
 
@@ -1439,7 +1718,8 @@ async def policy_api(ws: dict[str, str], req: Request, w):
         if old["ssh_keys"] != pol["ssh_keys"]:
             await sync_agent(name)
         try:
-            sync_claude_md(ws)
+            if ws_agent(ws) == "claude":
+                sync_claude_md(ws)
         except (OSError, ValueError) as e:
             return await send_json(w, {"error": f"Saved, but CLAUDE.md: {e}"}, 500)
         if is_microvm(ws):
@@ -1480,6 +1760,80 @@ async def pool_api(req: Request, parts: list[str], w):
         return await send_json(w, {"error": str(e)}, 400)
     except RuntimeError as e:
         return await send_json(w, {"error": str(e)}, 500)
+    await respond(w, 404, "Not found\n")
+
+
+# ---- Google accounts (Settings): your OAuth client and the accounts you
+# connected with it; grants on them are pool tokens (ui/gbroker.py)
+
+google_pending: dict[str, tuple[str, list[str], float]] = {}   # state -> (PKCE verifier, scopes, started)
+
+
+async def google_api(req: Request, parts: list[str], w):
+    m = req.method
+    try:
+        body = json.loads(req.body or b"{}") if req.body else {}
+        if parts == [] and m == "GET":
+            c = gbroker.client()
+            return await send_json(w, {
+                "client": bool(c), "clientId": (c or {}).get("client_id", ""),
+                "accounts": gbroker.accounts(), "redirect": gbroker.REDIRECT_URI,
+                "scopes": list(gbroker.SCOPES),
+                "presets": {k: {"label": v["label"], "detail": v["detail"], "scope": v["scope"],
+                                "needsLabel": bool(v.get("needs_label"))} for k, v in gbroker.PRESETS.items()}})
+        if parts == ["client"] and m == "PUT":
+            cid, secret = str(body.get("client_id", "")).strip(), str(body.get("client_secret", "")).strip()
+            if not re.fullmatch(r"[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com", cid):
+                raise ValueError("Client ID: the ….apps.googleusercontent.com one from Google Cloud Console")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{10,100}", secret):
+                raise ValueError("Paste the client secret")
+            gbroker.GOOGLE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            private_write(gbroker.CLIENT_FILE, json.dumps({"client_id": cid, "client_secret": secret}) + "\n")
+            return await send_json(w, {"ok": True})
+        if parts == ["connect"] and m == "POST":
+            scopes = [x for x in body.get("scopes", []) if x in gbroker.SCOPES]
+            if not scopes:
+                raise ValueError("Tick at least one kind of access")
+            now = time.time()
+            for k in [k for k, v in google_pending.items() if now - v[2] > 900]:
+                del google_pending[k]
+            state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+            google_pending[state] = (verifier, scopes, now)
+            return await send_json(w, {"url": gbroker.auth_url(scopes, state, challenge), "state": state})
+        if parts == ["finish"] and m == "POST":
+            # The address the browser couldn't open after consent: its code and state
+            q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(str(body.get("url", "")).strip()).query))
+            if q.get("error"):
+                raise ValueError(f"Google: {q['error']}")
+            pending = google_pending.pop(q.get("state", ""), None)
+            if not pending or not q.get("code"):
+                raise ValueError("Paste the whole address from the browser's address bar (it starts "
+                                 f"{gbroker.REDIRECT_URI}?state=…), from the Connect you just started")
+            got = await asyncio.to_thread(gbroker.exchange, q["code"], pending[0])
+            base = re.sub(r"[^a-z0-9]+", "-", got["email"].split("@")[0].lower()).strip("-")[:30] or "google"
+            existing = {a["email"]: a["id"] for a in gbroker.accounts()}
+            aid = existing.get(got["email"]) or next(
+                x for x in [base] + [f"{base}-{i}" for i in range(2, 100)] if not gbroker.account_path(x).exists())
+            gbroker.save_account(aid, got)
+            return await send_json(w, {"ok": True, "id": aid, "email": got["email"], "scopes": got["scopes"]})
+        if len(parts) >= 2 and parts[0] == "accounts" and gbroker.ACCOUNT_RE.match(parts[1]):
+            aid = parts[1]
+            if not gbroker.account(aid):
+                return await send_json(w, {"error": "No such account"}, 404)
+            if parts[2:] == ["labels"] and m == "GET":
+                return await send_json(w, {"labels": await asyncio.to_thread(gbroker.gmail_labels, aid)})
+            if parts[2:] == [] and m == "DELETE":
+                # Its grants go with it (out of every workspace's policy), then
+                # Google revokes the refresh token
+                for p in TOKEN_POOL.glob("*.json"):
+                    meta = token_meta(p.stem)
+                    if meta and meta.get("service") == "google" and meta.get("account") == aid:
+                        await remove_pool_item("token", p.stem)
+                await asyncio.to_thread(gbroker.remove_account, aid)
+                return await send_json(w, {"ok": True})
+    except (ValueError, json.JSONDecodeError, OSError, urllib.error.URLError) as e:
+        return await send_json(w, {"error": str(e)}, 400)
     await respond(w, 404, "Not found\n")
 
 
@@ -2977,8 +3331,10 @@ async def proxyd_startup():
 # --------------------------------------------------------------- HTTP API bridge
 # Token routes for http:// APIs point at the proxy service's bridge (ui/proxyd.py).
 
-def bridge_upstream(tid: str, upstream: str) -> str:
-    if not upstream.startswith("http://"):
+def bridge_upstream(tid: str, upstream: str, broker: bool = False) -> str:
+    """http:// APIs, and Google grants whose checks need more than nono's
+    endpoint rules (ui/gbroker.py), go through the proxy service's bridge."""
+    if not upstream.startswith("http://") and not broker:
         return upstream
     host, port = HTTP_BRIDGE
     return f"http://{host}:{port}/{tid}{urllib.parse.urlsplit(upstream).path}"
@@ -3339,7 +3695,7 @@ def vm_prepare(name: str) -> None:
     write_if_changed(cfg / "proxy.env", vm_proxy_env_text(ws, pol))
     write_if_changed(cfg / "ca.crt", pem)
     browser = cfg / "browser-compose.yaml", cfg / "browser.env", cfg / "chromium-ca-policy.json"
-    if pol["vm_browser"]:
+    if pol["vm_browser"] and ws_agent(ws) == "claude":
         ensure_mcp_json(ws["WS_DIR"])
         der = ssl.PEM_cert_to_DER_cert(pem)
         write_if_changed(browser[0], vm_browser_compose_text(ws, pol))
@@ -3348,6 +3704,11 @@ def vm_prepare(name: str) -> None:
     else:
         for p in browser:
             p.unlink(missing_ok=True)
+    for f, src in (("aio-hermes", ROOT / "microvm" / "guest" / "aio-hermes"), ("hermes.lock", HERMES_LOCK)):
+        if ws_agent(ws) == "hermes":
+            write_if_changed(cfg / f, src.read_text())
+        else:
+            (cfg / f).unlink(missing_ok=True)
     write_if_changed(d / "host-profile.json", json.dumps(vm_host_profile(ws), indent=2) + "\n")
     write_if_changed(d / "vm.env", f"VM_CID={vm_cid(ws)}\nVM_MEMORY_MB={vm_memory_mb(pol)}\n"
                                    f"VM_VCPUS={vm_vcpus(pol)}\nWS_DIR={shlex.quote(ws['WS_DIR'])}\n"
@@ -3497,14 +3858,15 @@ async def main():
                          *(s.serve_forever() for s in servers))
 
 
-def cli_prepare(name: str, aux: bool = False):
+def cli_prepare(name: str, aux: bool = False, gateway: bool = False):
     """bin/claude-in calls this (outside nono) and evals the output."""
-    info = asyncio.run(prepare(name, aux))
+    info = asyncio.run(prepare(name, aux, gateway))
     print(f"WS_PROFILE={shlex.quote(info['profile'])}")
     print(f"WS_MEMORY={shlex.quote(info['memory'])}")
     print(f"WS_PIDS={int(info['pids'])}")
     print(f"WS_CPUS={int(info['cpus'])}")
     print(f"WS_PROMPT={shlex.quote(info['prompt'])}")
+    print(f"WS_HERMES_BIN={shlex.quote(str(HERMES_BIN))}")
 
 
 if __name__ == "__main__":
@@ -3512,8 +3874,8 @@ if __name__ == "__main__":
         ensure_dirs()
         vm_prepare(sys.argv[2])
         sys.exit(0)
-    if sys.argv[1:2] == ["prepare"] and len(sys.argv) in (3, 4) and sys.argv[3:] in ([], ["--aux"]):
-        cli_prepare(sys.argv[2], aux=sys.argv[3:] == ["--aux"])
+    if sys.argv[1:2] == ["prepare"] and len(sys.argv) in (3, 4) and sys.argv[3:] in ([], ["--aux"], ["--gateway"]):
+        cli_prepare(sys.argv[2], aux=sys.argv[3:] == ["--aux"], gateway=sys.argv[3:] == ["--gateway"])
         sys.exit(0)
     try:
         asyncio.run(main())

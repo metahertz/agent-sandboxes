@@ -54,9 +54,18 @@ if ! cmp -s pam.d/agent-sandboxes /etc/pam.d/agent-sandboxes; then
 fi
 
 # nono's profile and hook, as the install copies them
-if [[ -d ~/.config/nono/profiles ]] && ! cmp -s nono/claude-browser.jsonc ~/.config/nono/profiles/claude-browser.jsonc; then
-  say "Updating ~/.config/nono/profiles/claude-browser.jsonc"
-  cp nono/claude-browser.jsonc ~/.config/nono/profiles/
+for prof in claude-browser hermes-sandbox; do
+  if [[ -d ~/.config/nono/profiles ]] && ! cmp -s "nono/$prof.jsonc" ~/.config/nono/profiles/$prof.jsonc; then
+    say "Updating ~/.config/nono/profiles/$prof.jsonc"
+    cp "nono/$prof.jsonc" ~/.config/nono/profiles/
+  fi
+done
+# Hermes (sandbox-kind Hermes workspaces): the pinned release, once installed
+if [[ -e opt/hermes/installed-commit ]] && changed hermes.lock; then
+  say "Updating Hermes to the pinned release"
+  bin/install-hermes
+elif changed hermes.lock && [[ ! -e opt/hermes/installed-commit ]]; then
+  note "Hermes workspaces of the sandbox kind need bin/install-hermes once."
 fi
 if [[ -d ~/.config/nono/hooks ]] && ! cmp -s nono/aio-env.sh ~/.config/nono/hooks/aio-env.sh; then
   say "Updating ~/.config/nono/hooks/aio-env.sh"
@@ -95,7 +104,7 @@ if changed microvm/ bin/microvm-image libexec/ssh-proxy-connect; then
   note "The microVM guest changed: bin/microvm-image rebuilds the base image (new VMs only)."
 fi
 
-if changed ui/proxyd.py ui/common.py systemd/agent-sandboxes-proxy.service; then
+if changed ui/proxyd.py ui/common.py ui/gbroker.py systemd/agent-sandboxes-proxy.service; then
   say "Restarting the proxy service (open sandbox connections drop; requests in flight retry)"
   sudo systemctl restart agent-sandboxes-proxy
 fi

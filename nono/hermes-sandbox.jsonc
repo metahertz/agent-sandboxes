@@ -1,0 +1,31 @@
+// Install to ~/.config/nono/profiles/hermes-sandbox.jsonc (bin/update-host does).
+//
+// Hermes Agent under nono, for Hermes workspaces of the sandbox kind. Each
+// workspace's generated profile extends this one and adds its own grants: the
+// project folder (--allow-cwd), its HERMES_HOME (state/<name>/hermes), the
+// read-only Hermes install (opt/hermes), its sandbox port, allowlist and API
+// token routes.
+{
+  "meta": {
+    "name": "hermes-sandbox",
+    "version": "0.1.0",
+    "description": "Hermes Agent + per-workspace AIO Sandbox over localhost MCP"
+  },
+  // Python's runtime paths, conservative defaults (no credentials, keychains,
+  // browser data or shell history)
+  "extends": "python-dev",
+  "groups": {
+    // An agent edits files and runs tools: nono's default command blocklist
+    // (rm, mv, cp, pip, kill, …) would stop it from working at all. The
+    // filesystem grants are what limit it.
+    "exclude": ["dangerous_commands", "dangerous_commands_macos", "dangerous_commands_linux"]
+  },
+  "network": {
+    // The workspace's profile sets this from its Access tab (Hermes default:
+    // minimal, nono's LLM APIs only)
+    "network_profile": "minimal",
+    "no_proxy": ["127.0.0.1", "localhost"]
+  },
+  // Default-deny pathname Unix sockets (Docker, tmux, D-Bus/systemd --user).
+  "linux": { "af_unix_mediation": "pathname" }
+}

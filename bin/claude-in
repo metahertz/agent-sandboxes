@@ -1,42 +1,69 @@
 #!/usr/bin/env bash
-# Start Claude Code for one workspace inside nono, with that workspace's
-# policy: its own sandbox port only, its SSH agent, its tokens, its network
-# allowlist and resource limits (all set in the web UI).
+# Start a workspace's agent (Claude Code, or Hermes: WS_AGENT) inside nono, with
+# that workspace's policy: its own sandbox port only, its SSH agent, its tokens,
+# its network allowlist and resource limits (all set in the web UI). In a
+# microVM workspace the agent runs in the VM instead.
 #
-#   claude-in <workspace> [claude args...]
+#   claude-in <workspace> [agent args...]
 #   claude-in --shell <workspace>            a login shell under the same sandbox
 #   claude-in --exec <workspace> <command>   one command (sh -c), e.g. rsync / sftp-server
 #                                            for bin/ws-ssh; stdout stays clean
+#   claude-in --gateway <workspace>          Hermes only: start its messaging gateway
+#                                            as a service (aio-hermes-gw-<workspace>)
 set -euo pipefail
 
-mode=claude
+mode=agent
 case "${1:-}" in
-  --shell) mode=shell; shift ;;
-  --exec)  mode=exec; shift ;;
+  --shell)   mode=shell; shift ;;
+  --exec)    mode=exec; shift ;;
+  --gateway) mode=gateway; shift ;;
 esac
 
 ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
 WS_ROOT="${AIO_WORKSPACES:-$ROOT/workspaces}"
-name="${1:?usage: claude-in [--shell | --exec] <workspace> [claude args... | command]}"; shift
+name="${1:?usage: claude-in [--shell | --exec | --gateway] <workspace> [agent args... | command]}"; shift
 env_file="$WS_ROOT/$name.env"
 [[ -r "$env_file" ]] || { echo "No workspace '$name' ($env_file)." >&2; exit 1; }
 
 set -a; source "$env_file"; set +a
+agent="${WS_AGENT:-claude}"
+if [[ $mode == gateway && $agent != hermes ]]; then
+  echo "'$name' runs $agent: only Hermes workspaces have a gateway." >&2; exit 1
+fi
+# The interactive agent and the gateway each get the full profile and the
+# session prompt; shells and commands an auxiliary one (it doesn't count as
+# what the running agent started with)
+prep=(); case $mode in shell|exec) prep=(--aux) ;; gateway) prep=(--gateway) ;; esac
 
 if [[ "${WS_KIND:-}" == microvm ]]; then
-  # Claude runs in the workspace's VM (bin/microvm), not under nono here:
+  # The agent runs in the workspace's VM (bin/microvm), not under nono here:
   # in /project (the shared folder), over vsock ssh, with the agent forwarded.
-  aux=(); [[ $mode == claude ]] || aux=(--aux)
-  eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${aux[@]}")"    # agent keys, WS_PROMPT
+  eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${prep[@]}")"    # agent keys, WS_PROMPT
   if [[ $("$ROOT/bin/microvm" status "$name") != active ]]; then
     echo "The VM for '$name' isn't running — start it from the web UI (or bin/microvm start $name)." >&2
     exit 1
   fi
-  case $mode in
-    claude) remote="cd /project && exec aio-claude${WS_PROMPT:+ --append-system-prompt $(printf '%q' "$WS_PROMPT")}$(printf ' %q' "$@")"
-            tty=(-t) ;;
-    shell)  remote="cd /project && exec bash -l"; tty=(-t) ;;
-    exec)   remote="cd /project && ${1:?--exec needs a command}"; tty=() ;;
+  if [[ $agent == hermes ]]; then
+    # Hermes' managed settings (model, provider route, MCP): into the VM
+    # before each start, so Access tab changes don't need a VM restart
+    managed="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/agent-sandboxes/$name/hermes-managed/config.yaml"
+    "$ROOT/bin/microvm" ssh "$name" -- 'mkdir -p ~/.aio-hermes && cat > ~/.aio-hermes/config.yaml' < "$managed"
+  fi
+  prompt_env=""
+  [[ -n $WS_PROMPT ]] && prompt_env="HERMES_EPHEMERAL_SYSTEM_PROMPT=$(printf '%q' "$WS_PROMPT") "
+  case $mode/$agent in
+    agent/claude) remote="cd /project && exec aio-claude${WS_PROMPT:+ --append-system-prompt $(printf '%q' "$WS_PROMPT")}$(printf ' %q' "$@")"
+                  tty=(-t) ;;
+    # aio-hermes comes on the config disk (mounted noexec), so VMs made
+    # before Hermes support have it too
+    agent/hermes) remote="cd /project && ${prompt_env}exec bash /run/aio-config/aio-hermes$(printf ' %q' "$@")"
+                  tty=(-t) ;;
+    gateway/*)    remote="bash /run/aio-config/aio-hermes --install-only && { sudo systemctl reset-failed aio-hermes-gateway 2>/dev/null; \
+sudo systemd-run --unit=aio-hermes-gateway --uid=dev --gid=dev -p WorkingDirectory=/project \
+-p EnvironmentFile=/etc/environment -p Restart=on-failure -p RestartSec=10 \
+-E HOME=/home/dev ${prompt_env:+-E $prompt_env}/bin/bash /run/aio-config/aio-hermes gateway run; }"; tty=() ;;
+    shell/*)      remote="cd /project && exec bash -l"; tty=(-t) ;;
+    exec/*)       remote="cd /project && ${1:?--exec needs a command}"; tty=() ;;
   esac
   exec "$ROOT/bin/microvm" ssh "$name" "${tty[@]}" -- "$remote"
 fi
@@ -46,10 +73,14 @@ fi
 fi
 
 # Loads the agent's SSH keys and writes workspaces/<name>.profile.json
-# (.aux-profile.json for --shell / --exec);
-# sets WS_PROFILE, WS_MEMORY, WS_PIDS, WS_CPUS, and WS_PROMPT (how to use its API tokens).
-aux=(); [[ $mode == claude ]] || aux=(--aux)   # don't overwrite what Claude started with
-eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${aux[@]}")"
+# (.aux-profile.json for --shell / --exec, .gateway-profile.json for --gateway);
+# sets WS_PROFILE, WS_MEMORY, WS_PIDS, WS_CPUS, WS_PROMPT (how to use its API
+# tokens) and WS_HERMES_BIN; for Hermes, writes its managed settings.
+eval "$(python3 -I "$ROOT/ui/server.py" prepare "$name" "${prep[@]}")"
+if [[ $agent == hermes && ! -x $WS_HERMES_BIN ]]; then
+  echo "Hermes isn't installed on this host: run bin/install-hermes (the Host page's shell will do)." >&2
+  exit 1
+fi
 
 # AIO_NONO: another nono build (e.g. one from source, for testing);
 # AIO_NONO_LIVE_AUDIT=1 when it writes proxy events to its audit trail as they
@@ -59,8 +90,8 @@ if [[ $mode == exec ]]; then
   cmd+=(--silent)
 else
   # nono's log goes to a file outside the sandbox, which the metrics exporter
-  # ships to Loki, and its warnings stay out of Claude's terminal. nono up to
-  # 0.81 keeps only 4096 proxy events for the audit trail, written at exit,
+  # ships to Loki, and its warnings stay out of the agent's terminal. nono up
+  # to 0.81 keeps only 4096 proxy events for the audit trail, written at exit,
   # so it also logs each one; the marker tells the exporter this session's
   # proxy events come from the log.
   logs="$ROOT/monitoring/data/nono-logs"
@@ -71,22 +102,42 @@ else
   fi
   cmd+=(--log-file "$logs/$name.log")
 fi
-[[ -n "$WS_MEMORY" ]] && cmd+=(--memory "$WS_MEMORY")
-[[ "$WS_PIDS" != 0 ]] && cmd+=(--max-processes "$WS_PIDS")
-case $mode in
-  claude) cmd+=(-- claude ${WS_PROMPT:+--append-system-prompt "$WS_PROMPT"} "$@"); unit="claude-$name-$$" ;;
-  shell)  cmd+=(-- bash -l); unit="shell-$name-$$" ;;
-  exec)   cmd+=(-- sh -c "${1:?--exec needs a command}"); unit="exec-$name-$$" ;;
+# The gateway's limits are its service's (below); nono's need a scope of their own
+if [[ $mode != gateway ]]; then
+  [[ -n "$WS_MEMORY" ]] && cmd+=(--memory "$WS_MEMORY")
+  [[ "$WS_PIDS" != 0 ]] && cmd+=(--max-processes "$WS_PIDS")
+fi
+hermes=(env ${WS_PROMPT:+"HERMES_EPHEMERAL_SYSTEM_PROMPT=$WS_PROMPT"} "$WS_HERMES_BIN")
+case $mode/$agent in
+  agent/claude) cmd+=(-- claude ${WS_PROMPT:+--append-system-prompt "$WS_PROMPT"} "$@"); unit="claude-$name-$$" ;;
+  agent/hermes) cmd+=(-- "${hermes[@]}" "$@"); unit="hermes-$name-$$" ;;
+  gateway/*)    cmd+=(-- "${hermes[@]}" gateway run); unit="aio-hermes-gw-$name" ;;
+  shell/*)      cmd+=(-- bash -l); unit="shell-$name-$$" ;;
+  exec/*)       cmd+=(-- sh -c "${1:?--exec needs a command}"); unit="exec-$name-$$" ;;
 esac
 
 cd "$WS_DIR"
 # Run in a scope of the user's systemd instance (needs lingering, so it
 # exists without a login): nono's limits need that delegated cgroup, and
-# the metrics exporter reads usage from it (claude-<workspace>-<pid>.scope).
+# the metrics exporter reads usage from it (<agent>-<workspace>-<pid>.scope).
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
 if systemctl --user show-environment >/dev/null 2>&1; then
   cpu=(); [[ "${WS_CPUS:-0}" != 0 ]] && cpu=(-p "CPUQuota=$((WS_CPUS * 100))%")   # systemd's, not nono's
+  if [[ $mode == gateway ]]; then
+    # A service that outlives this call and restarts on failure; Stop in the
+    # UI is `systemctl --user stop`. Its output goes to the journal.
+    lim=()
+    [[ -n "$WS_MEMORY" ]] && lim+=(-p "MemoryMax=$WS_MEMORY")
+    [[ "$WS_PIDS" != 0 ]] && lim+=(-p "TasksMax=$WS_PIDS")
+    systemctl --user reset-failed "$unit" 2>/dev/null || true
+    exec systemd-run --user --quiet --collect --unit "$unit" -p WorkingDirectory="$WS_DIR" \
+      -p Restart=on-failure -p RestartSec=10 "${cpu[@]}" "${lim[@]}" -- "${cmd[@]}"
+  fi
   exec systemd-run --user --scope --quiet --collect --unit "$unit" "${cpu[@]}" -- "${cmd[@]}"
+fi
+if [[ $mode == gateway ]]; then
+  echo "No systemd --user instance: can't run the gateway as a service (enable lingering)." >&2
+  exit 1
 fi
 if [[ -n "$WS_MEMORY" || "$WS_PIDS" != 0 || "${WS_CPUS:-0}" != 0 ]]; then
   echo "No systemd --user instance: can't apply this workspace's resource limits." >&2

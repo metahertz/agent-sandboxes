@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Print a current Google access token for one connected account.
+
+nono's proxy runs this (outside the sandbox, as you) for a workspace's Google
+grant: its credential_capture entry in the workspace profile names the
+account. The access token goes into the upstream request only; the sandbox
+sees a placeholder. Never prints anything else on stdout.
+
+    google-token <account-id>
+"""
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ui"))
+import gbroker  # noqa: E402
+
+if len(sys.argv) != 2:
+    sys.exit("usage: google-token <account-id>")
+try:
+    tok = gbroker.access_token(sys.argv[1])
+except (ValueError, OSError) as e:
+    print(f"google-token: {e}", file=sys.stderr)
+    sys.exit(1)
+os.write(1, tok.encode() + b"\n")

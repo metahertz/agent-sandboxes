@@ -46,12 +46,16 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")          # pool key / token ids
 DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 MAX_HEAD = 64 * 1024
-PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("proxyd.py")]
+PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("proxyd.py"),
+                  Path(__file__).resolve().with_name("gbroker.py")]
 
 DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False, "vm_browser": False,
                   "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open", "listen": []},
                   "limits": {"memory": "", "pids": 0, "cpus": 0, "disk": "",
-                             "browser_memory": "", "browser_cpus": 0}}
+                             "browser_memory": "", "browser_cpus": 0},
+                  # Hermes workspaces: its model provider (a pool token's route, or a URL
+                  # the allowlist lets through) and model
+                  "hermes": {"llm": "", "base_url": "", "model": ""}}
 
 
 def die_with_parent():
@@ -105,6 +109,9 @@ def load_policy(name: str) -> dict:
             i if k == "ssh_keys" else f"{i}.json").is_file()]
     pol["network"].update(saved.get("network", {}))
     pol["limits"].update(saved.get("limits", {}))
+    pol["hermes"].update(saved.get("hermes", {}))
+    if pol["hermes"]["llm"] not in pol["tokens"]:
+        pol["hermes"]["llm"] = ""
     pol["claude_md"] = saved.get("claude_md") is True
     pol["vm_browser"] = saved.get("vm_browser") is True
     return pol
@@ -167,6 +174,16 @@ def container_filtered(name: str) -> bool:
 
 def is_microvm(ws: dict[str, str] | None) -> bool:
     return bool(ws) and ws.get("WS_KIND") == "microvm"
+
+
+AGENTS = {"claude": "Claude Code", "hermes": "Hermes"}
+
+
+def ws_agent(ws: dict[str, str] | None) -> str:
+    """Which agent the workspace runs (WS_AGENT; workspaces made before there
+    was a choice run Claude)."""
+    agent = (ws or {}).get("WS_AGENT", "claude")
+    return agent if agent in AGENTS else "claude"
 
 
 def vm_cid(ws: dict[str, str]) -> int:
