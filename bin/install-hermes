@@ -30,8 +30,12 @@ mkdir -p "$OPT"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 echo "==> Hermes $HERMES_TAG ($HERMES_COMMIT) into $OPT"
-curl -fsSL -o "$tmp/install.sh" \
-  "https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
+url="https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
+curl -fsSL -o "$tmp/install.sh" "$url" || {
+  echo "Couldn't download Hermes's installer from $url" >&2
+  echo "(is HERMES_COMMIT in hermes.lock a commit of NousResearch/hermes-agent?)" >&2
+  exit 1
+}
 
 # The installer would add ~/.local/bin to your shell rc files and publish
 # `hermes` there; keep it to opt/ (a HOME of its own for that), but let it use
