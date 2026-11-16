@@ -230,13 +230,27 @@
           </section>
           <section class="card hermes-only">
             <h2>Hermes model</h2>
-            <p class="hint">Hermes' model provider, pinned over its own <code>config.yaml</code> (managed settings). Either an API token from the pool, ticked above (OpenRouter, OpenAI, or a custom OpenAI-compatible API, e.g. your own server over <code>http://</code>, through the bridge): Hermes gets only its placeholder. Or the URL of a server that needs no key, which the network allowlist must let through (e.g. <code>192.168.1.20:11434</code>). Restart Hermes (and its gateway) to apply.</p>
+            <p class="hint">Hermes' model provider, pinned over its own <code>config.yaml</code> (managed settings). With an API key, the key goes in the pool and Hermes gets only a placeholder: the proxy adds the real key on requests to that provider (an <code>http://</code> server on your network goes through the bridge, so it needn't be on the allowlist). A server that needs no key must be let through the network allowlist (e.g. <code>192.168.1.20:11434</code>). Restart Hermes (and its gateway) to apply.</p>
             <div class="two">
               <label>Provider <select name="hermes_llm" id="acc-hermes-llm"></select></label>
               <label>Model <input name="hermes_model" placeholder="e.g. anthropic/claude-sonnet-4.5" autocomplete="off" spellcheck="false"></label>
             </div>
             <label id="acc-hermes-url">Server URL <span class="muted">(no key; OpenAI-compatible)</span>
               <input name="hermes_base_url" placeholder="http://192.168.1.20:11434/v1" autocomplete="off" spellcheck="false"></label>
+            <div id="acc-hermes-new" hidden>
+              <div class="two">
+                <label>Service <select name="hermes_new_service" id="acc-hermes-new-service">
+                  <option value="openrouter">OpenRouter</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="custom">OpenAI-compatible server</option>
+                </select></label>
+                <label>Name in the pool <span class="muted">(optional)</span> <input name="hermes_new_id" placeholder="e.g. openrouter" autocomplete="off" spellcheck="false"></label>
+              </div>
+              <label id="acc-hermes-new-url" hidden>Server URL <span class="muted">(OpenAI-compatible, up to <code>/v1</code>; gets the key as <code>Authorization: Bearer …</code>)</span>
+                <input name="hermes_new_url" placeholder="https://llm.example.com/v1 or http://192.168.1.20:8000/v1" autocomplete="off" spellcheck="false"></label>
+              <label>API key <input name="hermes_new_key" type="password" autocomplete="off" spellcheck="false"></label>
+              <p class="hint">Saving adds the key to the pool (Keys &amp; tokens) and ticks it for this workspace.</p>
+            </div>
             <p class="hint">A Telegram Bot API token ticked above sets up Hermes' Telegram gateway (its token stays a placeholder, swapped into the Bot API's URL by the proxy); who may talk to the bot is Hermes' own setting (<code>TELEGRAM_ALLOWED_USERS</code>, <code>hermes gateway setup</code> in the Hermes tab). Google grants appear above like tokens: create them under Keys &amp; tokens. Hermes reads mail as untrusted input, so keep this workspace's network narrow.</p>
           </section>
           <section class="card sandbox-only claude-only">

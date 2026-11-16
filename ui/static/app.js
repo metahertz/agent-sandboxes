@@ -846,6 +846,7 @@ function checkItem(name, value, checked, title, sub) {
 
 const lines = (text) => text.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
 
+let poolTokenIds = [];
 async function loadAccess() {
   const w = current();
   if (!w) return;
@@ -860,6 +861,7 @@ async function loadAccess() {
     ssh.replaceChildren(...pool.ssh.map((k) =>
       checkItem("ssh", k.id, policy.ssh_keys.includes(k.id), k.id, `${k.type} ${k.fingerprint}`)));
     if (!pool.ssh.length) ssh.append(el("p", { className: "muted", textContent: "No SSH keys in the pool yet — add one under Keys & tokens." }));
+    poolTokenIds = pool.tokens.map((t) => t.id);
     const tok = $("#acc-tokens");
     tok.replaceChildren(...pool.tokens.map((t) =>
       checkItem("token", t.id, policy.tokens.includes(t.id), t.id, `${t.label} → $${t.env_var}`)));
@@ -879,13 +881,17 @@ async function loadAccess() {
     form.elements.browser_cpus.value = policy.limits.browser_cpus || "";
     form.elements.claude_md.checked = policy.claude_md;
     const llm = $("#acc-hermes-llm");
-    llm.replaceChildren(el("option", { value: "", textContent: "No token: a server URL (below)" }),
-      ...pool.tokens.filter((t) => LLM_SERVICES.includes(t.service)).map((t) =>
-        el("option", { value: t.id, textContent: `${t.id} (${t.label})` })));
-    llm.value = policy.hermes?.llm || "";
+    const llmTokens = pool.tokens.filter((t) => LLM_SERVICES.includes(t.service));
+    llm.replaceChildren(
+      ...llmTokens.map((t) => el("option", { value: t.id, textContent: `${t.id} (${t.label})` })),
+      el("option", { value: NEW_LLM, textContent: "Add an API key…" }),
+      el("option", { value: "", textContent: "A server that needs no key" }));
+    // Nothing set yet: offer the first pool key, or adding one
+    llm.value = policy.hermes?.llm || (policy.hermes?.base_url ? "" : llmTokens[0]?.id || NEW_LLM);
     form.elements.hermes_model.value = policy.hermes?.model || "";
     form.elements.hermes_base_url.value = policy.hermes?.base_url || "";
-    $("#acc-hermes-url").hidden = !!llm.value;
+    for (const n of ["hermes_new_id", "hermes_new_url", "hermes_new_key"]) form.elements[n].value = "";
+    hermesLlmChanged();
     form.elements.vm_browser.checked = !!policy.vm_browser;
     form.elements.container.value = policy.network.container;
     $("#acc-restart").hidden = w.claude === "stopped";
@@ -901,9 +907,43 @@ async function saveAccess(restart) {
   const form = $("#access-form");
   const out = $("#acc-msg");
   out.classList.remove("err");
+  let llm = w.agent === "hermes" ? form.elements.hermes_llm.value : "";
+  if (llm === NEW_LLM) {
+    // Add the key to the pool first; the policy below then ticks and uses it
+    const service = form.elements.hermes_new_service.value;
+    const url = form.elements.hermes_new_url.value.trim();
+    const id = form.elements.hermes_new_id.value.trim() || defaultLlmId(service, url);
+    const key = form.elements.hermes_new_key.value.trim();
+    if (!key) {
+      out.textContent = service === "custom"
+        ? "Hermes model: paste the server's API key, or pick “A server that needs no key”."
+        : "Hermes model: paste the API key.";
+      out.classList.add("err");
+      return;
+    }
+    out.textContent = "Adding the key to the pool…";
+    try {
+      await api("POST", "pool/tokens", { id, service, secret: key,
+        custom: service === "custom" ? { upstream: url, header: "Authorization", format: "Bearer {}",
+          env_var: `${id.toUpperCase().replace(/-/g, "_").replace(/^(\d)/, "LLM_$1")}_API_KEY` } : undefined });
+    } catch (e) {
+      out.textContent = `Hermes model: ${e.message}`;
+      out.classList.add("err");
+      return;
+    }
+    llm = id;
+    // It's in the pool now: a retry (if the policy below fails) picks it, not adds it again
+    poolTokenIds.push(id);
+    const sel = form.elements.hermes_llm;
+    sel.insertBefore(el("option", { value: id, textContent: id }), sel.querySelector(`option[value="${NEW_LLM}"]`));
+    sel.value = id;
+    hermesLlmChanged();
+  }
+  const tokens = $$('input[name="token"]:checked', form).map((i) => i.value);
+  if (llm && !tokens.includes(llm)) tokens.push(llm);     // the provider's key comes with it
   const body = {
     ssh_keys: $$('input[name="ssh"]:checked', form).map((i) => i.value),
-    tokens: $$('input[name="token"]:checked', form).map((i) => i.value),
+    tokens,
     network: { mode: form.elements.mode?.value || "claude-code", allow: lines(form.elements.allow.value), deny: lines(form.elements.deny.value),
       container: form.elements.container.value || "open", listen: lines(form.elements.listen.value) },
     limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0),
@@ -911,7 +951,7 @@ async function saveAccess(restart) {
       browser_memory: form.elements.browser_memory.value.trim(), browser_cpus: Number(form.elements.browser_cpus.value || 0) },
     claude_md: form.elements.claude_md.checked,
     vm_browser: form.elements.vm_browser.checked,
-    hermes: { llm: form.elements.hermes_llm.value, model: form.elements.hermes_model.value.trim(),
+    hermes: { llm, model: form.elements.hermes_model.value.trim(),
       base_url: form.elements.hermes_base_url.value.trim() },
   };
   out.textContent = "Saving…";
@@ -938,7 +978,26 @@ async function saveAccess(restart) {
 $("#access-form").addEventListener("submit", (ev) => { ev.preventDefault(); saveAccess(false); });
 // Pool token services Hermes can use as its model provider
 const LLM_SERVICES = ["openrouter", "openai", "custom"];
-$("#acc-hermes-llm").addEventListener("change", (ev) => ($("#acc-hermes-url").hidden = !!ev.target.value));
+const NEW_LLM = "+new";
+function hermesLlmChanged() {
+  const v = $("#acc-hermes-llm").value;
+  $("#acc-hermes-url").hidden = v !== "";
+  $("#acc-hermes-new").hidden = v !== NEW_LLM;
+  $("#acc-hermes-new-url").hidden = $("#acc-hermes-new-service").value !== "custom";
+}
+// A free pool name for a new provider key: openrouter, openai, llm-<host>
+function defaultLlmId(service, url) {
+  let host = "";
+  try { host = new URL(url).hostname; } catch { /* the server says what's wrong with the URL */ }
+  const clean = (s) => s.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 36);
+  const base = clean(service === "custom" ? `llm-${host || "server"}` : service) || "llm";
+  const taken = new Set(poolTokenIds);
+  let id = base;
+  for (let i = 2; taken.has(id); i++) id = `${base}-${i}`;
+  return id;
+}
+$("#acc-hermes-llm").addEventListener("change", hermesLlmChanged);
+$("#acc-hermes-new-service").addEventListener("change", hermesLlmChanged);
 $("#acc-restart").addEventListener("click", () => saveAccess(true));
 
 // ------------------------------------------------------------------ keys & tokens pool
