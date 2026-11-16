@@ -99,7 +99,7 @@ VM_GUEST_CA = "/usr/local/share/ca-certificates/aio-proxy.crt"   # where the gue
 VM_EXTRA_HOSTS = {"claude": ["claude.ai", "downloads.claude.ai"],
                   # Hermes' installer: its checkout, uv and Python, its pinned packages
                   # and tools (its own mirror), the TUI's Node build
-                  "hermes": ["github.com", "codeload.github.com", "raw.githubusercontent.com",
+                  "hermes": ["github.com", "api.github.com", "codeload.github.com", "raw.githubusercontent.com",
                              "objects.githubusercontent.com", "release-assets.githubusercontent.com",
                              "hermes-assets.nousresearch.com", "pypi.org", "files.pythonhosted.org",
                              "nodejs.org", "registry.npmjs.org"]}

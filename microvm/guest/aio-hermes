@@ -16,14 +16,30 @@ lock=/run/aio-config/hermes.lock
 [[ -r $lock ]] || { echo "No Hermes pin on the config disk: restart the VM from the web UI." >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$lock"
+# raw.githubusercontent.com rate-limits busy addresses (429): retry (curl
+# honours Retry-After), then try GitHub's contents API, a separate limit
+fetch_installer() {
+  local path="NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh" code
+  code=$(curl -sSL --retry 4 --retry-max-time 120 -o "$1" -w '%{http_code}' \
+    "https://raw.githubusercontent.com/$path") || code=000
+  [[ $code == 200 ]] && return 0
+  echo "raw.githubusercontent.com answered $code; trying api.github.com" >&2
+  code=$(curl -sSL --retry 4 --retry-max-time 120 -o "$1" -w '%{http_code}' \
+    -H 'Accept: application/vnd.github.raw' \
+    "https://api.github.com/repos/NousResearch/hermes-agent/contents/scripts/install.sh?ref=$HERMES_COMMIT") || code=000
+  [[ $code == 200 ]] && return 0
+  echo "Couldn't download Hermes's installer (scripts/install.sh at $HERMES_COMMIT): HTTP $code" >&2
+  [[ $code == 404 ]] && echo "Is HERMES_COMMIT in hermes.lock a commit of NousResearch/hermes-agent?" >&2
+  [[ $code == 429 || $code == 403 ]] && echo "GitHub is rate-limiting this address; try again in a while." >&2
+  return 1
+}
 dir=$HOME/.local/share/hermes-agent
 hermes=$dir/.hermes/bin/hermes
 if [[ ! -x $hermes || $(cat "$dir/.aio-installed" 2>/dev/null) != "$HERMES_COMMIT" ]]; then
   echo "Installing Hermes $HERMES_TAG in this VM (first start: a few minutes)…"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL -o "$tmp/install.sh" \
-    "https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
+  fetch_installer "$tmp/install.sh" || exit 1
   HERMES_INSTALL_CHANNEL=stable bash "$tmp/install.sh" --commit "$HERMES_COMMIT" --dir "$dir" \
     --hermes-home "$HOME/.hermes" --non-interactive --skip-browser --skip-computer-use
   [[ $(git -C "$dir" rev-parse HEAD) == "$HERMES_COMMIT" ]] || { echo "Installed the wrong commit" >&2; exit 1; }
