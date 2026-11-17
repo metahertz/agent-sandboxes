@@ -474,7 +474,7 @@
           <p class="form-msg" id="auth-msg" role="status"></p>
         </section>
       </div>
-      <form id="mon-form" class="settings-form">
+      <div class="settings-form">
         <section class="card" id="google-card">
           <h2>Google accounts</h2>
           <p class="hint">For Google grants (Keys &amp; tokens): read-only access to Gmail or Calendar for a workspace, narrower than Google's own scopes. Uses your own OAuth client: in Google Cloud Console, enable the Gmail and Calendar APIs, set up the OAuth consent screen (you as a test user is enough), and create an OAuth client of type <strong>Desktop app</strong>. Its refresh tokens stay in <code>secrets/google/</code> on this host.</p>
@@ -497,6 +497,8 @@
           </form>
           <p class="form-msg" id="g-msg" role="status"></p>
         </section>
+      </div>
+      <form id="mon-form" class="settings-form">
         <section class="card" id="ca-card" hidden>
           <div class="card-head"><h2>HTTPS certificate</h2>
             <a class="btn" href="/ca.crt" download="agent-sandboxes-ca.crt">Download CA certificate</a></div>
