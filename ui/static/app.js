@@ -1501,13 +1501,37 @@ function gMsg(text, isErr = false) {
   $("#g-msg").classList.toggle("err", isErr);
 }
 
+let googleState = null;      // the last GET google
 async function loadGoogle() {
   let g;
   try { g = await api("GET", "google"); } catch (e) { return gMsg(e.message, true); }
-  $("#g-client-state").textContent = g.client ? `OAuth client: ${g.clientId}` : "No OAuth client yet.";
-  $("#g-client-form").elements.client_id.value = g.clientId || "";
+  googleState = g;
+  const kind = { web: "Web application", desktop: "Desktop app" }[g.clientType];
+  $("#g-client-state").textContent = g.client ? `${kind} client ${g.clientId}` : "none yet: set one up first";
+  $("#g-setup").open = !g.client;
+  const cf = $("#g-client-form").elements;
+  cf.client_id.value = g.clientId || "";
+  if (!g.client) cf.type.value = g.callbackProblem ? "desktop" : "web";
+  $("#g-callback").textContent = g.callback;
+  $("#g-callback-problem").textContent = g.callbackProblem;
+  $("#g-step-web").hidden = !!g.callbackProblem;
+  $("#g-step-desktop").hidden = !g.callbackProblem;
   $("#g-redirect").textContent = g.redirect;
+
+  // Connect: straight back here with a Web client (when Google allows this
+  // page's name), else the paste-back way (a Desktop client)
   $("#g-connect-form").hidden = !g.client;
+  const redirect = g.clientType === "web" && !g.callbackProblem;
+  $("#g-signin").textContent = redirect ? "Sign in with Google" : "Open Google consent ↗";
+  const hint = $("#g-connect-hint");
+  hint.textContent = g.clientType === "web" && g.callbackProblem
+    ? `${g.callbackProblem} A Web application client can only send you back to a page Google accepts; for this address, set up a Desktop app client instead.`
+    : redirect && g.callbackListed === false
+      ? `Your client's JSON doesn't list ${g.callback} as an authorized redirect URI: add it in Google Cloud Console (then save the client again), or Google will refuse the sign-in.`
+      : "";
+  hint.hidden = !hint.textContent;
+  $("#g-signin").disabled = g.clientType === "web" && !!g.callbackProblem;
+
   const rows = g.accounts.map((a) => {
     const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Disconnect" });
     del.addEventListener("click", async () => {
@@ -1535,22 +1559,41 @@ $("#g-client-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const f = ev.currentTarget.elements;
   try {
-    await api("PUT", "google/client", { client_id: f.client_id.value.trim(), client_secret: f.client_secret.value.trim() });
+    const r = await api("PUT", "google/client", { json: f.json.value.trim() || undefined, client_id: f.client_id.value.trim(),
+      client_secret: f.client_secret.value.trim(), type: f.type.value });
     f.client_secret.value = "";
-    gMsg("OAuth client saved.");
+    f.json.value = "";
+    gMsg(`OAuth client saved (${r.type === "web" ? "Web application" : "Desktop app"}). Now connect an account.`);
   } catch (e) { gMsg(e.message, true); }
   loadGoogle();
 });
-$("#g-connect-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
+$("#g-copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("#g-callback").textContent);
+    gMsg("Copied the redirect URI.");
+  } catch {
+    getSelection().selectAllChildren($("#g-callback"));     // no clipboard over plain HTTP: select it
+    gMsg("Selected: copy it with Ctrl+C / ⌘C.");
+  }
+});
+async function googleConnect(redirect) {
   const scopes = $$('#g-scopes input:checked').map((i) => i.value);
   try {
-    const r = await api("POST", "google/connect", { scopes });
+    const r = await api("POST", "google/connect", { scopes, redirect });
+    if (redirect) {
+      gMsg("Taking you to Google…");
+      location.assign(r.url);        // Google sends you back to this page
+      return;
+    }
     googleConnectState = r.state;
     window.open(r.url, "_blank", "noopener");
     $("#g-finish").hidden = false;
     gMsg("Allow access in the Google tab, then paste the address it ends on below.");
   } catch (e) { gMsg(e.message, true); }
+}
+$("#g-connect-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  googleConnect(googleState?.clientType === "web" && !googleState.callbackProblem);
 });
 $("#g-finish-btn").addEventListener("click", async () => {
   const f = $("#g-connect-form").elements;
@@ -1563,6 +1606,15 @@ $("#g-finish-btn").addEventListener("click", async () => {
   } catch (e) { gMsg(e.message, true); }
   loadGoogle();
 });
+// Back from Google's sign-in (GET /oauth/google/callback sends you here)
+function googleReturn() {
+  const q = new URLSearchParams(location.search);
+  if (!q.has("google") && !q.has("google_error")) return;
+  if (q.has("google")) gMsg(`Connected ${q.get("google")}. Create grants for it with + Add token (service Google).`);
+  else gMsg(q.get("google_error"), true);
+  history.replaceState(null, "", location.pathname + location.hash);
+  $("#google-card").scrollIntoView({ block: "center" });
+}
 
 async function loadSettings() {
   loadAuth();
@@ -2234,6 +2286,7 @@ window.addEventListener("hashchange", () => {
 });
 
 if (state.view in PAGE_LOAD) PAGE_LOAD[state.view]();
+googleReturn();
 refresh();
 setInterval(refresh, 4000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });

@@ -401,14 +401,33 @@ Hermes gets the same isolation as Claude, in either kind:
 A **Google grant** gives a workspace read access to Gmail or Calendar that is narrower than
 Google's OAuth scopes allow. It works for Claude workspaces too.
 
-1. **OAuth client.** Under *Keys & tokens → Google accounts*, add your own OAuth client from
-   Google Cloud Console. It must be of type *Desktop app*, with the Gmail and/or Calendar API
-   enabled, and you as a test user on the consent screen.
+1. **OAuth client, once.** Under *Keys & tokens → Google accounts → Your OAuth client*,
+   follow the steps. They link straight to the pages in Google Cloud Console:
+   - Enable the Gmail and/or Calendar API.
+   - Set up the consent screen (Google Auth Platform), then **publish** it. While it's
+     in *Testing*, Google ends the sign-in after 7 days. An unverified app gets a warning
+     before consent; go on through *Advanced*.
+   - Create a client, of the type the card says, and paste its downloaded JSON (or its
+     ID, secret and type).
+
+   It has to be your own client: Gmail read access is a *restricted* scope, so a client
+   shared by this project would need Google's verification and security assessment.
 2. **Connect an account.** Tick the access you'll want (`gmail.readonly`, `gmail.metadata`,
-   `calendar.readonly`) and click Connect. After Google's consent the browser lands on an
-   address that doesn't load (`http://127.0.0.1:1/?…`); paste it back in. This works
-   whatever name the UI has. The refresh token stays in `secrets/google/` and never enters
-   a sandbox.
+   `calendar.readonly`) and click **Sign in with Google**. There are two ways back:
+   - **Redirect** (a *Web application* client): Google sends you back to this page, at
+     `https://<the UI's name>/oauth/google/callback`, which must be one of the client's
+     authorized redirect URIs. The card shows the exact address, with a Copy button.
+     Google accepts it only for a name under a public top-level domain (it needn't resolve
+     on the internet: a public-domain name in your local DNS is fine), or `localhost`, and
+     only over HTTPS. The session cookie is `SameSite=Strict`, so it doesn't come along on
+     the way back from Google; the callback reloads itself once from this site, and then
+     it does.
+   - **Paste-back** (a *Desktop app* client), for a UI opened by IP address or a local
+     name: the browser lands on an address that doesn't load (`http://127.0.0.1:1/?…`);
+     paste it into the card.
+
+   The card says which way applies to the address you opened it at. The refresh token
+   stays in `secrets/google/` and never enters a sandbox.
 3. **Create a grant.** Under *Keys & tokens*, add a token of service *Google* with an
    account and a preset, then tick it for workspaces like any token. The presets:
 

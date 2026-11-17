@@ -534,24 +534,41 @@
         </section>
         <section class="card" id="google-card">
           <h2>Google accounts</h2>
-          <p class="hint">For Google grants (API tokens above, service Google): read-only access to Gmail or Calendar for a workspace, narrower than Google's own scopes. Uses your own OAuth client: in Google Cloud Console, enable the Gmail and Calendar APIs, set up the OAuth consent screen (you as a test user is enough), and create an OAuth client of type <strong>Desktop app</strong>. Its refresh tokens stay in <code>secrets/google/</code> on this host.</p>
-          <form id="g-client-form" class="row">
-            <label>Client ID <input name="client_id" placeholder="….apps.googleusercontent.com" autocomplete="off" spellcheck="false"></label>
-            <label>Client secret <input name="client_secret" type="password" autocomplete="off"></label>
-            <button class="btn" type="submit">Save client</button>
-          </form>
-          <p class="hint" id="g-client-state"></p>
+          <p class="hint">For Google grants (API tokens above, service Google): read-only access to Gmail or Calendar for a workspace, narrower than Google's own scopes. You sign in with your own OAuth client (set up once, below); the refresh tokens stay in <code>secrets/google/</code> on this host.</p>
           <div class="keylist" id="g-accounts"></div>
-          <form id="g-connect-form">
+          <form id="g-connect-form" hidden>
             <h3>Connect an account</h3>
             <div class="checks" id="g-scopes"></div>
-            <div class="row"><button class="btn" type="submit">Open Google consent ↗</button></div>
+            <div class="row">
+              <button class="btn primary" type="submit" id="g-signin">Sign in with Google</button>
+            </div>
+            <p class="hint g-warn" id="g-connect-hint" hidden></p>
             <div id="g-finish" hidden>
               <p class="hint">After you allow access, the browser goes to an address that doesn't load (<code id="g-redirect"></code>…). Copy that whole address from the address bar and paste it here.</p>
               <div class="row"><input name="url" placeholder="http://127.0.0.1:1/?state=…&amp;code=…" autocomplete="off" spellcheck="false">
                 <button class="btn primary" type="button" id="g-finish-btn">Finish</button></div>
             </div>
           </form>
+          <details class="g-setup" id="g-setup">
+            <summary><strong>Your OAuth client</strong> <span class="muted" id="g-client-state"></span></summary>
+            <ol class="steps">
+              <li>In Google Cloud Console, pick or create a project, then enable the <a href="https://console.cloud.google.com/apis/library/gmail.googleapis.com" target="_blank" rel="noopener">Gmail API</a> and the <a href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com" target="_blank" rel="noopener">Google Calendar API</a> in it.</li>
+              <li>Set up its <a href="https://console.cloud.google.com/auth/overview" target="_blank" rel="noopener">Google Auth Platform</a> (the consent screen): audience <em>External</em> (or <em>Internal</em> for your own Workspace domain), you as a test user. Then <a href="https://console.cloud.google.com/auth/audience" target="_blank" rel="noopener">publish it</a> (Audience → Publish app): while it's in <em>Testing</em>, Google ends the sign-in after 7 days. Unverified, it shows a warning before consent; go on through <em>Advanced</em>.</li>
+              <li id="g-step-web"><a href="https://console.cloud.google.com/auth/clients/create" target="_blank" rel="noopener">Create an OAuth client</a> of type <strong>Web application</strong>, with this <em>authorized redirect URI</em>:
+                <span class="g-copy"><code id="g-callback"></code> <button class="btn" type="button" id="g-copy">Copy</button></span></li>
+              <li id="g-step-desktop" hidden><a href="https://console.cloud.google.com/auth/clients/create" target="_blank" rel="noopener">Create an OAuth client</a> of type <strong>Desktop app</strong>. (<span id="g-callback-problem"></span>)</li>
+              <li>Download the client's JSON (the ⬇ on its page) and paste it here, or type its ID and secret.</li>
+            </ol>
+            <form id="g-client-form" class="g-client-form">
+              <label>Client JSON <textarea name="json" rows="3" spellcheck="false" placeholder='{"web":{"client_id":"….apps.googleusercontent.com","client_secret":"…",…}}'></textarea></label>
+              <div class="row">
+                <label>or Client ID <input name="client_id" placeholder="….apps.googleusercontent.com" autocomplete="off" spellcheck="false"></label>
+                <label>Client secret <input name="client_secret" type="password" autocomplete="off"></label>
+                <label>Type <select name="type"><option value="web">Web application</option><option value="desktop">Desktop app</option></select></label>
+              </div>
+              <div class="row"><button class="btn" type="submit">Save client</button></div>
+            </form>
+          </details>
           <p class="form-msg" id="g-msg" role="status"></p>
         </section>
         <p class="form-msg" id="pool-msg" role="status"></p>

@@ -29,6 +29,7 @@ import fcntl
 import grp
 import hashlib
 import hmac
+import html
 import json
 import mimetypes
 import os
@@ -386,6 +387,8 @@ async def handle_ui(req: Request, reader, w):
         return
     if req.path.startswith("/auth/"):
         return await auth_public(req, reader, w)
+    if req.path == gbroker.CALLBACK_PATH and req.method == "GET":
+        return await google_callback(req, w)
     if req.path == "/static/login.js" and req.method == "GET":
         return await respond(w, 200, (STATIC / "login.js").read_bytes(), "text/javascript; charset=utf-8",
                              {"Content-Security-Policy": ui_csp(req)})
@@ -1873,7 +1876,66 @@ async def pool_api(req: Request, parts: list[str], w):
 # ---- Google accounts (Settings): your OAuth client and the accounts you
 # connected with it; grants on them are pool tokens (ui/gbroker.py)
 
-google_pending: dict[str, tuple[str, list[str], float]] = {}   # state -> (PKCE verifier, scopes, started)
+google_pending: dict[str, tuple[str, list[str], float, str]] = {}   # state -> (PKCE verifier, scopes, started, redirect_uri)
+
+
+def google_callback_problem(req: Request) -> str:
+    """Why Google won't send you back to this page ("" if it will): its name,
+    or plain HTTP (Google wants https://, except for localhost)."""
+    if (problem := gbroker.callback_problem(req.hostname)):
+        return problem
+    if SCHEME != "https" and req.hostname not in ("localhost", "127.0.0.1", "::1"):
+        return "Google only redirects to https:// pages (this UI runs without TLS: AIO_UI_TLS=0)."
+    return ""
+
+
+def google_callback_uri(req: Request) -> str:
+    """Where a Web application client sends you back to: this page's own origin."""
+    return f"{SCHEME}://{req.host}{gbroker.CALLBACK_PATH}"
+
+
+async def google_finish(code: str, pending: tuple) -> dict:
+    """Trade a consent's code for the account's tokens, and keep them."""
+    got = await asyncio.to_thread(gbroker.exchange, code, pending[0], pending[3])
+    base = re.sub(r"[^a-z0-9]+", "-", got["email"].split("@")[0].lower()).strip("-")[:30] or "google"
+    existing = {a["email"]: a["id"] for a in gbroker.accounts()}
+    aid = existing.get(got["email"]) or next(
+        x for x in [base] + [f"{base}-{i}" for i in range(2, 100)] if not gbroker.account_path(x).exists())
+    gbroker.save_account(aid, got)
+    return {"id": aid, "email": got["email"], "scopes": got["scopes"]}
+
+
+async def google_callback(req: Request, w):
+    """Google sends the browser back here after consent (a Web application
+    client). The session cookie is SameSite=Strict, so this first, cross-site
+    arrival comes without it: answer with a page that reloads the address
+    from this site (then the cookie comes along), once."""
+    q = req.query
+    if not ui_authed(req):
+        if q.get("again") == "1":
+            return await respond(w, 401, (STATIC / "login.html").read_bytes(), "text/html; charset=utf-8",
+                                 {"Content-Security-Policy": ui_csp(req)})
+        again = req.path + "?" + urllib.parse.urlencode({**q, "again": "1"})
+        page = ('<!doctype html><meta charset="utf-8"><title>Signing in…</title>'
+                f'<meta http-equiv="refresh" content="0;url={html.escape(again, quote=True)}">'
+                '<p style="font:14px system-ui;margin:2rem">Finishing the Google sign-in…</p>')
+        return await respond(w, 200, page, "text/html; charset=utf-8",
+                             {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+    result: dict
+    pending = google_pending.get(q.get("state", ""))
+    if q.get("error"):
+        google_pending.pop(q.get("state", ""), None)
+        result = {"google_error": f"Google: {q['error']}"}
+    elif not pending or pending[3] != google_callback_uri(req) or not q.get("code"):
+        result = {"google_error": "That sign-in expired or was already used: start it again"}
+    else:
+        del google_pending[q["state"]]
+        try:
+            got = await google_finish(q["code"], pending)
+            result = {"google": got["email"]}
+        except (ValueError, OSError, urllib.error.URLError) as e:
+            result = {"google_error": str(e)[:300]}
+    await respond(w, 303, headers={"Location": "/?" + urllib.parse.urlencode(result) + "#~keys"})
 
 
 async def google_api(req: Request, parts: list[str], w):
@@ -1882,21 +1944,23 @@ async def google_api(req: Request, parts: list[str], w):
         body = json.loads(req.body or b"{}") if req.body else {}
         if parts == [] and m == "GET":
             c = gbroker.client()
+            callback = google_callback_uri(req)
             return await send_json(w, {
                 "client": bool(c), "clientId": (c or {}).get("client_id", ""),
+                "clientType": (c or {}).get("type", "desktop"),
+                # this page's own address for Google to send you back to, and
+                # whether Google allows it (and the client lists it, if known)
+                "callback": callback, "callbackProblem": google_callback_problem(req),
+                "callbackListed": None if not (c or {}).get("redirect_uris") else callback in c["redirect_uris"],
                 "accounts": gbroker.accounts(), "redirect": gbroker.REDIRECT_URI,
                 "scopes": list(gbroker.SCOPES),
                 "presets": {k: {"label": v["label"], "detail": v["detail"], "scope": v["scope"],
                                 "needsLabel": bool(v.get("needs_label"))} for k, v in gbroker.PRESETS.items()}})
         if parts == ["client"] and m == "PUT":
-            cid, secret = str(body.get("client_id", "")).strip(), str(body.get("client_secret", "")).strip()
-            if not re.fullmatch(r"[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com", cid):
-                raise ValueError("Client ID: the ….apps.googleusercontent.com one from Google Cloud Console")
-            if not re.fullmatch(r"[A-Za-z0-9_-]{10,100}", secret):
-                raise ValueError("Paste the client secret")
+            c = gbroker.parse_client(body)
             gbroker.GOOGLE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-            private_write(gbroker.CLIENT_FILE, json.dumps({"client_id": cid, "client_secret": secret}) + "\n")
-            return await send_json(w, {"ok": True})
+            private_write(gbroker.CLIENT_FILE, json.dumps(c) + "\n")
+            return await send_json(w, {"ok": True, "type": c["type"]})
         if parts == ["connect"] and m == "POST":
             scopes = [x for x in body.get("scopes", []) if x in gbroker.SCOPES]
             if not scopes:
@@ -1906,24 +1970,29 @@ async def google_api(req: Request, parts: list[str], w):
                 del google_pending[k]
             state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-            google_pending[state] = (verifier, scopes, now)
-            return await send_json(w, {"url": gbroker.auth_url(scopes, state, challenge), "state": state})
+            # redirect: Google sends the browser back to this page (a Web
+            # application client); otherwise you paste the address back
+            if body.get("redirect"):
+                if (problem := google_callback_problem(req)):
+                    raise ValueError(problem)
+                if (gbroker.client() or {}).get("type") != "web":
+                    raise ValueError("Signing in with a redirect needs a Web application OAuth client")
+                redirect = google_callback_uri(req)
+            else:
+                redirect = gbroker.REDIRECT_URI
+            google_pending[state] = (verifier, scopes, now, redirect)
+            return await send_json(w, {"url": gbroker.auth_url(scopes, state, challenge, redirect), "state": state})
         if parts == ["finish"] and m == "POST":
             # The address the browser couldn't open after consent: its code and state
             q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(str(body.get("url", "")).strip()).query))
             if q.get("error"):
                 raise ValueError(f"Google: {q['error']}")
-            pending = google_pending.pop(q.get("state", ""), None)
-            if not pending or not q.get("code"):
+            pending = google_pending.get(q.get("state", ""))
+            if not pending or pending[3] != gbroker.REDIRECT_URI or not q.get("code"):
                 raise ValueError("Paste the whole address from the browser's address bar (it starts "
                                  f"{gbroker.REDIRECT_URI}?state=…), from the Connect you just started")
-            got = await asyncio.to_thread(gbroker.exchange, q["code"], pending[0])
-            base = re.sub(r"[^a-z0-9]+", "-", got["email"].split("@")[0].lower()).strip("-")[:30] or "google"
-            existing = {a["email"]: a["id"] for a in gbroker.accounts()}
-            aid = existing.get(got["email"]) or next(
-                x for x in [base] + [f"{base}-{i}" for i in range(2, 100)] if not gbroker.account_path(x).exists())
-            gbroker.save_account(aid, got)
-            return await send_json(w, {"ok": True, "id": aid, "email": got["email"], "scopes": got["scopes"]})
+            del google_pending[q["state"]]
+            return await send_json(w, {"ok": True, **await google_finish(q["code"], pending)})
         if len(parts) >= 2 and parts[0] == "accounts" and gbroker.ACCOUNT_RE.match(parts[1]):
             aid = parts[1]
             if not gbroker.account(aid):

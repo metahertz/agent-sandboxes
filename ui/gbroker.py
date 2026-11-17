@@ -33,7 +33,7 @@ from pathlib import Path
 from common import SECRETS
 
 GOOGLE_DIR = SECRETS / "google"
-CLIENT_FILE = GOOGLE_DIR / "client.json"        # {"client_id", "client_secret"}: your OAuth client
+CLIENT_FILE = GOOGLE_DIR / "client.json"        # {"client_id", "client_secret", "type", "redirect_uris"}
 ACCOUNTS = GOOGLE_DIR / "accounts"              # <id>.json: email, refresh_token, scopes
 CACHE = GOOGLE_DIR / "cache"                    # <id>.json: access_token, expires (bin/google-token)
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -42,8 +42,14 @@ REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 # A "Desktop app" OAuth client may redirect to any loopback port. Nothing
 # listens on this one: you copy the address the browser fails to open back
-# into the UI, so this works whatever host and name the UI has.
+# into the UI, so this works whatever host and name the UI has. A "Web
+# application" client redirects to the UI itself (CALLBACK_PATH) instead,
+# which Google allows only for a name under a public TLD, or localhost.
 REDIRECT_URI = "http://127.0.0.1:1/"
+CALLBACK_PATH = "/oauth/google/callback"
+# Names Google won't take as a web redirect (no public suffix)
+PRIVATE_TLDS = {"local", "lan", "home", "internal", "localdomain", "arpa", "test", "invalid", "example",
+                "corp", "intranet", "private", "intra", "localhost", "router", "box"}
 CAPTURE_TTL = 2700                              # access tokens last 3600 s
 ACCOUNT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # a Gmail label id (INBOX, Label_123…)
@@ -154,24 +160,70 @@ def _post(url: str, form: dict, timeout: float = 20) -> dict:
         raise ValueError(f"Google said {e.code}: {body.get('error_description') or body.get('error') or e.reason}")
 
 
-def auth_url(scopes: list[str], state: str, challenge: str) -> str:
+def parse_client(body: dict) -> dict:
+    """Your OAuth client, from the JSON Google Cloud Console downloads (its
+    "web" or "installed" object) or from the ID and secret typed in."""
+    raw = str(body.get("json", "") or "").strip()
+    if raw:
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            raise ValueError("That isn't the client's JSON file (client_secret_….json)") from None
+        kind = "web" if "web" in doc else "desktop" if "installed" in doc else ""
+        if not kind or not isinstance(doc.get("web" if kind == "web" else "installed"), dict):
+            raise ValueError("That JSON has no \"web\" or \"installed\" client in it")
+        c = doc["web" if kind == "web" else "installed"]
+        cid, secret = str(c.get("client_id", "")), str(c.get("client_secret", ""))
+        uris = [u for u in c.get("redirect_uris", []) if isinstance(u, str)][:50]
+    else:
+        cid, secret = str(body.get("client_id", "")).strip(), str(body.get("client_secret", "")).strip()
+        kind = "web" if body.get("type") == "web" else "desktop"
+        uris = []
+    if not re.fullmatch(r"[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com", cid):
+        raise ValueError("Client ID: the ….apps.googleusercontent.com one from Google Cloud Console")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,100}", secret):
+        raise ValueError("Paste the client secret")
+    return {"client_id": cid, "client_secret": secret, "type": kind, "redirect_uris": uris}
+
+
+def callback_problem(hostname: str) -> str:
+    """Why Google won't redirect back to the UI at this name ("" if it will)."""
+    import ipaddress
+    h = hostname.lower().rstrip(".")
+    if h == "localhost":
+        return ""
+    try:
+        ip = ipaddress.ip_address(h.strip("[]"))
+        return "" if ip.is_loopback else (
+            f"Google won't redirect to an IP address ({h}). Open this page by a DNS name instead "
+            "(add it to ui/extra-hostnames), or connect with the paste-back way below.")
+    except ValueError:
+        pass
+    if "." not in h or h.rsplit(".", 1)[1] in PRIVATE_TLDS:
+        return (f"Google only redirects to a name under a public top-level domain (.com, .net, .uk…); "
+                f"{h} isn't one. The name needn't resolve on the internet: a public-domain name in your "
+                "local DNS works. Or connect with the paste-back way below.")
+    return ""
+
+
+def auth_url(scopes: list[str], state: str, challenge: str, redirect_uri: str = REDIRECT_URI) -> str:
     c = client()
     if not c:
         raise ValueError("Add your OAuth client first")
     return AUTH_URL + "?" + urllib.parse.urlencode({
-        "client_id": c["client_id"], "redirect_uri": REDIRECT_URI, "response_type": "code",
+        "client_id": c["client_id"], "redirect_uri": redirect_uri, "response_type": "code",
         "scope": " ".join(["openid", "email"] + [SCOPES[s] for s in scopes]),
         "access_type": "offline", "prompt": "consent", "include_granted_scopes": "false",
         "state": state, "code_challenge": challenge, "code_challenge_method": "S256"})
 
 
-def exchange(code: str, verifier: str) -> dict:
+def exchange(code: str, verifier: str, redirect_uri: str = REDIRECT_URI) -> dict:
     """The consent's code for tokens; returns {email, refresh_token, scopes}."""
     c = client()
     if not c:
         raise ValueError("No OAuth client")
     tok = _post(TOKEN_URL, {"code": code, "client_id": c["client_id"], "client_secret": c["client_secret"],
-                            "redirect_uri": REDIRECT_URI, "grant_type": "authorization_code",
+                            "redirect_uri": redirect_uri, "grant_type": "authorization_code",
                             "code_verifier": verifier})
     if not tok.get("refresh_token"):
         raise ValueError("Google sent no refresh token; remove this app's access in your Google account "
