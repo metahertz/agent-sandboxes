@@ -1849,20 +1849,6 @@ $("#bk-prune").addEventListener("click", async () => {
   } catch (e) { bkMsg(e.message, true); }
 });
 
-// ------------------------------------------------------------------ boot
-
-window.addEventListener("hashchange", () => {
-  const view = VIEW_OF_HASH[location.hash];
-  if (view) return state.view !== view && showPage(view);
-  const name = decodeURIComponent(location.hash.slice(1));
-  if (name && (name !== state.selected || state.view !== "ws")) select(name);
-});
-
-if (state.view in PAGE_LOAD) PAGE_LOAD[state.view]();
-refresh();
-setInterval(refresh, 4000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
-
 // ------------------------------------------------------------------ guided Hermes setup
 
 const GUIDE_STEPS = ["where", "model", "chat", "google", "network", "review"];
@@ -1898,10 +1884,14 @@ const envFromId = (id) => `${id.toUpperCase().replace(/-/g, "_").replace(/^(\d)/
 
 async function loadGuide() {
   if (guide.run?.done) resetGuide();
+  showGuideStep(guide.step);
   try {
     [guide.status, guide.pool] = await Promise.all([api("GET", "setup/hermes"), api("GET", "pool")]);
   } catch (e) {
-    guideMsg(e.message, true);
+    guideMsg(/not found/i.test(e.message)
+      ? "The web UI service is running older code than these pages: restart it (Host page, or sudo systemctl restart agent-sandboxes-ui), then reload."
+      : `Couldn't load this host's status: ${e.message}`, true);
+    $("#guide-next").disabled = true;
     return;
   }
   const st = guide.status;
@@ -2234,3 +2224,17 @@ function renderSetup(w) {
       return li;
     })));
 }
+
+// ------------------------------------------------------------------ boot (keep last: it uses everything above)
+
+window.addEventListener("hashchange", () => {
+  const view = VIEW_OF_HASH[location.hash];
+  if (view) return state.view !== view && showPage(view);
+  const name = decodeURIComponent(location.hash.slice(1));
+  if (name && (name !== state.selected || state.view !== "ws")) select(name);
+});
+
+if (state.view in PAGE_LOAD) PAGE_LOAD[state.view]();
+refresh();
+setInterval(refresh, 4000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
