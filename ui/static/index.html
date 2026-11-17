@@ -22,6 +22,7 @@
     <nav id="ws-list" class="ws-list" aria-label="Workspaces"></nav>
 
     <button id="new-toggle" class="btn ghost new-toggle" type="button">+ New workspace</button>
+    <button id="guide-btn" class="btn ghost new-toggle" type="button" aria-current="false">✦ Set up a Hermes agent (guided)</button>
     <form id="new-form" class="new-form" hidden>
       <label>Name
         <input name="name" required pattern="[a-z0-9][a-z0-9\-]{0,29}" placeholder="my-app" autocomplete="off">
@@ -41,7 +42,7 @@
           <option value="microvm">MicroVM: the agent with root and Docker, in a VM</option>
         </select>
       </label>
-      <p class="hint muted" id="new-agent-hint" hidden>Hermes starts with network access to LLM provider APIs only. Give it a model provider in the Access tab (an OpenRouter token, or your own OpenAI-compatible server). Sandbox type: run <code>bin/install-hermes</code> on the host once. MicroVM: Hermes installs itself in the VM on first start.</p>
+      <p class="hint muted" id="new-agent-hint" hidden>First time? The guided setup (below) walks through all of this. Hermes starts with network access to LLM provider APIs only. Give it a model provider in the Access tab (an OpenRouter token, or your own OpenAI-compatible server). Sandbox type: run <code>bin/install-hermes</code> on the host once. MicroVM: Hermes installs itself in the VM on first start.</p>
       <p class="hint muted" id="new-kind-hint" hidden>A VM with no network interface: it reaches only this workspace's allowlist, through its proxy on the host. Only the project folder is shared in (at <code>/project</code>). The browser container is optional (Access tab).</p>
       <div class="row">
         <button class="btn primary" type="submit">Create</button>
@@ -70,6 +71,7 @@
     <section id="empty" class="empty">
       <h1>No workspace selected</h1>
       <p>Each workspace is a project folder, a Claude Code session confined by nono, and a browser sandbox container that only that session can reach.</p>
+      <p>New to Hermes Agent? <button class="linkish" type="button" id="empty-guide">Set one up step by step</button>.</p>
     </section>
 
     <section id="detail" class="detail" hidden>
@@ -115,6 +117,7 @@
         </div>
       </div>
       <p class="action-msg" id="action-msg" role="status"></p>
+      <div class="setup-check" id="d-setup" hidden></div>
 
       <div class="tabs" role="tablist">
         <button role="tab" data-tab="claude" aria-selected="true" class="agent-name">Claude</button>
@@ -251,7 +254,14 @@
               <label>API key <input name="hermes_new_key" type="password" autocomplete="off" spellcheck="false"></label>
               <p class="hint">Saving adds the key to the pool (Keys &amp; tokens) and ticks it for this workspace.</p>
             </div>
-            <p class="hint">A Telegram Bot API token ticked above sets up Hermes' Telegram gateway (its token stays a placeholder, swapped into the Bot API's URL by the proxy); who may talk to the bot is Hermes' own setting (<code>TELEGRAM_ALLOWED_USERS</code>, <code>hermes gateway setup</code> in the Hermes tab). Google grants appear above like tokens: create them under Keys &amp; tokens. Hermes reads mail as untrusted input, so keep this workspace's network narrow.</p>
+            <h3>Chat gateway: who may talk to it</h3>
+            <p class="hint">A Telegram, Discord or Slack token ticked above turns that platform on for Hermes' gateway (the tokens stay placeholders; the proxy swaps them in). Hermes answers only these user IDs (comma-separated) and refuses everyone else. Set here, so the agent can't widen it. Restart the gateway to apply.</p>
+            <div class="three">
+              <label>Telegram <input name="users_telegram" placeholder="123456789" autocomplete="off" spellcheck="false"></label>
+              <label>Discord <input name="users_discord" placeholder="123456789012345678" autocomplete="off" spellcheck="false"></label>
+              <label>Slack <input name="users_slack" placeholder="U0123ABCD" autocomplete="off" spellcheck="false"></label>
+            </div>
+            <p class="hint">Google grants appear above like tokens: create them under Keys &amp; tokens. Hermes reads mail as untrusted input, so keep this workspace's network narrow.</p>
           </section>
           <section class="card sandbox-only claude-only">
             <h2>Notes for Claude</h2>
@@ -320,6 +330,147 @@
           <button class="btn" id="logs-refresh">Refresh</button>
         </div>
         <pre id="logs" class="logs"></pre>
+      </div>
+    </section>
+
+    <section id="guide" class="pool" hidden>
+      <header class="detail-head"><div class="title">
+        <h1>Set up a Hermes agent</h1>
+        <p class="meta">A guided first setup: where it runs, its model, who can chat with it, what it may read. Everything here can be changed later in the workspace's Access tab.</p>
+      </div></header>
+
+      <div class="guide-body">
+        <ol class="guide-steps" id="guide-steps"></ol>
+
+        <form id="guide-form" class="guide-form" autocomplete="off">
+          <!-- 1. where it runs -->
+          <section class="card guide-step" data-step="where" data-title="Where it runs">
+            <h2>Name and isolation</h2>
+            <p class="hint">Each Hermes agent gets its own workspace: a project folder it can write, its own Hermes home (memory, skills, sessions), and a network allowlist. Secrets never enter it: the proxy on this host swaps them in.</p>
+            <div class="two">
+              <label>Name <input name="name" required pattern="[a-z0-9][a-z0-9\-]{0,29}" placeholder="hermes" spellcheck="false"></label>
+              <label>Project folder <span class="muted">(optional)</span> <input name="dir" id="guide-dir" spellcheck="false"></label>
+            </div>
+            <h3>Isolation</h3>
+            <div class="radios" id="guide-kinds">
+              <label class="check"><input type="radio" name="kind" value="sandbox">
+                <span><strong>Sandbox</strong> <span class="muted">Hermes under nono on this host (Landlock: only its folders and the proxy), plus a browser container. Light; starts in seconds.</span>
+                  <span class="guide-ready" data-ready="sandbox"></span></span></label>
+              <label class="check"><input type="radio" name="kind" value="microvm">
+                <span><strong>MicroVM</strong> <span class="muted">Hermes in its own VM with root and Docker, no network interface. Stronger isolation; the first start installs Hermes in the VM (minutes).</span>
+                  <span class="guide-ready" data-ready="microvm"></span></span></label>
+            </div>
+          </section>
+
+          <!-- 2. model -->
+          <section class="card guide-step" data-step="model" data-title="Model" hidden>
+            <h2>Its model</h2>
+            <p class="hint">The key stays on this host; Hermes only ever sees a placeholder, and the proxy adds the real key on requests to that provider.</p>
+            <div class="radios" id="guide-llm-kinds">
+              <label class="check" id="guide-llm-pool-wrap"><input type="radio" name="llm_kind" value="pool">
+                <span><strong>A key already in the pool</strong> <select name="llm_pool" id="guide-llm-pool"></select></span></label>
+              <label class="check"><input type="radio" name="llm_kind" value="openrouter">
+                <span><strong>OpenRouter</strong> <span class="muted">one key for many models; create one at openrouter.ai/keys</span></span></label>
+              <label class="check"><input type="radio" name="llm_kind" value="openai">
+                <span><strong>OpenAI</strong> <span class="muted">platform.openai.com/api-keys</span></span></label>
+              <label class="check"><input type="radio" name="llm_kind" value="custom">
+                <span><strong>An OpenAI-compatible server with an API key</strong> <span class="muted">vLLM, LiteLLM, a hosted endpoint…</span></span></label>
+              <label class="check"><input type="radio" name="llm_kind" value="keyless">
+                <span><strong>A server that needs no key</strong> <span class="muted">Ollama, llama.cpp, LM Studio on your network</span></span></label>
+            </div>
+            <div class="two">
+              <label data-llm="custom keyless">Server URL <span class="muted">(OpenAI-compatible, up to <code>/v1</code>)</span>
+                <input name="llm_url" placeholder="http://192.168.1.20:11434/v1" spellcheck="false"></label>
+              <label data-llm="openrouter openai custom">API key <input name="llm_key" type="password" spellcheck="false"></label>
+            </div>
+            <div class="two">
+              <label>Model <input name="model" id="guide-model" spellcheck="false"></label>
+            </div>
+            <p class="hint" id="guide-model-hint"></p>
+          </section>
+
+          <!-- 3. chat -->
+          <section class="card guide-step" data-step="chat" data-title="Chat" hidden>
+            <h2>Chat with it <span class="muted">(optional)</span></h2>
+            <p class="hint">Hermes' gateway answers on chat platforms while you're away from the terminal. It only answers the user IDs you list here; everyone else is refused. Its tokens stay on this host like the model key. Skip this to use Hermes from the terminal only.</p>
+            <div class="guide-chat" data-platform="telegram">
+              <label class="check"><input type="checkbox" name="chat_telegram"> <span><strong>Telegram</strong></span></label>
+              <div class="guide-chat-body" hidden>
+                <ol class="steps">
+                  <li>In Telegram, message <code>@BotFather</code>, send <code>/newbot</code>, and copy the bot token it gives you.</li>
+                  <li>Your user ID: message <code>@userinfobot</code> (a number such as <code>123456789</code>).</li>
+                </ol>
+                <div class="two">
+                  <label>Bot token <span class="guide-tok" data-service="telegram"></span></label>
+                  <label>Allowed user IDs <input name="users_telegram" placeholder="123456789" spellcheck="false"></label>
+                </div>
+              </div>
+            </div>
+            <div class="guide-chat" data-platform="discord">
+              <label class="check"><input type="checkbox" name="chat_discord"> <span><strong>Discord</strong></span></label>
+              <div class="guide-chat-body" hidden>
+                <ol class="steps">
+                  <li>In the Discord Developer Portal, create an application, add a bot, turn on <strong>Message Content Intent</strong>, and copy its token (Reset Token).</li>
+                  <li>Invite it to your server (OAuth2 → URL Generator, scope <code>bot</code>).</li>
+                  <li>Your user ID: Settings → Advanced → Developer Mode, then right-click your name → Copy User ID.</li>
+                </ol>
+                <div class="two">
+                  <label>Bot token <span class="guide-tok" data-service="discord"></span></label>
+                  <label>Allowed user IDs <input name="users_discord" placeholder="123456789012345678" spellcheck="false"></label>
+                </div>
+              </div>
+            </div>
+            <div class="guide-chat" data-platform="slack">
+              <label class="check"><input type="checkbox" name="chat_slack"> <span><strong>Slack</strong></span></label>
+              <div class="guide-chat-body" hidden>
+                <ol class="steps">
+                  <li>At api.slack.com/apps, create an app, turn on <strong>Socket Mode</strong>, and create an app-level token with <code>connections:write</code> (<code>xapp-…</code>).</li>
+                  <li>Add bot scopes (<code>app_mentions:read</code>, <code>chat:write</code>, <code>im:history</code>, <code>im:read</code>), subscribe to the <code>app_mention</code> and <code>message.im</code> events, install it, and copy the bot token (<code>xoxb-…</code>).</li>
+                  <li>Your member ID: your profile → ⋯ → Copy member ID (<code>U…</code>).</li>
+                </ol>
+                <div class="two">
+                  <label>Bot token <span class="guide-tok" data-service="slack-bot"></span></label>
+                  <label>App token <span class="guide-tok" data-service="slack-app"></span></label>
+                  <label>Allowed member IDs <input name="users_slack" placeholder="U0123ABCD" spellcheck="false"></label>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 4. google -->
+          <section class="card guide-step" data-step="google" data-title="Google" hidden>
+            <h2>Mail and calendar <span class="muted">(optional)</span></h2>
+            <p class="hint">A Google grant gives the agent read-only Gmail or Calendar access, narrower than Google's own permissions (e.g. one label's messages only). Grants are made under Keys &amp; tokens from an account connected in Settings.</p>
+            <div class="checks" id="guide-google"></div>
+            <p class="hint">Mail is untrusted input: a message can try to talk the agent into things. Keep the network step narrow if you give it mail.</p>
+          </section>
+
+          <!-- 5. network -->
+          <section class="card guide-step" data-step="network" data-title="Network" hidden>
+            <h2>Network</h2>
+            <p class="hint">The agent starts with network access to LLM provider APIs only (OpenRouter, OpenAI, Anthropic, Gemini…). The chat platforms you picked are added for you, and your model provider goes through the proxy. Add anything else it should reach, such as sites for research or your own services; you can change this in the Access tab later.</p>
+            <label class="guide-wide">Also allow <span class="muted">(one per line: a domain, <code>*.example.com</code>, or an IP address; <code>:443</code> limits the port)</span>
+              <textarea name="allow" rows="4" spellcheck="false" placeholder="docs.python.org&#10;192.168.1.20:11434"></textarea></label>
+          </section>
+
+          <!-- 6. review -->
+          <section class="card guide-step" data-step="review" data-title="Create" hidden>
+            <h2>Review and create</h2>
+            <ul class="guide-summary" id="guide-summary"></ul>
+            <div class="checks">
+              <label class="check"><input type="checkbox" name="start" checked> <span>Start Hermes when it's ready <span class="muted">(its terminal is the workspace's Hermes tab)</span></span></label>
+              <label class="check" id="guide-gw-wrap"><input type="checkbox" name="gateway" checked> <span>Start the chat gateway</span></label>
+            </div>
+            <ol class="guide-progress" id="guide-progress"></ol>
+          </section>
+
+          <div class="row guide-nav">
+            <button class="btn ghost" type="button" id="guide-back">Back</button>
+            <button class="btn primary" type="submit" id="guide-next">Next</button>
+            <button class="btn" type="button" id="guide-open" hidden>Open the workspace</button>
+            <p class="form-msg" id="guide-msg" role="status"></p>
+          </div>
+        </form>
       </div>
     </section>
 

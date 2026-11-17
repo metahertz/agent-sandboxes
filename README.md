@@ -344,6 +344,23 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
 
 A workspace runs either Claude Code or [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 (Nous Research). You pick the agent when you create it, and it can't be changed later.
+
+**Guided setup:** *Set up a Hermes agent (guided)* in the sidebar walks through a first
+Hermes workspace in six steps:
+1. Name and kind, with what each kind still needs on this host.
+2. Its model: a pool key, or a new OpenRouter, OpenAI or OpenAI-compatible key, or a server
+   that needs no key.
+3. Chat (optional): Telegram, Discord or Slack, with where to get each token and your user
+   ID.
+4. Google grants (optional).
+5. Extra hosts for the allowlist.
+6. Create: makes the workspace, adds the keys to the pool, saves its access, and starts
+   Hermes and its gateway. If a step fails, *Try again* carries on from it.
+
+A Hermes workspace that isn't fully set up shows a checklist above its tabs (model, Hermes
+running, allowed users, gateway), with a button for each missing step; *Hide* dismisses it
+in that browser.
+
 Hermes gets the same isolation as Claude, in either kind:
 
 - **Files:** under nono, the project folder and its own `HERMES_HOME`
@@ -370,9 +387,12 @@ Hermes gets the same isolation as Claude, in either kind:
   *Telegram Bot API* token in the pool sets up its Telegram channel: the bot token stays a
   placeholder, which nono swaps into the Bot API's URL path (`/bot<token>/`). *Discord bot*
   and *Slack bot / app* tokens work the same way for those channels, swapped by the proxy
-  service (see Keys & tokens: tokens in WebSockets). Who may talk to the bot is Hermes' own
-  setting (`TELEGRAM_ALLOWED_USERS`, `DISCORD_ALLOWED_USERS`, …; `hermes gateway setup` in
-  the Hermes tab).
+  service (see Keys & tokens: tokens in WebSockets).
+- **Who may talk to the bot:** the Access tab's allowed user IDs per platform. They are set
+  as `TELEGRAM_ALLOWED_USERS`, `DISCORD_ALLOWED_USERS` and `SLACK_ALLOWED_USERS` in Hermes'
+  environment by the host (its nono profile, or the VM's `proxy.env`), not in its `.env`,
+  so the agent can't widen them. Hermes refuses everyone else; with none listed, it
+  answers no one. There is no allow-everyone option. Restart the gateway to apply.
 - **Install and updates:** `bin/update-host` reinstalls Hermes when the pin in `hermes.lock`
   changes. Hermes' own `hermes update` can't write the read-only install.
 

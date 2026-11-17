@@ -223,3 +223,42 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 /* microVM workspaces: their own Access-tab notes; no container-only parts */
 #detail.is-vm .sandbox-only, #detail:not(.is-vm) .vm-only { display: none !important; }
 #detail.is-hermes .claude-only, #detail:not(.is-hermes) .hermes-only { display: none !important; }
+
+/* guided Hermes setup */
+.guide-body { flex: 1; overflow: auto; padding: 8px 20px 20px; display: flex; flex-direction: column; gap: 14px; }
+.guide-steps { list-style: none; display: flex; flex-wrap: wrap; gap: 4px; margin: 0; padding: 0; }
+.guide-steps button { all: unset; cursor: pointer; font-size: 12.5px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.guide-steps button:disabled { cursor: default; opacity: .6; }
+.guide-steps button:focus-visible { outline: 2px solid var(--accent); }
+.guide-steps .done button { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.guide-steps .current button { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); font-weight: 560; opacity: 1; }
+.guide-form { display: flex; flex-direction: column; gap: 14px; max-width: 60rem; }
+.guide-form .check > span { display: flex; flex-direction: column; gap: 2px; }
+.guide-form .check .muted { font-family: inherit; font-size: 12.5px; }
+.guide-form .check select { margin-top: 4px; max-width: 24rem; }
+.guide-ready { font-size: 12px; }
+.guide-ready.ok { color: var(--ok); }
+.guide-ready.warn { color: var(--warn); }
+.guide-wide { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; font-weight: 550; }
+.guide-chat { border-top: 1px solid var(--line); padding: 10px 0 4px; }
+.guide-chat-body { padding: 4px 0 0 24px; }
+.guide-chat-body .two { margin-top: 8px; }
+.guide-tok { display: flex; flex-direction: column; gap: 4px; font-weight: 400; }
+.guide-summary { margin: 4px 0 12px; padding-left: 18px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.guide-progress { margin: 12px 0 0; padding-left: 20px; font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
+.guide-progress:empty { display: none; }
+.guide-progress li::marker { color: var(--muted); }
+.guide-progress li.busy { color: var(--warn); }
+.guide-progress li.busy::after { content: " …"; }
+.guide-progress li.ok { color: var(--ok); }
+.guide-progress li.ok::after { content: " ✓"; }
+.guide-progress li.bad { color: var(--bad); }
+.guide-progress li .muted { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.guide-nav { align-items: center; }
+.setup-check { margin: 0 20px 8px; padding: 10px 14px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius); background: var(--surface); font-size: 13px; }
+.setup-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.setup-check ul { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.setup-check li { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.setup-check li::before { content: "○"; color: var(--muted); }
+.setup-check li.ok { color: var(--muted); }
+.setup-check li.ok::before { content: "✓"; color: var(--ok); }

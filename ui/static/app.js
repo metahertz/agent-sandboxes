@@ -7,8 +7,10 @@ const POOL_HASH = "#~keys";
 const SETTINGS_HASH = "#~settings";
 const IMPORT_HASH = "#~import";
 const HOST_HASH = "#~host";
-const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings", [IMPORT_HASH]: "import", [HOST_HASH]: "host" };
-const PAGES = { pool: "#pool", import: "#import", host: "#host", settings: "#settings" };   // view -> section
+const GUIDE_HASH = "#~hermes-setup";
+const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings", [IMPORT_HASH]: "import", [HOST_HASH]: "host",
+  [GUIDE_HASH]: "guide" };
+const PAGES = { pool: "#pool", import: "#import", host: "#host", settings: "#settings", guide: "#guide" };   // view -> section
 const state = {
   workspaces: [],
   view: VIEW_OF_HASH[location.hash] || "ws",
@@ -128,6 +130,7 @@ function renderDetail() {
     $('[data-act="gateway/start"]').disabled = gw === "running";
     $('[data-act="gateway/stop"]').disabled = gw === "stopped";
   }
+  renderSetup(w);
 
   const up = w.container === "running";
   for (const b of $$('[data-act="container/start"]')) b.disabled = up;
@@ -173,7 +176,8 @@ function select(name) {
   if (state.tab === "access") loadAccess();
 }
 
-const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), host: () => loadHost(), settings: () => loadSettings() };
+const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), host: () => loadHost(), settings: () => loadSettings(),
+  guide: () => loadGuide() };
 
 function showPage(view) {
   state.view = view;
@@ -890,6 +894,7 @@ async function loadAccess() {
     llm.value = policy.hermes?.llm || (policy.hermes?.base_url ? "" : llmTokens[0]?.id || NEW_LLM);
     form.elements.hermes_model.value = policy.hermes?.model || "";
     form.elements.hermes_base_url.value = policy.hermes?.base_url || "";
+    for (const p of ["telegram", "discord", "slack"]) form.elements[`users_${p}`].value = policy.hermes?.allowed_users?.[p] || "";
     for (const n of ["hermes_new_id", "hermes_new_url", "hermes_new_key"]) form.elements[n].value = "";
     hermesLlmChanged();
     form.elements.vm_browser.checked = !!policy.vm_browser;
@@ -952,7 +957,9 @@ async function saveAccess(restart) {
     claude_md: form.elements.claude_md.checked,
     vm_browser: form.elements.vm_browser.checked,
     hermes: { llm, model: form.elements.hermes_model.value.trim(),
-      base_url: form.elements.hermes_base_url.value.trim() },
+      base_url: form.elements.hermes_base_url.value.trim(),
+      allowed_users: Object.fromEntries(["telegram", "discord", "slack"].map((p) =>
+        [p, lines(form.elements[`users_${p}`].value).join(",")])) },
   };
   out.textContent = "Saving…";
   try {
@@ -1855,3 +1862,375 @@ if (state.view in PAGE_LOAD) PAGE_LOAD[state.view]();
 refresh();
 setInterval(refresh, 4000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+
+// ------------------------------------------------------------------ guided Hermes setup
+
+const GUIDE_STEPS = ["where", "model", "chat", "google", "network", "review"];
+const CHAT_SERVICES = { telegram: ["telegram"], discord: ["discord"], slack: ["slack-bot", "slack-app"] };
+const SERVICE_NAME = { openrouter: "OpenRouter", openai: "OpenAI", custom: "server", telegram: "Telegram bot",
+  discord: "Discord bot", "slack-bot": "Slack bot", "slack-app": "Slack app" };
+const MODEL_HINT = {
+  pool: ["", "The model name that provider serves."],
+  openrouter: ["e.g. anthropic/claude-sonnet-4.5", "OpenRouter's model ID, provider/model, as listed on openrouter.ai/models."],
+  openai: ["e.g. gpt-4.1", "An OpenAI model name."],
+  custom: ["e.g. qwen3-32b", "A model your server serves (its /v1/models list)."],
+  keyless: ["e.g. llama3.1:8b", "A model your server serves (for Ollama, as `ollama list` shows it)."],
+};
+// guide.run: what the Create step has done so far, so a retry carries on from there
+const guide = { step: 0, status: null, pool: null, run: null };
+const gf = $("#guide-form");
+const gEl = gf.elements;
+
+function guideMsg(text, isErr = false) {
+  $("#guide-msg").textContent = text;
+  $("#guide-msg").classList.toggle("err", isErr);
+}
+
+// A pool token id that isn't taken: <workspace>-<what>
+function freeTokenId(base, taken) {
+  base = base.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 36) || "token";
+  let id = base;
+  for (let i = 2; taken.has(id); i++) id = `${base}-${i}`;
+  taken.add(id);
+  return id;
+}
+const envFromId = (id) => `${id.toUpperCase().replace(/-/g, "_").replace(/^(\d)/, "LLM_$1")}_API_KEY`;
+
+async function loadGuide() {
+  if (guide.run?.done) resetGuide();
+  try {
+    [guide.status, guide.pool] = await Promise.all([api("GET", "setup/hermes"), api("GET", "pool")]);
+  } catch (e) {
+    guideMsg(e.message, true);
+    return;
+  }
+  const st = guide.status;
+  for (const kind of ["sandbox", "microvm"]) {
+    const problems = st[kind];
+    const box = $(`[data-ready="${kind}"]`);
+    const radio = $(`#guide-kinds input[value="${kind}"]`);
+    radio.disabled = problems.length > 0;
+    box.className = `guide-ready ${problems.length ? "warn" : "ok"}`;
+    box.replaceChildren(problems.length ? `Not ready: ${problems.join("; ")}.` : "Ready on this host.");
+    if (problems.length && kind === "sandbox") {
+      const b = el("button", { type: "button", className: "linkish", textContent: "Open the Host page to run it" });
+      b.addEventListener("click", () => showPage("host"));
+      box.append(" ", b);
+    }
+  }
+  if (!gf.querySelector('input[name="kind"]:checked:not(:disabled)')) {
+    const first = gf.querySelector('input[name="kind"]:not(:disabled)');
+    if (first) first.checked = true;
+  }
+  guideDirPlaceholder();
+
+  // Model: keys already in the pool
+  const llms = guide.pool.tokens.filter((t) => LLM_SERVICES.includes(t.service));
+  const sel = $("#guide-llm-pool");
+  const was = sel.value;
+  sel.replaceChildren(...llms.map((t) => el("option", { value: t.id, textContent: `${t.id} (${t.label})` })));
+  if (was) sel.value = was;
+  $("#guide-llm-pool-wrap").hidden = !llms.length;
+  if (!gf.querySelector('input[name="llm_kind"]:checked'))
+    gf.querySelector(`input[name="llm_kind"][value="${llms.length ? "pool" : "openrouter"}"]`).checked = true;
+
+  // Chat: an existing token of that kind, or a new one
+  for (const span of $$(".guide-tok", gf)) {
+    const service = span.dataset.service;
+    const have = guide.pool.tokens.filter((t) => t.service === service);
+    const prev = gEl[`tok_${service}`]?.value;
+    const typed = gEl[`tok_${service}_new`]?.value || "";
+    const pick = el("select", { name: `tok_${service}` },
+      ...have.map((t) => el("option", { value: t.id, textContent: `${t.id} (in the pool)` })),
+      el("option", { value: "", textContent: "A new token…" }));
+    pick.hidden = !have.length;
+    pick.value = prev ?? (have[0]?.id || "");
+    const input = el("input", { name: `tok_${service}_new`, type: "password", spellcheck: false, value: typed,
+      placeholder: service === "slack-bot" ? "xoxb-…" : service === "slack-app" ? "xapp-…" : "" });
+    const sync = () => (input.hidden = !!pick.value);
+    pick.addEventListener("change", sync);
+    sync();
+    span.replaceChildren(pick, input);
+  }
+
+  // Google grants already made
+  const box = $("#guide-google");
+  const grants = guide.pool.tokens.filter((t) => t.service === "google");
+  const ticked = new Set($$('input[name="google"]:checked', gf).map((i) => i.value));
+  box.replaceChildren(...grants.map((t) => checkItem("google", t.id, ticked.has(t.id), t.id, t.detail || t.label)));
+  if (!grants.length) {
+    const g = st.google;
+    const p = el("p", { className: "hint" }, !g.client
+      ? "No Google OAuth client yet: add yours in Settings → Google accounts, connect an account, then make a grant under Keys & tokens. "
+      : !g.accounts ? "No Google account connected yet: connect one in Settings → Google accounts, then make a grant under Keys & tokens. "
+        : "No grants yet: make one under Keys & tokens (Add token → Google grant). ");
+    const toSettings = el("button", { type: "button", className: "btn", textContent: "Settings" });
+    toSettings.addEventListener("click", () => showPage("settings"));
+    const toPool = el("button", { type: "button", className: "btn", textContent: "Keys & tokens" });
+    toPool.addEventListener("click", () => showPage("pool"));
+    box.append(p, el("div", { className: "row" }, toSettings, toPool),
+      el("p", { className: "hint", textContent: "Your answers here are kept while you do that; come back with the guided setup button. Or skip this: grants can be added in the Access tab later." }));
+  }
+  guideModelChanged();
+  guideChatChanged();
+  showGuideStep(guide.step);
+}
+
+function guideDirPlaceholder() {
+  const name = gEl.name.value.trim() || "<name>";
+  $("#guide-dir").placeholder = `${guide.status?.projects || "~/projects"}/${name}`.replace(/^\/home\/[^/]+/, "~");
+}
+gEl.name.addEventListener("input", guideDirPlaceholder);
+
+function guideModelChanged() {
+  const kind = gEl.llm_kind.value;
+  for (const lab of $$("[data-llm]", gf)) lab.hidden = !lab.dataset.llm.split(" ").includes(kind);
+  const [ph, hint] = MODEL_HINT[kind] || ["", ""];
+  $("#guide-model").placeholder = ph;
+  $("#guide-model-hint").textContent = hint;
+}
+$$('input[name="llm_kind"]', gf).forEach((r) => r.addEventListener("change", guideModelChanged));
+$("#guide-llm-pool").addEventListener("change", () => (gEl.llm_kind.value = "pool"));
+
+const chatPicked = () => Object.keys(CHAT_SERVICES).filter((p) => gEl[`chat_${p}`].checked);
+function guideChatChanged() {
+  for (const box of $$(".guide-chat", gf)) $(".guide-chat-body", box).hidden = !gEl[`chat_${box.dataset.platform}`].checked;
+  $("#guide-gw-wrap").hidden = !chatPicked().length;
+}
+$$('.guide-chat input[type="checkbox"]', gf).forEach((c) => c.addEventListener("change", guideChatChanged));
+
+function showGuideStep(i) {
+  guide.step = i;
+  const step = GUIDE_STEPS[i];
+  for (const sec of $$(".guide-step", gf)) sec.hidden = sec.dataset.step !== step;
+  $("#guide-steps").replaceChildren(...GUIDE_STEPS.map((s, j) => {
+    const title = $(`.guide-step[data-step="${s}"]`).dataset.title;
+    const b = el("button", { type: "button", textContent: `${j + 1}. ${title}`, disabled: j > i || !!guide.run?.done });
+    b.addEventListener("click", () => { guideMsg(""); showGuideStep(j); });
+    return el("li", { className: j < i ? "done" : j === i ? "current" : "" }, b);
+  }));
+  const running = !!guide.run?.busy;
+  $("#guide-back").hidden = i === 0 || !!guide.run?.done;
+  $("#guide-back").disabled = running;
+  $("#guide-next").hidden = !!guide.run?.done;
+  $("#guide-next").disabled = running;
+  $("#guide-next").textContent = step !== "review" ? "Next" : guide.run?.failed ? "Try again" : "Create";
+  $("#guide-open").hidden = !guide.run?.done;
+  if (step === "network") guidePrefillAllow();
+  if (step === "review") guideSummary();
+}
+
+// The keyless server (and an https:// one with a key) must be on the allowlist;
+// an http:// one with a key goes through the bridge instead
+function guidePrefillAllow() {
+  const kind = gEl.llm_kind.value;
+  const url = gEl.llm_url.value.trim();
+  if (!(kind === "keyless" || (kind === "custom" && url.startsWith("https://")))) return;
+  let entry;
+  try {
+    const u = new URL(url);
+    entry = u.port ? `${u.hostname}:${u.port}` : u.hostname;
+  } catch { return; }
+  const have = lines(gEl.allow.value);
+  if (!have.includes(entry)) gEl.allow.value = [...have, entry].join("\n");
+}
+
+function guideValidate(step) {
+  const v = (n) => gEl[n].value.trim();
+  if (step === "where") {
+    const name = v("name");
+    if (!/^[a-z0-9][a-z0-9-]{0,29}$/.test(name)) return "Name: lowercase letters, digits and dashes (up to 30).";
+    if (state.workspaces.some((w) => w.name === name) && guide.run?.name !== name) return `There's already a workspace called ${name}.`;
+    if (!gf.querySelector('input[name="kind"]:checked:not(:disabled)'))
+      return "Neither kind can run on this host yet: see what's missing above.";
+  }
+  if (step === "model") {
+    const kind = gEl.llm_kind.value;
+    if (kind === "pool" && !v("llm_pool")) return "Pick a key from the pool.";
+    if (["custom", "keyless"].includes(kind)) {
+      try {
+        if (!/^https?:$/.test(new URL(v("llm_url")).protocol)) throw new Error();
+      } catch { return "Server URL: http:// or https://, e.g. http://192.168.1.20:11434/v1"; }
+    }
+    if (["openrouter", "openai", "custom"].includes(kind) && !v("llm_key")) return "Paste the API key.";
+    if (!v("model")) return "Model: the model name to use (see the hint below it).";
+  }
+  if (step === "chat") {
+    for (const p of chatPicked()) {
+      for (const service of CHAT_SERVICES[p]) {
+        if (!gEl[`tok_${service}`].value && !gEl[`tok_${service}_new`].value.trim())
+          return `${SERVICE_NAME[service]}: paste its token.`;
+      }
+      if (!lines(v(`users_${p}`)).length)
+        return `${p[0].toUpperCase() + p.slice(1)}: list at least one user ID. Hermes refuses everyone not listed.`;
+    }
+  }
+  return "";
+}
+
+function guideSummary() {
+  const v = (n) => gEl[n].value.trim();
+  const kind = gEl.kind.value;
+  const llm = gEl.llm_kind.value;
+  const provider = llm === "pool" ? `${v("llm_pool")} (from the pool)` : llm === "keyless" ? `${v("llm_url")} (no key)`
+    : llm === "custom" ? `${v("llm_url")}, with its key` : SERVICE_NAME[llm];
+  const chats = chatPicked();
+  const google = $$('input[name="google"]:checked', gf).map((i) => i.value);
+  const allow = lines(v("allow"));
+  const item = (k, val) => el("li", {}, el("strong", { textContent: `${k}: ` }), val);
+  $("#guide-summary").replaceChildren(
+    item("Workspace", `${v("name")}, ${kind === "microvm" ? "microVM" : "sandbox"}, folder ${v("dir") || $("#guide-dir").placeholder}`),
+    item("Model", `${v("model")} via ${provider}`),
+    item("Chat", chats.length ? chats.map((p) => `${p} (users ${lines(v(`users_${p}`)).join(", ")})`).join("; ") : "none (terminal only)"),
+    item("Google", google.length ? google.join(", ") : "none"),
+    item("Network", `LLM provider APIs${chats.length ? ", the chat platforms" : ""}${allow.length ? `, ${allow.join(", ")}` : ""}`));
+  guideChatChanged();
+}
+
+gf.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const step = GUIDE_STEPS[guide.step];
+  const problem = guideValidate(step);
+  if (problem) { guideMsg(problem, true); return; }
+  guideMsg("");
+  if (step !== "review") { showGuideStep(guide.step + 1); return; }
+  await guideCreate();
+});
+$("#guide-back").addEventListener("click", () => { guideMsg(""); showGuideStep(Math.max(0, guide.step - 1)); });
+$("#guide-open").addEventListener("click", () => {
+  const name = guide.run.name;
+  resetGuide();
+  select(name);
+  selectTab("claude");
+});
+$("#empty-guide").addEventListener("click", () => showPage("guide"));
+
+function resetGuide() {
+  gf.reset();
+  guide.run = null;
+  guide.step = 0;
+  $("#guide-progress").replaceChildren();
+  guideMsg("");
+}
+
+async function guideCreate() {
+  const v = (n) => gEl[n].value.trim();
+  const name = v("name");
+  if (guide.run && guide.run.name !== name) guide.run = null;      // renamed after a failed try: start over
+  const run = guide.run ||= { name, tokens: {}, done: false };
+  run.busy = true;
+  run.failed = false;
+  const kind = gEl.kind.value;
+  const llmKind = gEl.llm_kind.value;
+  const chats = chatPicked();
+  const taken = new Set([...guide.pool.tokens.map((t) => t.id), ...Object.values(run.tokens)]);
+
+  // New keys and tokens for the pool: [what, service, secret, extra]
+  const newTokens = [];
+  if (["openrouter", "openai", "custom"].includes(llmKind)) newTokens.push(["llm", llmKind, v("llm_key")]);
+  for (const p of chats) {
+    for (const service of CHAT_SERVICES[p]) {
+      if (!gEl[`tok_${service}`].value) newTokens.push([service, service, v(`tok_${service}_new`)]);
+    }
+  }
+  const tasks = [[`Create the workspace and start its ${kind === "microvm" ? "VM (the first start copies its image: minutes)" : "container"}`,
+    async () => { if (!run.ws) { await api("POST", "workspaces", { name, dir: v("dir") || undefined, kind, agent: "hermes" }); run.ws = true; } }]];
+  for (const [what, service, secret] of newTokens) {
+    tasks.push([`Add the ${SERVICE_NAME[service]} ${what === "llm" ? "key" : "token"} to the pool`, async () => {
+      if (run.tokens[what]) return;
+      const id = freeTokenId(`${name}-${what === "llm" ? (service === "custom" ? "llm" : service) : service}`, taken);
+      await api("POST", "pool/tokens", { id, service, secret,
+        custom: service === "custom" ? { upstream: v("llm_url"), header: "Authorization", format: "Bearer {}", env_var: envFromId(id) } : undefined });
+      run.tokens[what] = id;
+    }]);
+  }
+  tasks.push(["Give it the model, chat and Google access, and the network allowlist", async () => {
+    const { policy: pol } = await api("GET", wsPath(name, "/policy"));
+    const llm = llmKind === "pool" ? v("llm_pool") : llmKind === "keyless" ? "" : run.tokens.llm;
+    const tokens = new Set(pol.tokens);
+    if (llm) tokens.add(llm);
+    for (const p of chats) for (const service of CHAT_SERVICES[p]) tokens.add(gEl[`tok_${service}`].value || run.tokens[service]);
+    for (const i of $$('input[name="google"]:checked', gf)) tokens.add(i.value);
+    pol.tokens = [...tokens];
+    pol.hermes = { llm, base_url: llmKind === "keyless" ? v("llm_url") : "", model: v("model"),
+      allowed_users: Object.fromEntries(Object.keys(CHAT_SERVICES).map((p) => [p, chats.includes(p) ? lines(v(`users_${p}`)).join(",") : ""])) };
+    pol.network.allow = [...new Set([...pol.network.allow, ...lines(v("allow"))])];
+    await api("PUT", wsPath(name, "/policy"), pol);
+  }]);
+  if (gEl.start.checked) {
+    tasks.push([kind === "microvm" ? "Start Hermes (in a new VM it installs first: a few minutes)" : "Start Hermes",
+      async () => { if (!run.started) { await api("POST", wsPath(name, "/claude/start")); run.started = true; } }]);
+  }
+  if (chats.length && gEl.gateway.checked) {
+    tasks.push(["Start the chat gateway",
+      async () => { if (!run.gateway) { await api("POST", wsPath(name, "/gateway/start")); run.gateway = true; } }]);
+  }
+
+  const items = tasks.map(([label]) => el("li", { textContent: label }));
+  $("#guide-progress").replaceChildren(...items);
+  showGuideStep(guide.step);
+  guideMsg("Working…");
+  for (const [i, [, fn]] of tasks.entries()) {
+    items[i].className = "busy";
+    try {
+      await fn();
+      items[i].className = "ok";
+    } catch (e) {
+      items[i].className = "bad";
+      items[i].append(el("div", { className: "muted", textContent: e.message }));
+      run.busy = false;
+      run.failed = true;
+      guideMsg("That step failed: fix it (Back changes your answers), then Try again; done steps aren't repeated.", true);
+      showGuideStep(guide.step);
+      await refresh();
+      return;
+    }
+  }
+  run.busy = false;
+  run.done = true;
+  showGuideStep(guide.step);
+  guideMsg(`${name} is set up.${chats.length ? " Message your bot to try it." : ""}`);
+  await refresh();
+}
+
+// ------------------------------------------------------------------ a Hermes workspace's setup checklist
+
+const setupHidden = (name) => { try { return localStorage.getItem(`setup-hidden:${name}`) === "1"; } catch { return false; } };
+
+function renderSetup(w) {
+  const box = $("#d-setup");
+  const s = w.setup;
+  if (w.agent !== "hermes" || !s || setupHidden(w.name)) { box.hidden = true; return; }
+  const gw = w.gateway === "unknown" ? gatewayState[w.name] : w.gateway;
+  const access = () => selectTab("access");
+  // [done, text, action label, action]
+  const items = [
+    [s.model && !!s.modelName, s.model && s.modelName ? `Model: ${s.modelName}` : "Choose its model provider and model", "Access tab", access],
+    [w.claude === "running", "Start Hermes", "Start", "claude/start"],
+    ...s.chat.map((p) => {
+      const name = p[0].toUpperCase() + p.slice(1);
+      return s.allowed.includes(p) ? [true, `${name}: allowed users set`]
+        : [false, `${name}: list who may talk to the bot (Hermes refuses everyone until you do)`, "Access tab", access];
+    }),
+  ];
+  if (s.chat.length) items.push([gw === "running", `Start the chat gateway (${s.chat.join(", ")})`, "Start", "gateway/start"]);
+  if (items.every(([done]) => done)) { box.hidden = true; return; }
+  box.hidden = false;
+  const hide = el("button", { type: "button", className: "btn ghost", textContent: "Hide" });
+  hide.addEventListener("click", () => {
+    try { localStorage.setItem(`setup-hidden:${w.name}`, "1"); } catch { /* shown again next time */ }
+    box.hidden = true;
+  });
+  box.replaceChildren(
+    el("div", { className: "setup-head" }, el("strong", { textContent: "Finish setting up Hermes" }), hide),
+    el("ul", {}, ...items.map(([done, text, label, action]) => {
+      const li = el("li", { className: done ? "ok" : "" }, el("span", { textContent: text }));
+      if (!done) {
+        const b = el("button", { type: "button", className: "btn", textContent: label });
+        if (typeof action === "string") b.dataset.act = action;
+        else b.addEventListener("click", action);
+        li.append(b);
+      }
+      return li;
+    })));
+}

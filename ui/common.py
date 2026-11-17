@@ -55,8 +55,13 @@ DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False, "vm_browser"
                   "limits": {"memory": "", "pids": 0, "cpus": 0, "disk": "",
                              "browser_memory": "", "browser_cpus": 0},
                   # Hermes workspaces: its model provider (a pool token's route, or a URL
-                  # the allowlist lets through) and model
-                  "hermes": {"llm": "", "base_url": "", "model": ""}}
+                  # the allowlist lets through) and model; who may talk to its gateway
+                  # on each chat platform (user IDs; Hermes refuses everyone else)
+                  "hermes": {"llm": "", "base_url": "", "model": "",
+                             "allowed_users": {"telegram": "", "discord": "", "slack": ""}}}
+# Hermes' environment variable for each platform's allowed users
+HERMES_ALLOWED_ENV = {"telegram": "TELEGRAM_ALLOWED_USERS", "discord": "DISCORD_ALLOWED_USERS",
+                      "slack": "SLACK_ALLOWED_USERS"}
 
 
 def die_with_parent():
@@ -110,7 +115,10 @@ def load_policy(name: str) -> dict:
             i if k == "ssh_keys" else f"{i}.json").is_file()]
     pol["network"].update(saved.get("network", {}))
     pol["limits"].update(saved.get("limits", {}))
+    allowed = pol["hermes"]["allowed_users"]
     pol["hermes"].update(saved.get("hermes", {}))
+    pol["hermes"]["allowed_users"] = {**allowed, **{k: v for k, v in (pol["hermes"].get("allowed_users") or {}).items()
+                                                    if k in allowed and isinstance(v, str)}}
     if pol["hermes"]["llm"] not in pol["tokens"]:
         pol["hermes"]["llm"] = ""
     pol["claude_md"] = saved.get("claude_md") is True

@@ -54,7 +54,7 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
                     EGRESS_PORT_OFFSET, HTTP_BRIDGE, ITEM_RE, MAX_HEAD, NAME_RE, PROXYD_SOCK, ROOT, RUNTIME,
                     SANDBOX_PORTS, SECRETS, SSH_POOL, TOKEN_POOL, VM_BROWSER_PORT, VM_PROXY_OFFSET,
                     VM_RELAY_PORT, VM_ROOT,
-                    AGENTS, WS_ROOT, all_ws, container_ca_paths, container_filtered, container_net,
+                    AGENTS, HERMES_ALLOWED_ENV, WS_ROOT, all_ws, container_ca_paths, container_filtered, container_net,
                     container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
                     load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version, read_env,
                     substituted, token_meta, token_placeholder, vm_browser, vm_cid, ws_agent)
@@ -458,6 +458,8 @@ async def api(req: Request, w):
         return await settings_api(req, parts[1:], w)
     if parts == ["host"] and m == "GET":
         return await send_json(w, await host_status())
+    if parts == ["setup", "hermes"] and m == "GET":
+        return await send_json(w, hermes_setup_status())
     if parts and parts[0] == "auth":
         return await auth_api(req, parts[1:], w)
     if parts and parts[0] == "access":
@@ -624,7 +626,8 @@ async def status_all() -> list[dict]:
                                 else gateway_word(gateways.get(n))),
                     "sshKeys": len(pol["ssh_keys"]), "tokens": len(pol["tokens"]),
                     "network": pol["network"]["mode"],
-                    "policyPending": not vm and claude.get(n) == "running" and policy_pending(ws)})
+                    "policyPending": not vm and claude.get(n) == "running" and policy_pending(ws),
+                    "setup": hermes_setup_summary(pol) if ws_agent(ws) == "hermes" else None})
     return out
 
 
@@ -1101,7 +1104,13 @@ def validate_policy(body: dict) -> dict:
     model = str(h.get("model", "") or "").strip()
     if model and not re.fullmatch(r"[A-Za-z0-9._:/@+-]{1,200}", model):
         raise ValueError("Hermes model: a model name such as anthropic/claude-sonnet-4.5")
-    pol["hermes"] = {"llm": llm, "base_url": "" if llm else base_url, "model": model}
+    allowed = {}
+    for platform in HERMES_ALLOWED_ENV:
+        ids = [x for x in re.split(r"[\s,]+", str((h.get("allowed_users") or {}).get(platform, "") or "")) if x]
+        if len(ids) > 50 or not all(re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", x) for x in ids):
+            raise ValueError(f"Hermes {platform} users: user IDs separated by commas (no * : list each one)")
+        allowed[platform] = ",".join(ids)
+    pol["hermes"] = {"llm": llm, "base_url": "" if llm else base_url, "model": model, "allowed_users": allowed}
     return pol
 
 
@@ -1353,6 +1362,37 @@ def hermes_problems() -> list[str]:
     return []
 
 
+
+def hermes_allowed_env(pol: dict) -> dict[str, str]:
+    """Who may use Hermes' gateway, per platform: set by the host (the Access
+    tab), not by Hermes' own .env, which the agent could rewrite."""
+    return {HERMES_ALLOWED_ENV[p]: ids for p, ids in pol["hermes"]["allowed_users"].items() if ids}
+
+
+# A pool token's chat platform, for Hermes' gateway
+CHAT_PLATFORM = {"telegram": "telegram", "discord": "discord", "slack-bot": "slack", "slack-app": "slack"}
+
+
+def hermes_setup_summary(pol: dict) -> dict:
+    """A Hermes workspace's setup checklist (the page's guide)."""
+    h = pol["hermes"]
+    services = {(token_meta(t) or {}).get("service") for t in pol["tokens"]}
+    chat = sorted({CHAT_PLATFORM[s] for s in services if s in CHAT_PLATFORM})
+    if "slack" in chat and not {"slack-bot", "slack-app"} <= services:
+        chat.remove("slack")      # Socket Mode needs both
+    return {"model": bool(h["llm"] or h["base_url"]), "modelName": h["model"], "chat": chat,
+            "allowed": sorted(p for p, ids in h["allowed_users"].items() if ids),
+            "google": sum(1 for s in services if s == "google")}
+
+
+def hermes_setup_status() -> dict:
+    """What the Hermes setup guide needs to know about this host."""
+    lock = hermes_lock()
+    return {"tag": lock.get("HERMES_TAG", ""), "sandbox": hermes_problems(), "microvm": vm_problems(),
+            "google": {"client": gbroker.client() is not None, "accounts": len(gbroker.accounts())},
+            "projects": str(PROJECTS_BASE)}
+
+
 def hermes_home(name: str) -> Path:
     return STATE_ROOT / name / "hermes"
 
@@ -1486,7 +1526,7 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
         # Claude gets from the claude-browser profile's hook
         fs["read"] += [str(HERMES_OPT), str(hermes_managed_dir(name))] + hermes_read_paths()
         env.update({"HERMES_HOME": str(hermes_home(name)), "HERMES_MANAGED_DIR": str(hermes_managed_dir(name)),
-                    "AIO_PORT": ws["WS_PORT"], "AIO_KEY": ws.get("WS_KEY", "")})
+                    "AIO_PORT": ws["WS_PORT"], "AIO_KEY": ws.get("WS_KEY", ""), **hermes_allowed_env(pol)})
     prof = {
         "meta": {"name": f"ws-{name}", "version": "1.0.0",
                  "description": f"Generated by agent-sandboxes for workspace {name}; edit in the web UI"},
@@ -3629,6 +3669,8 @@ def vm_proxy_env_text(ws: dict[str, str], pol: dict) -> str:
            "NODE_USE_ENV_PROXY": "1", "AIO_WORKSPACE": ws["WS_NAME"]}
     if pol["vm_browser"]:     # .mcp.json's aio-sandbox server: the container in the VM
         env.update({"AIO_PORT": str(VM_BROWSER_PORT), "AIO_KEY": ws["WS_KEY"]})
+    if ws_agent(ws) == "hermes":
+        env.update(hermes_allowed_env(pol))
     for tid in pol["tokens"]:
         if substituted(meta := token_meta(tid)):
             env[meta["env_var"]] = token_placeholder(ws["WS_NAME"], tid)
