@@ -401,7 +401,7 @@ Hermes gets the same isolation as Claude, in either kind:
 A **Google grant** gives a workspace read access to Gmail or Calendar that is narrower than
 Google's OAuth scopes allow. It works for Claude workspaces too.
 
-1. **OAuth client.** Under *Settings → Google accounts*, add your own OAuth client from
+1. **OAuth client.** Under *Keys & tokens → Google accounts*, add your own OAuth client from
    Google Cloud Console. It must be of type *Desktop app*, with the Gmail and/or Calendar API
    enabled, and you as a test user on the consent screen.
 2. **Connect an account.** Tick the access you'll want (`gmail.readonly`, `gmail.metadata`,

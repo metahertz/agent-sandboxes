@@ -1,6 +1,6 @@
 """Google access for workspaces, narrower than OAuth scopes allow.
 
-A Google *account* (Settings -> Google accounts) is your OAuth consent with
+A Google *account* (Keys & tokens -> Google accounts) is your OAuth consent with
 your own OAuth client; its refresh token stays in secrets/google/. A *grant* is
 a pool token (secrets/tokens/<id>.json, service "google") naming an account
 and a preset: what a workspace may do with that account. The sandbox sees a

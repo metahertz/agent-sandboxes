@@ -1068,6 +1068,7 @@ async function loadPool() {
   } catch (e) {
     return poolMsg(e.message, true);
   }
+  loadGoogle();
   renderMatrix($("#m-ssh"), "ssh", poolData.ssh, (k) => `${k.type} ${k.fingerprint} · ${k.comment}`);
   renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => t.service === "google"
     ? `${t.label} → $${baseUrlVar(t.id)} · ${t.detail}`
@@ -1097,7 +1098,7 @@ async function showGoogleFields(on) {
   }
   const acc = $("#tok-g-account");
   acc.replaceChildren(...googleData.accounts.map((a) => el("option", { value: a.id, textContent: `${a.email} (${a.scopes.join(", ")})` })));
-  if (!googleData.accounts.length) acc.append(el("option", { value: "", textContent: "None yet: connect one under Settings" }));
+  if (!googleData.accounts.length) acc.append(el("option", { value: "", textContent: "None yet: connect one in Google accounts below" }));
   const pre = $("#tok-g-preset");
   if (!pre.options.length) {
     for (const [k, v] of Object.entries(googleData.presets)) pre.append(el("option", { value: k, textContent: v.label }));
@@ -1493,7 +1494,7 @@ $("#auth-logout-others").addEventListener("click", async () => {
   loadAuth();
 });
 
-// ---- Settings: Google accounts (OAuth client, connected accounts)
+// ---- Keys & tokens: Google accounts (OAuth client, connected accounts)
 
 function gMsg(text, isErr = false) {
   $("#g-msg").textContent = text;
@@ -1557,7 +1558,8 @@ $("#g-finish-btn").addEventListener("click", async () => {
     const r = await api("POST", "google/finish", { url: f.url.value.trim() });
     f.url.value = "";
     $("#g-finish").hidden = true;
-    gMsg(`Connected ${r.email} (${r.scopes.join(", ") || "no API scopes granted"}). Create grants for it under Keys & tokens.`);
+    gMsg(`Connected ${r.email} (${r.scopes.join(", ") || "no API scopes granted"}). Create grants for it with + Add token (service Google).`);
+    if (!$("#tok-google").hidden) showGoogleFields(true);
   } catch (e) { gMsg(e.message, true); }
   loadGoogle();
 });
@@ -1567,7 +1569,6 @@ async function loadSettings() {
   try {
     const st = await api("GET", "settings/monitoring");
     loadClaudeMd();
-    loadGoogle();
     loadBackup(true);
     renderMonStatus(st);
     fillMonForm(st);
@@ -1951,14 +1952,12 @@ async function loadGuide() {
   if (!grants.length) {
     const g = st.google;
     const p = el("p", { className: "hint" }, !g.client
-      ? "No Google OAuth client yet: add yours in Settings → Google accounts, connect an account, then make a grant under Keys & tokens. "
-      : !g.accounts ? "No Google account connected yet: connect one in Settings → Google accounts, then make a grant under Keys & tokens. "
+      ? "No Google OAuth client yet: add yours under Keys & tokens → Google accounts, connect an account, then make a grant there (+ Add token, service Google). "
+      : !g.accounts ? "No Google account connected yet: connect one under Keys & tokens → Google accounts, then make a grant there (+ Add token, service Google). "
         : "No grants yet: make one under Keys & tokens (Add token → Google grant). ");
-    const toSettings = el("button", { type: "button", className: "btn", textContent: "Settings" });
-    toSettings.addEventListener("click", () => showPage("settings"));
     const toPool = el("button", { type: "button", className: "btn", textContent: "Keys & tokens" });
     toPool.addEventListener("click", () => showPage("pool"));
-    box.append(p, el("div", { className: "row" }, toSettings, toPool),
+    box.append(p, el("div", { className: "row" }, toPool),
       el("p", { className: "hint", textContent: "Your answers here are kept while you do that; come back with the guided setup button. Or skip this: grants can be added in the Access tab later." }));
   }
   guideModelChanged();
