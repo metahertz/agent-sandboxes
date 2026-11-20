@@ -513,7 +513,8 @@ builds commits only: uncommitted changes aren't sent. A repo whose `.git` borrow
 from elsewhere (alternates, symlinks) is refused. The *Builds* tab shows the same jobs, with
 live logs, screenshots, artifacts, and a form to queue one yourself.
 
-**Setting it up:**
+**Setting it up** (*Settings → Apple builds → Set up a build host and Mac workers* has these steps,
+with the commands filled in and downloads of the installers for another build host and for the Mac):
 
 1. On this host: `bin/install-buildhost`. It needs an ssh server, and it:
    - creates `aiogit`;

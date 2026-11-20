@@ -971,6 +971,13 @@ async function loadBuildHost() {
   const f = $("#bh-form").elements;
   if (document.activeElement?.form !== $("#bh-form")) { f.host.value = r.host; f.port.value = r.port; }
   $("#bh-key").textContent = r.publicKey;
+  $("#bh-cmd-host").textContent = `tar xzf aio-buildhost.tar.gz && aio-buildhost/bin/install-buildhost --ui-key '${r.publicKey}'`;
+  // The Mac reaches the build host from outside: a loopback address means this machine
+  const [user, at] = r.host.includes("@") ? r.host.split("@") : ["aiogit", r.host];
+  const host = !at || /^(127\.|localhost$|::1$)/.test(at) ? location.hostname : at;
+  $("#bh-cmd-mac").textContent = `tar xzf aio-build-worker.tar.gz && aio-build-worker/buildhost/install-worker --host ${user}@${host}`
+    + (Number(r.port) && Number(r.port) !== 22 ? ` --port ${r.port}` : "");
+  if (!r.host || !r.workers.length) $("#bh-setup").open = true;
   setPill($("#bh-state"), "build host", !r.host ? "not set up" : r.connected ? "connected" : "not connected",
     !r.host ? "" : r.connected ? "ok" : "bad");
   if (r.error) bhMsg(r.error, true);
@@ -1017,6 +1024,13 @@ $("#bh-add").addEventListener("submit", async (ev) => {
   } catch (e) { bhMsg(e.message, true); }
   loadBuildHost();
 });
+for (const b of document.querySelectorAll(".bh-cmd [data-copy]")) {
+  b.addEventListener("click", async () => {
+    const code = b.previousElementSibling;
+    try { await navigator.clipboard.writeText(code.textContent); bhMsg("Copied."); }
+    catch { getSelection().selectAllChildren(code); bhMsg("Selected: copy it with Ctrl+C / ⌘C."); }
+  });
+}
 $("#bh-copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText($("#bh-key").textContent); bhMsg("Copied."); }
   catch { getSelection().selectAllChildren($("#bh-key")); bhMsg("Selected: copy it with Ctrl+C / ⌘C."); }

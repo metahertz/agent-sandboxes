@@ -876,6 +876,22 @@
           </form>
           <p class="hint">This host's key, for the build host's <code>aio-buildd ui-key</code> (the installer adds it for a build host on this machine):</p>
           <span class="g-copy"><code id="bh-key"></code> <button class="btn" type="button" id="bh-copy">Copy</button></span>
+          <details class="bh-setup" id="bh-setup">
+            <summary>Set up a build host and Mac workers</summary>
+            <h3>1. The build host</h3>
+            <p class="hint"><strong>On this machine</strong> (the usual case), in the agent-sandboxes folder; it needs an ssh server. It creates the <code>aiogit</code> user, gives this host's key the ui role and fills in the form above:</p>
+            <div class="bh-cmd"><code>bin/install-buildhost &amp;&amp; sudo systemctl restart agent-sandboxes-ui</code> <button class="btn" type="button" data-copy>Copy</button></div>
+            <p class="hint"><strong>Or on another Linux host</strong> with git and an ssh server: download the installer there, run it with this host's key, then set its address above as <code>aiogit@&lt;that host&gt;</code> and <em>Test connection</em>.</p>
+            <div class="row"><a class="btn" href="/api/builds/download/buildhost" download>⬇ aio-buildhost.tar.gz</a></div>
+            <div class="bh-cmd"><code id="bh-cmd-host"></code> <button class="btn" type="button" data-copy>Copy</button></div>
+            <h3>2. A Mac worker</h3>
+            <p class="hint">On a Mac with Apple silicon, <a href="https://tart.run" target="_blank" rel="noopener">Tart</a> and Python 3.9+ (<code>xcode-select --install</code>), logged in as the user whose VMs it should use. It only connects out, to the build host's ssh port, which must be reachable from the Mac. Download the worker, then run:</p>
+            <div class="row"><a class="btn" href="/api/builds/download/worker" download>⬇ aio-build-worker.tar.gz</a></div>
+            <div class="bh-cmd"><code id="bh-cmd-mac"></code> <button class="btn" type="button" data-copy>Copy</button></div>
+            <p class="hint">It installs into <code>~/.aio-build</code> with a LaunchAgent, and prints the worker's name and key: add them under <em>Mac workers</em> below. Then pull the image once (<code>tart pull ghcr.io/cirruslabs/macos-sequoia-xcode:latest</code>), so the first build doesn't wait for it.</p>
+            <h3>3. A workspace</h3>
+            <p class="hint">Tick <em>Apple builds</em> on its Access tab and restart its agent.</p>
+          </details>
           <h3>Mac workers</h3>
           <div class="keylist" id="bh-workers"></div>
           <form id="bh-add" class="b-form">
