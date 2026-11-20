@@ -111,6 +111,7 @@
         <button role="tab" data-tab="access">Access</button>
         <button role="tab" data-tab="files">Files</button>
         <button role="tab" data-tab="logs">Logs</button>
+        <button role="tab" data-tab="builds" id="builds-tab" hidden>Builds</button>
       </div>
 
       <div class="panel" data-panel="claude">
@@ -192,6 +193,11 @@
             <p class="hint">“Same as Claude” puts the container on a network with no route out; its browser and shell tools use the proxy, and the rest (DNS, raw TCP) can't connect. Allowlist changes apply to the container at once; switching this, or changing its tokens, recreates the container (its browser session restarts). VS Code extensions need <code>open-vsx.org</code> allowed.</p>
             </div>
             <p class="hint vm-only">This VM has no network interface: everything in it (Claude, apt, Docker, git over ssh) goes through its proxy on the host, with this allowlist, which applies at once. <code>claude.ai</code> and <code>downloads.claude.ai</code> are always allowed, for installing Claude Code in the VM. Token changes apply when the VM restarts.</p>
+          </section>
+          <section class="card">
+            <h2>Apple builds</h2>
+            <label class="check"><input type="checkbox" name="builds"> <span>Let the agent build, test and run this repo's Xcode project on the Mac build worker <span class="muted">(the aio-builds MCP server)</span></span></label>
+            <p class="hint">Each job is a commit of the project's git repository, pushed by this host to the build host and run by a Mac worker in a fresh macOS VM that's deleted afterwards. The agent gets MCP tools only, never a key or a connection to the build host or the Mac. Set up the build host and workers under Settings → Apple builds. Restart the agent to apply.</p>
           </section>
           <section class="card vm-only">
             <h2>Browser container</h2>
@@ -282,6 +288,49 @@
           <button class="btn" id="logs-refresh">Refresh</button>
         </div>
         <pre id="logs" class="logs"></pre>
+      </div>
+
+      <div class="panel" data-panel="builds" hidden>
+        <div class="panel-bar">
+          <span class="muted" id="b-status">Apple builds</span>
+          <span class="spacer"></span>
+          <button class="btn" id="b-refresh">Refresh</button>
+        </div>
+        <div class="builds">
+          <details class="card b-new" id="b-new">
+            <summary><strong>New build</strong> <span class="muted">(the agent queues its own with the aio-builds MCP tools)</span></summary>
+            <form id="b-form" class="b-form">
+              <div class="row">
+                <label>Action <select name="action">
+                  <option value="build">build</option><option value="test">test</option>
+                  <option value="run">run (Simulator + screenshot)</option><option value="archive">archive (unsigned)</option></select></label>
+                <label>Scheme <input name="scheme" required autocomplete="off" spellcheck="false"></label>
+                <label>Project <input name="project" placeholder="App.xcodeproj (optional)" autocomplete="off" spellcheck="false"></label>
+              </div>
+              <div class="row">
+                <label>Destination <input name="destination" placeholder="platform=iOS Simulator,name=iPhone 16" autocomplete="off" spellcheck="false"></label>
+                <label>Configuration <input name="configuration" placeholder="Debug" autocomplete="off" spellcheck="false"></label>
+                <label>Ref <input name="ref" placeholder="HEAD" autocomplete="off" spellcheck="false"></label>
+              </div>
+              <div class="row"><button class="btn primary" type="submit">Queue build</button>
+                <span class="hint">Builds a commit: uncommitted changes aren't sent.</span></div>
+            </form>
+          </details>
+          <p class="form-msg" id="b-msg" role="status"></p>
+          <div class="matrix-wrap"><table class="matrix b-jobs" id="b-jobs"></table></div>
+          <section class="card b-detail" id="b-detail" hidden>
+            <div class="card-head"><h2 id="b-d-title"></h2>
+              <div class="row">
+                <button class="btn" type="button" id="b-cancel">Cancel</button>
+                <button class="btn ghost" type="button" id="b-abandon" title="Mark a build whose worker went away as abandoned">Abandon</button>
+                <button class="btn ghost" type="button" id="b-close">Close</button>
+              </div></div>
+            <p class="hint" id="b-d-meta"></p>
+            <div class="b-shots" id="b-shots"></div>
+            <div id="b-arts"></div>
+            <pre class="logs b-log" id="b-log"></pre>
+          </section>
+        </div>
       </div>
     </section>
 
@@ -576,6 +625,33 @@
           <div class="matrix-wrap"><table class="matrix" id="bk-runs"></table></div>
         </section>
       </div>
+      <div class="settings-form">
+        <section class="card" id="builds-card">
+          <div class="card-head"><h2>Apple builds</h2><span class="pill" id="bh-state">…</span></div>
+          <p class="hint">Xcode builds for workspaces with Apple builds ticked: this host pushes each job (a commit, tagged <code>build/&lt;id&gt;</code>) over ssh to a plain git build host, and Mac workers take them, each into a throwaway Tart VM. <code>bin/install-buildhost</code> sets up a build host on this machine; <code>buildhost/install-worker</code> sets up a Mac.</p>
+          <form id="bh-form" class="b-form">
+            <div class="row">
+              <label>Build host <input name="host" placeholder="aiogit@127.0.0.1" autocomplete="off" spellcheck="false"></label>
+              <label>Port <input name="port" type="number" min="1" max="65535" value="22"></label>
+            </div>
+            <div class="row"><button class="btn primary" type="submit">Save</button>
+              <button class="btn" type="button" id="bh-test">Test connection</button></div>
+          </form>
+          <p class="hint">This host's key, for the build host's <code>aio-buildd ui-key</code> (the installer adds it for a build host on this machine):</p>
+          <span class="g-copy"><code id="bh-key"></code> <button class="btn" type="button" id="bh-copy">Copy</button></span>
+          <h3>Mac workers</h3>
+          <div class="keylist" id="bh-workers"></div>
+          <form id="bh-add" class="b-form">
+            <div class="row">
+              <label>Name <input name="name" placeholder="mac-mini" autocomplete="off" spellcheck="false"></label>
+              <label>Public key <span class="muted">(the one <code>install-worker</code> printed)</span> <input name="key" placeholder="ssh-ed25519 AAAA…" autocomplete="off" spellcheck="false"></label>
+            </div>
+            <div class="row"><button class="btn" type="submit">Add worker</button></div>
+          </form>
+          <p class="form-msg" id="bh-msg" role="status"></p>
+        </section>
+      </div>
+
       </div>
     </section>
   </main>

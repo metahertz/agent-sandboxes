@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Set up a build host for Apple builds: plain git over ssh, as its own user,
+# with buildhost/aio-buildd as the only thing any key may run.
+#
+#   bin/install-buildhost                 on the agent-sandboxes host itself
+#                                         (the usual case): also gives the web
+#                                         UI its key and points it here
+#   bin/install-buildhost --ui-key 'ssh-ed25519 AAAA…'
+#                                         on another Linux host, with the key
+#                                         the UI shows (Settings → Apple builds);
+#                                         then set this host in the UI
+#
+# Options: --user NAME (default aiogit), --home DIR (default /var/lib/NAME).
+# Needs sudo and an ssh server. Run it again to update aio-buildd.
+set -euo pipefail
+
+ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/buildhost/aio-buildd"
+GUSER=aiogit; GHOME=""; UIKEY=""; LOCAL=1
+while (($#)); do
+  case $1 in
+    --ui-key) UIKEY=$2; LOCAL=0; shift 2 ;;
+    --user) GUSER=$2; shift 2 ;;
+    --home) GHOME=$2; shift 2 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
+  esac
+done
+GHOME=${GHOME:-/var/lib/$GUSER}
+BIN=/usr/local/lib/agent-sandboxes/aio-buildd
+say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
+note() { printf '\033[33m    %s\033[0m\n' "$*"; }
+
+[[ -f $SRC ]] || { echo "can't find $SRC" >&2; exit 1; }
+command -v git >/dev/null || { echo "git isn't installed (sudo apt install git)" >&2; exit 1; }
+command -v sshd >/dev/null || [[ -x /usr/sbin/sshd ]] || {
+  echo "no ssh server here: sudo apt install openssh-server" >&2; exit 1; }
+
+if ! id "$GUSER" >/dev/null 2>&1; then
+  say "Creating user $GUSER (home $GHOME)"
+  sudo useradd --system --create-home --home-dir "$GHOME" --shell /bin/sh "$GUSER"
+fi
+# A locked password ("!") makes some sshd setups refuse its keys; "*" means
+# no password login, keys only
+sudo usermod -p '*' "$GUSER"
+
+say "Installing aio-buildd to $BIN"
+sudo install -d -m 755 "$(dirname "$BIN")"
+sudo install -m 755 "$SRC" "$BIN"
+sudo -u "$GUSER" -H "$BIN" init
+
+if (( LOCAL )); then
+  KEYDIR="$ROOT/secrets/builds"
+  mkdir -p "$KEYDIR"; chmod 700 "$ROOT/secrets" "$KEYDIR"
+  [[ -f $KEYDIR/ui_ed25519 ]] || ssh-keygen -q -t ed25519 -N "" -C agent-sandboxes-ui -f "$KEYDIR/ui_ed25519"
+  UIKEY=$(cat "$KEYDIR/ui_ed25519.pub")
+fi
+say "Giving the web UI's key the ui role"
+sudo -u "$GUSER" -H "$BIN" ui-key "$UIKEY"
+
+if allow=$(sudo sshd -T 2>/dev/null | awk '$1=="allowusers"{ $1=""; print }') && [[ -n $allow ]] && \
+    [[ " $allow " != *" $GUSER "* ]]; then
+  note "sshd has AllowUsers ($allow): add $GUSER there (/etc/ssh/sshd_config.d/), then: sudo systemctl reload ssh"
+fi
+
+if (( LOCAL )); then
+  port=$(sudo sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}'); port=${port:-22}
+  if [[ -s $KEYDIR/config.json ]]; then
+    say "Keeping the web UI's build host setting ($(cat "$KEYDIR/config.json"))"
+  else
+    say "Pointing the web UI at $GUSER@127.0.0.1:$port"
+    ssh-keyscan -p "$port" -T 5 127.0.0.1 2>/dev/null > "$KEYDIR/known_hosts" || true
+    printf '{"host": "%s@127.0.0.1", "port": %s}\n' "$GUSER" "$port" > "$KEYDIR/config.json"
+    chmod 600 "$KEYDIR/config.json" "$KEYDIR/known_hosts"
+    if out=$(ssh -F /dev/null -i "$KEYDIR/ui_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes \
+        -o UserKnownHostsFile="$KEYDIR/known_hosts" -p "$port" "$GUSER@127.0.0.1" version 2>&1); then
+      say "Connected: $out"
+    else
+      note "Couldn't connect yet: $out"
+    fi
+  fi
+  note "Restart the web UI to pick it up: sudo systemctl restart agent-sandboxes-ui"
+  note "Then add a Mac: run buildhost/install-worker on it, and paste its key under Settings → Apple builds."
+  note "The Mac connects to this host's ssh port ($port) as $GUSER: it must be reachable from the Mac."
+else
+  say "Done. In the web UI (Settings → Apple builds), set the build host to $GUSER@$(hostname -f 2>/dev/null || hostname)"
+fi

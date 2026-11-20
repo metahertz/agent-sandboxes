@@ -83,6 +83,9 @@ flowchart LR
 | `bin/sandbox-ui` | UI launcher (systemd `ExecStart`) |
 | `bin/sandbox-ui-cert` | Private, name-constrained CA + server cert in `ui/tls/` |
 | `bin/claude-in <name>` | Claude Code inside nono for one workspace (prepares agent + profile); nono's log goes to `monitoring/data/nono-logs/<name>.log`, outside the sandbox |
+| `ui/builds.py`, `buildhost/aio-buildd`, `buildhost/aio-build-worker` | Apple builds: the UI's side (submit, monitor, the aio-builds MCP server); the git build host's only command; the Mac worker |
+| `bin/install-buildhost`, `buildhost/install-worker` | Set up a build host (user `aiogit`, `/usr/local/lib/agent-sandboxes/aio-buildd`); set up a Mac worker (`~/.aio-build`, a LaunchAgent) |
+| `secrets/builds/` ✱ | The UI's build host key, address and `known_hosts`; each workspace's MCP key; clean mirrors the jobs are pushed from |
 | `libexec/ssh-proxy-connect` | SSH `ProxyCommand` through nono's proxy (readable in the sandbox) |
 | `compose.workspace.yaml` | Container template (compose project `aio-<name>`) |
 | `bin/microvm`, `bin/microvm-image`, `microvm/guest/` | MicroVM workspaces: start / stop / ssh a VM (systemd `--user` unit `aio-vm-<name>`); build the base image; the guest's own scripts and units |
@@ -300,6 +303,91 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
   Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+
+### Apple builds
+
+Agents in Linux sandboxes can build, test and run Xcode projects (iOS, macOS) on a Mac,
+without any way to reach the Mac. There are three parts:
+
+- **The build host:** plain git over ssh, as its own user (`aiogit`), on this machine or
+  another Linux host. There is no daemon: sshd runs `aio-buildd` for every connection, as
+  the forced command of the key that connected (`restrict,command=…`), and git runs it as
+  the repos' hooks. Git is the record. A job is an annotated tag `build/<id>` whose message
+  is the job (JSON). A worker claims it with a create-only ref `refs/claims/<id>`, and its
+  result is `refs/results/<id>` (`summary.json`, `build.log`, test results, screenshots).
+  Logs, heartbeats and cancel flags are small files next to the repos.
+- **The keys:**
+  - The web UI's key may only create `build/*` and `release/*` tags (the job checked at
+    push time against a fixed format: action, scheme, project, destination,
+    configuration), read state and logs, and add or remove workers.
+  - A worker's key may fetch, claim a job, send its log and heartbeats, upload an
+    artifact, and push the result of a job it claimed.
+  - Nothing else runs, and refs are write-once: no deletes, no force-pushes.
+- **Mac workers** (`buildhost/aio-build-worker`) only connect out. Per job:
+  1. Fetch the commit.
+  2. `tart clone` the image (e.g. Cirrus Labs' `macos-sequoia-xcode`), then `tart run` it
+     with the checkout shared read-only.
+  3. Through `tart exec`, run fixed `xcodebuild` steps for the action:
+     - *build*;
+     - *test* (an `.xcresult` summary);
+     - *run*: build, install and launch in the Simulator, then a screenshot;
+     - *archive*: an unsigned `.xcarchive`, zipped, kept as an artifact.
+  4. Push the result.
+  5. Delete the VM.
+
+  Apple's licence allows two macOS VMs per Mac, so `max_vms` is 1 or 2.
+
+**The agent's side.** Tick *Apple builds* in the workspace's Access tab. The agent gets an
+MCP server, `aio-builds`, with these tools:
+
+- `apple_build`
+- `build_status`, which can wait for the build to finish
+- `build_log`
+- `build_result`, which returns screenshots as images
+- `cancel_build`
+
+It reaches the server like an API token route. nono's proxy adds the workspace's key
+(`X-AIO-Build`), and the proxy service's bridge (`/~build`) passes the request to the web UI
+with the workspace's name, over a Unix socket only that service can reach. The web UI then:
+
+- copies the commit out of the project's repo into a clean mirror in `secrets/builds/`,
+  using git's upload-pack and never the repo's own hooks or config;
+- tags it;
+- pushes the tag to the build host.
+
+The agent never holds a git credential or a connection to the build host or the Mac. It
+builds commits only: uncommitted changes aren't sent. A repo whose `.git` borrows objects
+from elsewhere (alternates, symlinks) is refused. The *Builds* tab shows the same jobs, with
+live logs, screenshots, artifacts, and a form to queue one yourself.
+
+**Setting it up:**
+
+1. On this host: `bin/install-buildhost`. It needs an ssh server, and it:
+   - creates `aiogit`;
+   - installs `aio-buildd`;
+   - gives the UI's key the ui role;
+   - points the UI at `aiogit@127.0.0.1`.
+
+   For a build host elsewhere, run `bin/install-buildhost --ui-key '<key>'` there, with
+   the key shown under *Settings → Apple builds*, and set its address in that card.
+2. Restart the UI. *Settings → Apple builds* should say *connected*.
+3. On the Mac (Apple silicon, [Tart](https://tart.run) installed):
+   `buildhost/install-worker --host aiogit@<this host>`. It sets up `~/.aio-build` and a
+   LaunchAgent, and prints the worker's key. Add that key under *Settings → Apple builds →
+   Mac workers*. Then `tart pull` the image once.
+4. Tick *Apple builds* in a workspace's Access tab and restart its agent.
+
+The Mac's settings are in `~/.aio-build/config.json`:
+
+- `image`
+- `max_vms`
+- `run_args`, e.g. `--net-softnet` to keep VMs off your LAN
+- `vm_env`, e.g. a proxy for package downloads
+- `ssh_args`
+
+What a build may reach on the network is the Mac's and Tart's to decide. The agent-sandboxes
+allowlist doesn't cover the VM. Signing and App Store uploads aren't part of this: archives
+are unsigned. `release/*` tags are reserved for a separate signing service.
 
 ### Import
 

@@ -110,6 +110,8 @@ function renderDetail() {
   const views = !vm || w.browser;
   for (const tab of VM_HIDDEN_TABS) $(`.tabs [data-tab="${tab}"]`).hidden = !views;
   if (!views && VM_HIDDEN_TABS.includes(state.tab)) selectTab("claude");
+  $("#builds-tab").hidden = !w.builds;
+  if (!w.builds && state.tab === "builds") selectTab("claude");
   setPill($("#d-claude"), "Claude", w.claude, CLAUDE_TONE[w.claude]);
   $("#d-pending").hidden = !w.policyPending;
 
@@ -155,6 +157,7 @@ function select(name) {
   if (state.tab === "files") loadFiles();
   if (state.tab === "logs") loadLogs();
   if (state.tab === "access") loadAccess();
+  if (state.tab === "builds") loadBuilds(true);
 }
 
 const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), host: () => loadHost(), settings: () => loadSettings() };
@@ -289,6 +292,7 @@ function selectTab(tab) {
   if (tab === "files") loadFiles();
   if (tab === "logs") loadLogs();
   if (tab === "access") loadAccess();
+  if (tab === "builds") loadBuilds(true);
 }
 $$(".tabs [role=tab]").forEach((b) => b.addEventListener("click", () => selectTab(b.dataset.tab)));
 
@@ -784,6 +788,190 @@ async function loadLogs() {
 }
 $("#logs-refresh").addEventListener("click", loadLogs);
 
+// ------------------------------------------------------------------ Apple builds (per workspace)
+
+const BUILD_TONE = { passed: "ok", running: "warn", queued: "warn", failed: "bad", error: "bad", timeout: "bad",
+  stale: "warn" };
+const ACTIVE = ["queued", "running", "stale"];
+const bstate = { for: null, sel: null, offset: 0, timer: null, jobs: [] };
+const dur = (s) => (s == null ? "" : s < 90 ? `${s} s` : `${Math.round(s / 60)} min`);
+function bMsg(text, isErr = false) { const e = $("#b-msg"); e.textContent = text; e.classList.toggle("err", isErr); }
+
+async function loadBuilds(fresh = false) {
+  clearTimeout(bstate.timer);
+  const w = current();
+  if (!w || state.view !== "ws" || state.tab !== "builds") return;
+  if (bstate.for !== w.name) {
+    Object.assign(bstate, { for: w.name, sel: null, offset: 0, jobs: [] });
+    $("#b-detail").hidden = true;
+    bMsg("");
+  }
+  let r;
+  try { r = await api("GET", wsPath(w.name, "/builds")); }
+  catch (e) { $("#b-status").textContent = e.message; bstate.timer = setTimeout(loadBuilds, 10000); return; }
+  const online = r.workers.filter((x) => x.online);
+  $("#b-status").textContent = !r.host ? "No build host set up yet: Settings → Apple builds."
+    : !r.connected ? `Build host ${r.host}: not connected${r.error ? ` (${r.error})` : ""}`
+      : `Build host ${r.host} · Mac workers: ${r.workers.map((x) => `${x.name} (${x.online ? "online" : "offline"})`).join(", ") || "none yet"}`
+        + (online.length ? "" : " · jobs wait in the queue until a worker is online");
+  bstate.jobs = r.jobs;
+  const head = el("tr", {}, ...["Build", "Action", "Scheme", "Commit", "State", "Time", "Worker"].map((h) => el("th", { textContent: h })));
+  const rows = r.jobs.map((j) => {
+    const pill = el("span", { className: `pill ${BUILD_TONE[j.state] || ""}`, textContent: j.state });
+    const tr = el("tr", { className: j.id === bstate.sel ? "sel" : "" },
+      el("td", { className: "mono", textContent: j.id }), el("td", { textContent: j.spec?.action || "" }),
+      el("td", { textContent: j.spec?.scheme || "" }), el("td", { className: "mono", textContent: (j.commit || "").slice(0, 10) }),
+      el("td", {}, pill), el("td", { textContent: dur(j.summary?.seconds) }), el("td", { textContent: j.worker || "" }));
+    tr.dataset.id = j.id;
+    tr.addEventListener("click", () => openBuild(j.id));
+    return tr;
+  });
+  if (!rows.length) rows.push(el("tr", {}, el("td", { colSpan: 7, className: "note muted",
+    textContent: "No builds yet. Queue one above, or ask the agent (its aio-builds MCP tools)." })));
+  $("#b-jobs").replaceChildren(head, ...rows);
+  if (bstate.sel) await showBuild(fresh);
+  const busy = r.jobs.some((j) => ACTIVE.includes(j.state));
+  bstate.timer = setTimeout(loadBuilds, busy ? 3000 : 15000);
+}
+
+function openBuild(id) {
+  Object.assign(bstate, { sel: id, offset: 0 });
+  $("#b-log").textContent = "";
+  $("#b-shots").replaceChildren();
+  $("#b-arts").replaceChildren();
+  $("#b-detail").hidden = false;
+  $$("#b-jobs tr[data-id]").forEach((tr) => tr.classList.toggle("sel", tr.dataset.id === id));
+  showBuild(true);
+}
+
+async function showBuild(full) {
+  const w = current();
+  const j = bstate.jobs.find((x) => x.id === bstate.sel);
+  if (!w) return;
+  if (!j) {     // just queued: the build host's next snapshot brings it
+    $("#b-d-title").textContent = `${bstate.sel} · queued`;
+    $("#b-d-meta").textContent = "Waiting for the build host…";
+    $("#b-cancel").hidden = $("#b-abandon").hidden = true;
+    return;
+  }
+  const base = `/api/${wsPath(w.name, `/builds/${j.id}`)}`;
+  $("#b-d-title").textContent = `${j.spec?.action} ${j.spec?.scheme} · ${j.state}`;
+  const s = j.summary || {};
+  $("#b-d-meta").textContent = [`commit ${j.commit?.slice(0, 12)}`, j.spec?.project, j.spec?.destination,
+    j.spec?.configuration, `queued ${j.spec?.submitted || ""} by ${j.spec?.by === "agent" ? "the agent" : "you"}`,
+    j.worker && `worker ${j.worker}`, s.xcode, s.seconds != null && dur(s.seconds), s.error && `error: ${s.error}`]
+    .filter(Boolean).join(" · ");
+  $("#b-cancel").hidden = !["queued", "running"].includes(j.state);
+  $("#b-abandon").hidden = j.state !== "stale";
+  // the log, from where we got to
+  if (full || ACTIVE.includes(j.state) || j.log_size > bstate.offset) {
+    try {
+      const res = await fetch(`${base}/log?offset=${bstate.offset}`, { headers: { "X-Requested-With": "sbui" } });
+      const t = await res.text();
+      if (res.ok && t) {
+        const pre = $("#b-log");
+        const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+        pre.textContent += t;
+        bstate.offset += new TextEncoder().encode(t).length;
+        if (atEnd) pre.scrollTop = pre.scrollHeight;
+      }
+    } catch { /* next time */ }
+  }
+  if (!j.summary || !full) return;
+  $("#b-shots").replaceChildren(...(s.files || []).filter((f) => /^screenshots\/.*\.png$/.test(f)).map((f) =>
+    el("img", { src: `${base}/file?path=${encodeURIComponent(f)}`, alt: f })));
+  const arts = j.artifacts || [];
+  $("#b-arts").replaceChildren(...(arts.length ? [el("span", { className: "muted", textContent: "Artifacts: " })] : []),
+    ...arts.map((a) => el("a", { className: "btn", href: `${base}/artifact?name=${encodeURIComponent(a)}`, textContent: `⬇ ${a}` })));
+}
+
+async function buildAction(what) {
+  const w = current();
+  if (!w || !bstate.sel) return;
+  if (what === "abandon" && !confirm("Mark this build abandoned? Do it when its worker is gone for good.")) return;
+  try { await api("POST", wsPath(w.name, `/builds/${bstate.sel}/${what}`)); bMsg(what === "cancel" ? "Cancel requested." : "Marked abandoned."); }
+  catch (e) { bMsg(e.message, true); }
+  loadBuilds();
+}
+$("#b-cancel").addEventListener("click", () => buildAction("cancel"));
+$("#b-abandon").addEventListener("click", () => buildAction("abandon"));
+$("#b-close").addEventListener("click", () => { bstate.sel = null; $("#b-detail").hidden = true; loadBuilds(); });
+$("#b-refresh").addEventListener("click", () => loadBuilds(true));
+$("#b-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const w = current();
+  const f = ev.currentTarget.elements;
+  const body = Object.fromEntries(["action", "scheme", "project", "destination", "configuration", "ref"].map((k) => [k, f[k].value.trim()]));
+  bMsg("Sending the commit to the build host…");
+  try {
+    const j = await api("POST", wsPath(w.name, "/builds"), body);
+    bMsg(`Queued ${j.id} (${j.commit.slice(0, 10)}).`);
+    await loadBuilds();
+    openBuild(j.id);
+  } catch (e) { bMsg(e.message, true); }
+});
+
+// ------------------------------------------------------------------ Apple builds (Settings: build host, workers)
+
+function bhMsg(text, isErr = false) { const e = $("#bh-msg"); e.textContent = text; e.classList.toggle("err", isErr); }
+
+async function loadBuildHost() {
+  let r;
+  try { r = await api("GET", "builds"); } catch (e) { return bhMsg(e.message, true); }
+  const f = $("#bh-form").elements;
+  if (document.activeElement?.form !== $("#bh-form")) { f.host.value = r.host; f.port.value = r.port; }
+  $("#bh-key").textContent = r.publicKey;
+  setPill($("#bh-state"), "build host", !r.host ? "not set up" : r.connected ? "connected" : "not connected",
+    !r.host ? "" : r.connected ? "ok" : "bad");
+  if (r.error) bhMsg(r.error, true);
+  let keys = [];
+  if (r.connected) { try { keys = (await api("GET", "builds/worker-keys")).workers; } catch { /* shown above */ } }
+  const names = [...new Set([...keys.map((k) => k.name), ...r.workers.map((x) => x.name)])];
+  const rows = names.map((n) => {
+    const hb = r.workers.find((x) => x.name === n) || {};
+    const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Remove" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Remove worker ${n}? Its key stops working on the build host.`)) return;
+      try { await api("DELETE", `builds/workers/${encodeURIComponent(n)}`); bhMsg(`Removed ${n}.`); } catch (e) { bhMsg(e.message, true); }
+      loadBuildHost();
+    });
+    const facts = [hb.online ? "online" : hb.seen ? `offline, last seen ${when(hb.seen)}` : "never connected",
+      hb.macos && `macOS ${hb.macos}`, hb.tart, hb.max_vms && `up to ${hb.max_vms} VM(s)`,
+      hb.running?.length && `running ${hb.running.length}`, hb.image].filter(Boolean).join(" · ");
+    return el("div", { className: "keyrow" },
+      el("div", {}, el("strong", { textContent: n }), el("div", { className: "muted", textContent: facts })), del);
+  });
+  if (!rows.length) rows.push(el("p", { className: "muted", textContent: r.connected ? "No workers yet: add one below." : "Connect to the build host to see its workers." }));
+  $("#bh-workers").replaceChildren(...rows);
+}
+$("#bh-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.currentTarget.elements;
+  try { await api("PUT", "builds/config", { host: f.host.value.trim(), port: Number(f.port.value || 22) }); bhMsg("Saved; connecting…"); }
+  catch (e) { return bhMsg(e.message, true); }
+  setTimeout(loadBuildHost, 2500);
+});
+$("#bh-test").addEventListener("click", async () => {
+  bhMsg("Testing…");
+  try { const r = await api("POST", "builds/test"); bhMsg(`Connected: aio-buildd ${r.version}.`); }
+  catch (e) { bhMsg(e.message, true); }
+  loadBuildHost();
+});
+$("#bh-add").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.currentTarget.elements;
+  try {
+    await api("POST", "builds/workers", { name: f.name.value.trim(), key: f.key.value.trim() });
+    bhMsg(`Added ${f.name.value.trim()}. Start the worker on the Mac.`);
+    f.name.value = ""; f.key.value = "";
+  } catch (e) { bhMsg(e.message, true); }
+  loadBuildHost();
+});
+$("#bh-copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("#bh-key").textContent); bhMsg("Copied."); }
+  catch { getSelection().selectAllChildren($("#bh-key")); bhMsg("Selected: copy it with Ctrl+C / ⌘C."); }
+});
+
 // ------------------------------------------------------------------ access (per-workspace policy)
 
 function el(tag, props = {}, ...kids) {
@@ -833,6 +1021,7 @@ async function loadAccess() {
     form.elements.browser_cpus.value = policy.limits.browser_cpus || "";
     form.elements.claude_md.checked = policy.claude_md;
     form.elements.vm_browser.checked = !!policy.vm_browser;
+    form.elements.builds.checked = !!policy.builds;
     form.elements.container.value = policy.network.container;
     $("#acc-restart").hidden = w.claude === "stopped";
     loadWsSshAccess(w);
@@ -857,6 +1046,7 @@ async function saveAccess(restart) {
       browser_memory: form.elements.browser_memory.value.trim(), browser_cpus: Number(form.elements.browser_cpus.value || 0) },
     claude_md: form.elements.claude_md.checked,
     vm_browser: form.elements.vm_browser.checked,
+    builds: form.elements.builds.checked,
   };
   out.textContent = "Saving…";
   try {
@@ -1315,6 +1505,7 @@ $("#auth-logout-others").addEventListener("click", async () => {
 
 async function loadSettings() {
   loadAuth();
+  loadBuildHost();
   try {
     const st = await api("GET", "settings/monitoring");
     loadClaudeMd();

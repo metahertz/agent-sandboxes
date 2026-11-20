@@ -46,9 +46,11 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")          # pool key / token ids
 DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 MAX_HEAD = 64 * 1024
-PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("proxyd.py")]
+PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("proxyd.py"),
+                  Path(__file__).resolve().with_name("builds.py")]
 
 DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False, "vm_browser": False,
+                  "builds": False,      # Apple builds: the aio-builds MCP server (ui/builds.py)
                   "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open", "listen": []},
                   "limits": {"memory": "", "pids": 0, "cpus": 0, "disk": "",
                              "browser_memory": "", "browser_cpus": 0}}
@@ -107,6 +109,7 @@ def load_policy(name: str) -> dict:
     pol["limits"].update(saved.get("limits", {}))
     pol["claude_md"] = saved.get("claude_md") is True
     pol["vm_browser"] = saved.get("vm_browser") is True
+    pol["builds"] = saved.get("builds") is True
     return pol
 
 

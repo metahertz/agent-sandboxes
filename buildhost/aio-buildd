@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""agent-sandboxes build host: plain git over ssh, for Apple builds on a Mac.
+
+Runs as its own user (aiogit, bin/install-buildhost) on any Linux host,
+the agent-sandboxes host itself by default. There is no daemon: sshd runs
+this for every connection, as the forced command of the key that connected
+(~/.ssh/authorized_keys), and git runs it as the repos' hooks. Git is the
+record: a job is an annotated tag, its claim and its result are refs; the
+rest (logs, heartbeats, cancel flags) are small files next to the repos.
+
+Keys and what each may do:
+
+  restrict,command="aio-buildd shell ui"            the agent-sandboxes UI
+      push to <workspace>.git: only new tags build/<id> (an annotated tag
+        whose message is the job, checked here) and release/<name>
+      status, watch, log, result, file, cancel, abandon, workers,
+      add-worker, remove-worker
+  restrict,command="aio-buildd shell worker <name>" a Mac build worker
+      fetch any repo; push only refs/results/<id> of a job it claimed
+      next (claim the oldest queued job), progress, heartbeat, artifact
+
+Every repo refuses deletions and non-fast-forward pushes, and fsck-checks
+what it receives. Layout under $AIO_BUILDD_BASE (default: this user's home):
+
+  repos/<ws>.git          refs/tags/build/<id>  the job (tag message: JSON)
+                          refs/claims/<id>      which worker took it
+                          refs/results/<id>     summary.json, build.log, screenshots/
+  logs/<ws>/<id>.log      the live log, as the worker sends it
+  artifacts/<ws>/<id>/    larger outputs (an .xcarchive, zipped)
+  state/claims/<ws>/<id>.json, state/cancel/<ws>/<id>, state/abandon/<ws>/<id>
+  state/workers/<name>.json  the last heartbeat
+  hooks/                  core.hooksPath of every repo
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BASE = Path(os.environ.get("AIO_BUILDD_BASE") or Path.home())
+REPOS, LOGS, ARTIFACTS, STATE, HOOKS = (BASE / d for d in ("repos", "logs", "artifacts", "state", "hooks"))
+EVENTS = STATE / "events"
+SELF = Path(__file__).resolve()
+AUTH_KEYS = Path(os.environ.get("AIO_BUILDD_AUTH_KEYS") or BASE / ".ssh" / "authorized_keys")
+
+WS_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
+ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+WORKER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
+RELEASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ARTIFACT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+PUBKEY_RE = re.compile(r"^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+=*( [^\n\"]{0,100})?$")
+
+MAX_LOG = 50 << 20             # a job's live log
+MAX_ARTIFACT = 4 << 30         # one artifact file
+MAX_PUSH = 512 << 20           # receive.maxInputSize
+STALE_AFTER = 180              # seconds without a heartbeat: the worker's jobs are "stale"
+KEEP_JOBS = 40                 # per repo, in status
+
+# ---------------------------------------------------------------- the job spec
+# The tag message. Strings are checked here (and again by the worker, which
+# builds the xcodebuild command from them) so none can carry shell syntax.
+ACTIONS = ("build", "test", "run", "archive")
+SPEC_RULES = {
+    "action": re.compile(r"^(build|test|run|archive)$"),
+    "scheme": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,99}$"),
+    "project": re.compile(r"^$|^(?![/-])(?!.*(^|/)\.\.(/|$))[A-Za-z0-9 _.+/-]{1,200}$"),
+    "destination": re.compile(r"^$|^[A-Za-z0-9 _.,=:()+/-]{1,200}$"),
+    "configuration": re.compile(r"^$|^[A-Za-z0-9_-]{1,40}$"),
+    "workspace": WS_RE,
+    "commit": re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$"),
+    "submitted": re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$"),
+    "by": re.compile(r"^(agent|ui)$"),
+}
+
+
+def check_spec(spec) -> str:
+    """'' if the job spec is acceptable, else why not."""
+    if not isinstance(spec, dict) or spec.get("v") != 1:
+        return "the tag message must be a JSON object with \"v\": 1"
+    extra = set(spec) - set(SPEC_RULES) - {"v", "timeout_min"}
+    if extra:
+        return f"unknown fields: {', '.join(sorted(extra))}"
+    for k, rx in SPEC_RULES.items():
+        v = spec.get(k, "")
+        if not isinstance(v, str) or not rx.match(v):
+            return f"bad or missing {k}"
+    t = spec.get("timeout_min", 60)
+    if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= 240:
+        return "timeout_min must be 1-240"
+    if spec["action"] in ("test", "run") and not spec.get("destination", "").startswith("platform="):
+        return f"{spec['action']} needs a destination such as platform=iOS Simulator,name=iPhone 16"
+    return ""
+
+
+# ---------------------------------------------------------------- helpers
+def die(msg: str, code: int = 1):
+    sys.stderr.write(f"aio-buildd: {msg}\n")
+    sys.exit(code)
+
+
+def git(repo: Path, *args: str, input: bytes | None = None, check: bool = True) -> bytes:
+    p = subprocess.run(["git", "--git-dir", str(repo), *args], input=input, capture_output=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(p.stderr.decode(errors="replace").strip() or f"git {args[0]} failed")
+    return p.stdout
+
+
+def bump():
+    STATE.mkdir(parents=True, exist_ok=True)
+    EVENTS.write_text(str(time.time_ns()))
+
+
+def is_zero(sha: str) -> bool:
+    return set(sha) == {"0"}
+
+
+def repo_path(ws: str) -> Path:
+    if not WS_RE.match(ws):
+        die(f"bad workspace name {ws!r}")
+    return REPOS / f"{ws}.git"
+
+
+def job_arg(ws: str, jid: str) -> tuple[Path, str]:
+    repo = repo_path(ws)
+    if not ID_RE.match(jid):
+        die(f"bad job id {jid!r}")
+    if not repo.is_dir():
+        die(f"no repo {ws}")
+    return repo, jid
+
+
+def write_hooks():
+    HOOKS.mkdir(parents=True, exist_ok=True)
+    for hook in ("pre-receive", "post-receive"):
+        p = HOOKS / hook
+        text = f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(SELF))} hook {hook}\n"
+        if not p.is_file() or p.read_text() != text:
+            p.write_text(text)
+            p.chmod(0o755)
+
+
+def init_repo(repo: Path):
+    subprocess.run(["git", "init", "--quiet", "--bare", str(repo)], check=True)
+    for k, v in (("receive.denyDeletes", "true"), ("receive.denyNonFastForwards", "true"),
+                 ("receive.fsckObjects", "true"), ("receive.maxInputSize", str(MAX_PUSH)),
+                 ("core.hooksPath", str(HOOKS)), ("gc.auto", "0"), ("uploadpack.allowAnySHA1InWant", "false")):
+        git(repo, "config", k, v)
+
+
+def setup():
+    for d in (REPOS, LOGS, ARTIFACTS, STATE / "claims", STATE / "cancel", STATE / "abandon", STATE / "workers"):
+        d.mkdir(parents=True, exist_ok=True)
+    write_hooks()
+    if not EVENTS.exists():
+        bump()
+
+
+def read_json(p: Path) -> dict:
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+# ---------------------------------------------------------------- state
+def jobs(ws: str, limit: int = KEEP_JOBS, only: str = "", summaries: bool = True) -> list[dict]:
+    """The repo's jobs, newest first, with their state (only: one job id;
+    summaries: read finished jobs' summary.json, which takes a git call each)."""
+    repo = REPOS / f"{ws}.git"
+    out = git(repo, "for-each-ref", "--sort=-refname", f"--count={limit}",
+              "--format=%(refname:strip=3)%00%(objectname)%00%(*objectname)%00%(contents)%00%00",
+              f"refs/tags/build/{only}" if only else "refs/tags/build/", check=False).decode(errors="replace")
+    results = {}
+    for line in git(repo, "for-each-ref", "--format=%(refname:strip=2) %(objectname)", "refs/results/",
+                    check=False).decode().split("\n"):
+        if line:
+            k, _, v = line.partition(" ")
+            results[k] = v
+    claims = set(x for x in git(repo, "for-each-ref", "--format=%(refname:strip=2)", "refs/claims/",
+                                check=False).decode().split("\n") if x)
+    workers = {p.stem: read_json(p) for p in (STATE / "workers").glob("*.json")}
+    now = time.time()
+    found = []
+    for rec in out.split("\0\0\n"):
+        f = rec.split("\0")
+        if len(f) < 4 or not ID_RE.match(f[0]):
+            continue
+        jid, commit = f[0], f[2]
+        try:
+            spec = json.loads(f[3])
+        except ValueError:
+            spec = {}
+        claim = read_json(STATE / "claims" / ws / f"{jid}.json")
+        logp = LOGS / ws / f"{jid}.log"
+        job = {"workspace": ws, "id": jid, "commit": commit, "spec": spec, "submitted": spec.get("submitted", ""),
+               "worker": claim.get("worker", ""), "claimed": claim.get("claimed", 0),
+               "log_size": logp.stat().st_size if logp.exists() else 0,
+               "artifacts": sorted(p.name for p in (ARTIFACTS / ws / jid).glob("*")) if (ARTIFACTS / ws / jid).is_dir() else []}
+        if jid in results:
+            summary = summary_of(repo, results[jid]) if summaries else {"status": "done"}
+            job.update(state=summary.get("status", "error"), summary=summary, result=results[jid])
+        elif (STATE / "abandon" / ws / jid).exists():
+            job["state"] = "abandoned"
+        elif jid in claims:
+            hb = workers.get(job["worker"], {}).get("seen", 0)
+            job["state"] = "running" if now - hb < STALE_AFTER else "stale"
+            job["cancel_requested"] = (STATE / "cancel" / ws / jid).exists()
+        elif (STATE / "cancel" / ws / jid).exists():
+            job["state"] = "cancelled"
+        else:
+            job["state"] = "queued"
+        found.append(job)
+    return found
+
+
+_summaries: dict[str, dict] = {}
+
+
+def summary_of(repo: Path, sha: str) -> dict:
+    if sha not in _summaries:
+        try:
+            s = json.loads(git(repo, "show", f"{sha}:summary.json"))
+        except (RuntimeError, ValueError):
+            s = {"status": "error", "error": "no readable summary.json"}
+        s.pop("log_tail", None)
+        try:
+            s["files"] = [x for x in git(repo, "ls-tree", "-r", "--name-only", sha).decode().split("\n") if x]
+        except RuntimeError:
+            s["files"] = []
+        _summaries[sha] = s
+    return _summaries[sha]
+
+
+def workers_state() -> list[dict]:
+    now = time.time()
+    out = []
+    for p in sorted((STATE / "workers").glob("*.json")):
+        w = read_json(p)
+        w["name"] = p.stem
+        w["online"] = now - w.get("seen", 0) < STALE_AFTER
+        out.append(w)
+    return out
+
+
+def status() -> dict:
+    repos = sorted(p.name[:-4] for p in REPOS.glob("*.git") if WS_RE.match(p.name[:-4]))
+    return {"time": time.time(), "workers": workers_state(), "repos": {ws: jobs(ws) for ws in repos},
+            "version": file_version()}
+
+
+def file_version() -> str:
+    import hashlib
+    return hashlib.sha256(SELF.read_bytes()).hexdigest()[:12]
+
+
+def fingerprint() -> tuple:
+    parts = [EVENTS.stat().st_mtime_ns if EVENTS.exists() else 0]
+    for p in sorted((STATE / "workers").glob("*.json")):
+        parts.append((p.name, int(p.stat().st_mtime)))
+    for p in sorted(LOGS.glob("*/*.log")):
+        try:
+            parts.append((str(p), p.stat().st_size))
+        except OSError:
+            pass
+    return tuple(parts)
+
+
+# ---------------------------------------------------------------- commands
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def cmd_watch():
+    """A status snapshot now and on every change (polling: there's no daemon),
+    and at least every 20 s, so the reader knows we're alive."""
+    last, sent = None, 0.0
+    while True:
+        fp = fingerprint()
+        if fp != last or time.time() - sent > 20:
+            emit({"type": "status", **status()})
+            last, sent = fp, time.time()
+        time.sleep(1)
+
+
+def cmd_log(ws: str, jid: str, offset: str = "0"):
+    _, jid = job_arg(ws, jid)
+    p = LOGS / ws / f"{jid}.log"
+    if not p.exists():
+        return
+    with p.open("rb") as f:
+        f.seek(max(0, int(offset) if offset.isdigit() else 0))
+        sys.stdout.buffer.write(f.read(4 << 20))
+
+
+def cmd_result(ws: str, jid: str):
+    repo, jid = job_arg(ws, jid)
+    for j in jobs(ws, 1, only=jid):
+        if j["id"] == jid:
+            if j.get("result"):
+                try:
+                    j["summary"] = {**json.loads(git(repo, "show", f"{j['result']}:summary.json")),
+                                    "files": j["summary"].get("files", [])}
+                except (RuntimeError, ValueError):
+                    pass
+            return emit(j)
+    die("no such job")
+
+
+def cmd_file(ws: str, jid: str, path: str):
+    repo, jid = job_arg(ws, jid)
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$", path) or ".." in path:
+        die("bad path")
+    sys.stdout.buffer.write(git(repo, "show", f"refs/results/{jid}:{path}"))
+
+
+def cmd_artifact_get(ws: str, jid: str, name: str):
+    job_arg(ws, jid)
+    if not ARTIFACT_RE.match(name):
+        die("bad artifact name")
+    p = ARTIFACTS / ws / jid / name
+    if not p.is_file():
+        die("no such artifact")
+    with p.open("rb") as f:
+        while chunk := f.read(1 << 20):
+            sys.stdout.buffer.write(chunk)
+
+
+def flag(kind: str, ws: str, jid: str):
+    job_arg(ws, jid)
+    d = STATE / kind / ws
+    d.mkdir(parents=True, exist_ok=True)
+    (d / jid).touch()
+    bump()
+    emit({"ok": True})
+
+
+def cmd_next(worker: str):
+    """Claim the oldest queued job, atomically (a create-only ref)."""
+    queued = []
+    for p in REPOS.glob("*.git"):
+        ws = p.name[:-4]
+        if WS_RE.match(ws):
+            queued += [j for j in jobs(ws, 200, summaries=False) if j["state"] == "queued"]
+    for j in sorted(queued, key=lambda j: (j["submitted"], j["id"])):
+        repo = REPOS / f"{j['workspace']}.git"
+        tag = git(repo, "rev-parse", f"refs/tags/build/{j['id']}").decode().strip()
+        zero = "0" * len(tag)
+        try:
+            git(repo, "update-ref", f"refs/claims/{j['id']}", tag, zero)
+        except RuntimeError:
+            continue                    # another worker got it first
+        d = STATE / "claims" / j["workspace"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{j['id']}.json").write_text(json.dumps({"worker": worker, "claimed": time.time()}))
+        bump()
+        return emit({"workspace": j["workspace"], "id": j["id"], "commit": j["commit"], "spec": j["spec"]})
+    emit({})
+
+
+def own_claim(worker: str, ws: str, jid: str):
+    job_arg(ws, jid)
+    if read_json(STATE / "claims" / ws / f"{jid}.json").get("worker") != worker:
+        die("not your job")
+
+
+def cmd_progress(worker: str, ws: str, jid: str):
+    own_claim(worker, ws, jid)
+    d = LOGS / ws
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{jid}.log"
+    with p.open("ab") as f:
+        while chunk := sys.stdin.buffer.read1(65536):
+            room = MAX_LOG - f.tell()
+            if room <= 0:
+                continue            # keep reading so the worker isn't blocked
+            f.write(chunk[:room])
+            f.flush()
+
+
+def cmd_heartbeat(worker: str):
+    try:
+        info = json.loads(sys.stdin.read(65536) or "{}")
+    except ValueError:
+        info = {}
+    keep = {k: info[k] for k in ("host", "tart", "xcode", "macos", "max_vms", "running", "image", "version")
+            if k in info}
+    keep["seen"] = time.time()
+    (STATE / "workers").mkdir(parents=True, exist_ok=True)
+    p = STATE / "workers" / f"{worker}.json"
+    old = read_json(p)
+    p.write_text(json.dumps(keep))
+    if old.get("running") != keep.get("running") or time.time() - old.get("seen", 0) > STALE_AFTER:
+        bump()
+    cancel = []
+    for item in keep.get("running") or []:
+        if isinstance(item, list) and len(item) == 2 and all(isinstance(x, str) for x in item) \
+                and WS_RE.match(item[0]) and ID_RE.match(item[1]) and (STATE / "cancel" / item[0] / item[1]).exists():
+            cancel.append(item)
+    emit({"cancel": cancel})
+
+
+def cmd_artifact(worker: str, ws: str, jid: str, name: str):
+    own_claim(worker, ws, jid)
+    if not ARTIFACT_RE.match(name):
+        die("bad artifact name")
+    d = ARTIFACTS / ws / jid
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".{name}.{secrets.token_hex(4)}"
+    size = 0
+    with tmp.open("wb") as f:
+        while chunk := sys.stdin.buffer.read(1 << 20):
+            size += len(chunk)
+            if size > MAX_ARTIFACT:
+                f.close()
+                tmp.unlink()
+                die("artifact too large")
+            f.write(chunk)
+    tmp.rename(d / name)
+    bump()
+    emit({"ok": True, "size": size})
+
+
+def key_lines() -> list[str]:
+    try:
+        return AUTH_KEYS.read_text().splitlines()
+    except OSError:
+        return []
+
+
+def worker_line(name: str, pubkey: str) -> str:
+    return f'restrict,command="{SELF} shell worker {name}" {pubkey.strip()}'
+
+
+def cmd_add_worker(name: str):
+    if not WORKER_RE.match(name):
+        die("worker names: lowercase letters, digits and -")
+    key = " ".join(sys.stdin.read(16384).split()[:2])
+    if not PUBKEY_RE.match(key):
+        die("that isn't an ssh public key (ssh-ed25519 AAAA…)")
+    marker = f" shell worker {name}\" "
+    lines = [x for x in key_lines() if marker not in x]
+    if any(key in x for x in lines):
+        die("that key is already in use here")
+    lines.append(worker_line(name, key + f" aio-worker-{name}"))
+    write_keys(lines)
+    emit({"ok": True})
+
+
+def cmd_remove_worker(name: str):
+    if not WORKER_RE.match(name):
+        die("bad worker name")
+    marker = f" shell worker {name}\" "
+    write_keys([x for x in key_lines() if marker not in x])
+    (STATE / "workers" / f"{name}.json").unlink(missing_ok=True)
+    bump()
+    emit({"ok": True})
+
+
+def cmd_worker_keys():
+    out = []
+    for x in key_lines():
+        m = re.search(r' shell worker ([a-z0-9-]+)" (\S+ \S+)', x)
+        if m:
+            out.append({"name": m[1], "key": m[2]})
+    emit({"workers": out})
+
+
+def write_keys(lines: list[str]):
+    AUTH_KEYS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = AUTH_KEYS.with_name(".authorized_keys.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.chmod(0o600)
+    tmp.rename(AUTH_KEYS)
+    bump()
+
+
+# ---------------------------------------------------------------- git transport
+def git_transport(role: str, verb: str, path: str):
+    name = path.strip("'\"").lstrip("/").removeprefix("~/").removesuffix("/")
+    name = name.removeprefix("repos/").removesuffix(".git")
+    repo = repo_path(name)
+    if not repo.is_dir():
+        if verb == "git-receive-pack" and role == "ui":
+            init_repo(repo)
+        else:
+            die(f"no repo {name}")
+    os.execvp("git", ["git", verb.removeprefix("git-"), str(repo)])
+
+
+UI_CMDS = {"status": (0, lambda: emit(status())), "watch": (0, cmd_watch), "log": ((2, 3), cmd_log),
+           "result": (2, cmd_result), "file": (3, cmd_file), "artifact-get": (3, cmd_artifact_get),
+           "cancel": (2, lambda ws, j: flag("cancel", ws, j)), "abandon": (2, lambda ws, j: flag("abandon", ws, j)),
+           "workers": (0, lambda: emit({"workers": workers_state()})), "worker-keys": (0, cmd_worker_keys),
+           "add-worker": (1, cmd_add_worker), "remove-worker": (1, cmd_remove_worker),
+           "version": (0, lambda: emit({"version": file_version()}))}
+WORKER_CMDS = {"next": (0, cmd_next), "progress": (2, cmd_progress), "heartbeat": (0, cmd_heartbeat),
+               "artifact": (3, cmd_artifact)}
+
+
+def shell(role: str, worker: str = ""):
+    setup()
+    try:
+        argv = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+    except ValueError:
+        die("can't parse the command")
+    if not argv:
+        die("no interactive shell here; this key runs agent-sandboxes build commands only")
+    verb, args = argv[0], argv[1:]
+    os.environ["AIO_ROLE"], os.environ["AIO_WORKER"] = role, worker
+    if verb in ("git-upload-pack", "git-receive-pack") and len(args) == 1:
+        return git_transport(role, verb, args[0])
+    table = UI_CMDS if role == "ui" else WORKER_CMDS
+    if verb not in table:
+        die(f"'{verb}' isn't allowed for this key ({role})")
+    n, fn = table[verb]
+    if len(args) not in (n if isinstance(n, tuple) else (n,)):
+        die(f"{verb}: wrong number of arguments")
+    if role == "worker":
+        return fn(worker, *args)
+    return fn(*args)
+
+
+# ---------------------------------------------------------------- hooks
+def pre_receive():
+    role, worker = os.environ.get("AIO_ROLE", ""), os.environ.get("AIO_WORKER", "")
+    repo = Path(os.environ.get("GIT_DIR", ".")).resolve()
+    ws = repo.name.removesuffix(".git")
+    problems = []
+    for line in sys.stdin.read().splitlines():
+        old, new, ref = line.split(" ", 2)
+        why = check_update(role, worker, repo, ws, old, new, ref)
+        if why:
+            problems.append(f"{ref}: {why}")
+    if problems:
+        for p in problems:
+            sys.stderr.write(f"agent-sandboxes refused {p}\n")
+        sys.exit(1)
+
+
+def check_update(role: str, worker: str, repo: Path, ws: str, old: str, new: str, ref: str) -> str:
+    if is_zero(new):
+        return "deleting refs isn't allowed"
+    if not is_zero(old):
+        return "refs here are write-once"
+    kind = git(repo, "cat-file", "-t", new).decode().strip()
+    if role == "ui":
+        if m := re.fullmatch(r"refs/tags/build/(.+)", ref):
+            if not ID_RE.match(m[1]):
+                return "build tags are build/<YYYYmmddTHHMMSSZ>-<6 hex>"
+            if kind != "tag":
+                return "a build tag must be an annotated tag (its message is the job)"
+            body = git(repo, "cat-file", "tag", new).decode(errors="replace")
+            head, _, msg = body.partition("\n\n")
+            fields = dict(x.split(" ", 1) for x in head.split("\n") if " " in x)
+            if fields.get("type") != "commit" or fields.get("tag") != f"build/{m[1]}":
+                return "the tag must point at a commit and be named as its ref"
+            try:
+                spec = json.loads(msg.split("\n-----BEGIN")[0])
+            except ValueError:
+                return "the tag message isn't JSON"
+            if why := check_spec(spec):
+                return why
+            if spec["workspace"] != ws or spec["commit"] != fields.get("object"):
+                return "the job's workspace or commit doesn't match"
+            return ""
+        if m := re.fullmatch(r"refs/tags/release/(.+)", ref):
+            return "" if RELEASE_RE.match(m[1]) else "bad release tag name"
+        return "this key may only create build/* and release/* tags"
+    if role == "worker":
+        m = re.fullmatch(r"refs/results/(.+)", ref)
+        if not m or not ID_RE.match(m[1]):
+            return "a worker may only push refs/results/<job id>"
+        if read_json(STATE / "claims" / ws / f"{m[1]}.json").get("worker") != worker:
+            return "that job isn't claimed by this worker"
+        if kind != "commit":
+            return "a result must be a commit"
+        try:
+            summary = json.loads(git(repo, "show", f"{new}:summary.json"))
+        except (RuntimeError, ValueError):
+            return "a result needs a summary.json"
+        if summary.get("status") not in ("passed", "failed", "error", "cancelled", "timeout"):
+            return "summary.json: status must be passed, failed, error, cancelled or timeout"
+        return ""
+    return "unknown key role"
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["shell"] and len(a) == 2 and a[1] == "ui":
+        return shell("ui")
+    if a[:1] == ["shell"] and len(a) == 3 and a[1] == "worker" and WORKER_RE.match(a[2]):
+        return shell("worker", a[2])
+    if a == ["hook", "pre-receive"]:
+        return pre_receive()
+    if a == ["hook", "post-receive"]:
+        sys.stdin.read()
+        return bump()
+    if a == ["init"]:
+        setup()
+        return print(f"aio-buildd: ready in {BASE}")
+    if a[:1] == ["ui-key"] and len(a) == 2:      # install: the UI's key, replacing the old one
+        key = " ".join(a[1].split()[:2])
+        if not PUBKEY_RE.match(key):
+            die("that isn't an ssh public key")
+        lines = [x for x in key_lines() if " shell ui\" " not in x]
+        write_keys([f'restrict,command="{SELF} shell ui" {key} aio-ui'] + lines)
+        return print("aio-buildd: UI key installed")
+    die("usage: aio-buildd init | ui-key '<pubkey>' | shell ui | shell worker <name> | hook pre-receive|post-receive")
+
+
+if __name__ == "__main__":
+    main()

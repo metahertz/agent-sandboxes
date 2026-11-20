@@ -58,6 +58,7 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
                     load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version, read_env,
                     token_meta, vm_browser, vm_cid)
 import auth  # noqa: E402
+import builds  # noqa: E402
 
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
 CLAUDE_IN = ROOT / "bin" / "claude-in"
@@ -459,6 +460,8 @@ async def api(req: Request, w):
 
     if parts and parts[0] == "pool":
         return await pool_api(req, parts[1:], w)
+    if parts and parts[0] == "builds":
+        return await builds_api(req, parts[1:], w)
 
     if len(parts) < 2 or parts[0] != "workspaces":
         return await respond(w, 404, "Not found\n")
@@ -467,6 +470,8 @@ async def api(req: Request, w):
         return await send_json(w, {"error": "No such workspace"}, 404)
     name, action = ws["WS_NAME"], parts[2:]
 
+    if action[:1] == ["builds"]:
+        return await builds_ws_api(ws, req, action[1:], w)
     if is_microvm(ws) and (resp := await vm_api(ws, action, m, w)) is not None:
         return resp
 
@@ -478,6 +483,7 @@ async def api(req: Request, w):
         (WS_ROOT / f"{name}.env").unlink()
         kill_agent(name)
         remove_access(lambda scope, _: scope == name)
+        builds.remove_workspace(name)
         for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_override_path(name),
                   container_limits_path(name),
                   container_env_path(name), container_profile_path(name), *container_ca_files(name),
@@ -539,6 +545,7 @@ async def vm_api(ws: dict[str, str], action: list[str], m: str, w):
         (WS_ROOT / f"{name}.env").unlink()
         kill_agent(name)
         remove_access(lambda scope, _: scope == name)
+        builds.remove_workspace(name)
         for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_profile_path(name),
                   *(CONTAINER_PROXY_SECRETS / f"{name}{x}" for x in ("", ".ca.crt", ".ca.key"))):
             p.unlink(missing_ok=True)
@@ -598,7 +605,7 @@ async def status_all() -> list[dict]:
                     "container": state, "containerDetail": detail,
                     "claude": claude.get(n, "stopped"),
                     "sshKeys": len(pol["ssh_keys"]), "tokens": len(pol["tokens"]),
-                    "network": pol["network"]["mode"],
+                    "network": pol["network"]["mode"], "builds": pol["builds"],
                     "policyPending": not vm and claude.get(n) == "running" and policy_pending(ws)})
     return out
 
@@ -634,6 +641,29 @@ def check_new_ws(name: str, raw_dir: str | None, kind: str = "sandbox") -> str:
             raise WsError(f"Overlaps workspace '{o['WS_NAME']}' ({o['WS_DIR']}); "
                           "nono would expose one to the other")
     return d
+
+
+BUILDS_MCP_ENTRY = {"type": "http", "url": "${AIO_BUILD_BASE_URL}/mcp", "headers": {"X-AIO-Build": "${AIO_BUILD_KEY}"}}
+
+
+def sync_builds_mcp(d: str, on: bool):
+    """The aio-builds server in the project's .mcp.json, while Apple builds are on."""
+    mcp = Path(d) / ".mcp.json"
+    if mcp.is_symlink():
+        return
+    try:
+        cfg = json.loads(mcp.read_text()) if mcp.exists() else {}
+    except (OSError, ValueError):
+        return                          # not ours to fix; ensure_mcp_json says so
+    servers = cfg.setdefault("mcpServers", {})
+    if on and servers.get(builds.MCP_NAME) != BUILDS_MCP_ENTRY:
+        servers[builds.MCP_NAME] = BUILDS_MCP_ENTRY
+    elif not on and servers.get(builds.MCP_NAME) == BUILDS_MCP_ENTRY:
+        del servers[builds.MCP_NAME]
+    else:
+        return
+    mcp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.chown(mcp, -1, USER_GID)
 
 
 def ensure_mcp_json(d: str) -> list[str]:
@@ -946,6 +976,7 @@ def validate_policy(body: dict) -> dict:
                      "browser_memory": bmem, "browser_cpus": bcpus}
     pol["claude_md"] = body.get("claude_md") is True
     pol["vm_browser"] = body.get("vm_browser") is True
+    pol["builds"] = body.get("builds") is True
     return pol
 
 
@@ -1189,6 +1220,12 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
             "upstream": bridge_upstream(tid, meta["upstream"]), "credential_key": f"file://{TOKEN_POOL / tid}",
             "inject_header": meta["inject_header"], "credential_format": meta["credential_format"],
             "env_var": meta["env_var"]}
+    if pol["builds"]:
+        # The aio-builds MCP server: the bridge (/~build) knows the workspace by this key
+        creds[builds.ROUTE] = {"upstream": f"http://{HTTP_BRIDGE[0]}:{HTTP_BRIDGE[1]}/~build",
+                               "credential_key": f"file://{builds.ensure_mcp_key(name)}",
+                               "inject_header": "X-AIO-Build", "credential_format": "{}",
+                               "env_var": "AIO_BUILD_KEY"}
     if creds:
         net["credentials"] = sorted(creds)
         net["custom_credentials"] = creds
@@ -1248,6 +1285,8 @@ async def prepare(name: str, aux: bool = False) -> dict:
     write_ssh_config(name)
     target = aux_profile_path(name) if aux else profile_path(name)
     private_write(target, profile_text(ws))
+    if not aux:
+        sync_builds_mcp(ws["WS_DIR"], load_policy(name)["builds"])
     prompt = ""
     if not aux:
         try:
@@ -1294,6 +1333,15 @@ def token_lines(pol: dict) -> str:
     return "\n".join(out) or "- No API tokens are assigned to this workspace."
 
 
+def builds_lines(pol: dict) -> str:
+    if not pol["builds"]:
+        return ""
+    return ("\n- Apple builds: the aio-builds MCP server (apple_build, build_status, build_log, build_result, "
+            "cancel_build) builds, tests or runs this repo's Xcode project on a Mac build worker, in a fresh "
+            "macOS VM per job. It builds a commit (HEAD by default): commit first, uncommitted changes aren't "
+            "sent. You can't reach the Mac or its git host any other way.")
+
+
 def network_summary(pol: dict) -> str:
     net = pol["network"]
     if net["mode"] == "open":
@@ -1323,7 +1371,7 @@ def container_network_lines(pol: dict) -> str:
 
 def render_claude_md(ws: dict[str, str], pol: dict) -> str:
     values = {"workspace": ws["WS_NAME"], "project_dir": ws["WS_DIR"], "container_dir": CONTAINER_WORKSPACE,
-              "network": network_summary(pol), "tokens": token_lines(pol),
+              "network": network_summary(pol), "tokens": token_lines(pol) + builds_lines(pol),
               "container_network": container_network_lines(pol)}
     return re.sub(r"\{\{(\w+)\}\}", lambda m: values.get(m[1], m[0]), claude_md_template()[0])
 
@@ -1337,16 +1385,17 @@ def session_prompt(ws: dict[str, str], pol: dict) -> str:
               "and git over ssh), which allows only the workspace's allowlist and logs each connection. "
               "Programs that ignore the proxy variables can't connect.")
         if not pol["tokens"]:
-            return vm
+            return vm + builds_lines(pol)
         return vm + (" API token variables hold placeholders; the proxy swaps in the real token only on "
                      "requests that carry the placeholder. Never ask the user for a real token.\n"
-                     + token_lines(pol))
+                     + token_lines(pol) + builds_lines(pol))
     if not pol["tokens"]:
-        return ""
+        return (f"This session runs in the agent-sandboxes workspace {ws['WS_NAME']}, inside a nono sandbox."
+                + builds_lines(pol)) if pol["builds"] else ""
     return (f"This session runs in the agent-sandboxes workspace {ws['WS_NAME']}, inside a nono sandbox. "
             "API token variables hold placeholders; nono's proxy swaps in the real token only on requests "
             "that carry the placeholder, and for plain-HTTP APIs only via the base URL variable. "
-            "Never ask the user for a real token.\n" + token_lines(pol))
+            "Never ask the user for a real token.\n" + token_lines(pol) + builds_lines(pol))
 
 
 def sync_claude_md(ws: dict[str, str]):
@@ -1925,6 +1974,87 @@ async def monitoring_status() -> dict:
     return {"configured": MONITORING_ENV.is_file(), "services": services, "exporterAge": age,
             "settings": monitoring_settings(), "telemetry": telemetry_enabled(),
             "caFingerprint": CA_FINGERPRINT}
+
+
+# --------------------------------------------------------------- Apple builds
+# The build host (buildhost/aio-buildd, over ssh) and its Mac workers; the
+# per-workspace builds, also the agent's through the aio-builds MCP server
+# (ui/builds.py)
+
+async def builds_api(req: Request, parts: list[str], w):
+    m = req.method
+    try:
+        if parts == [] and m == "GET":
+            return await send_json(w, {**builds.overview(), "publicKey": await builds.ensure_key(),
+                                       "workspaces": [x["WS_NAME"] for x in all_ws()
+                                                      if load_policy(x["WS_NAME"])["builds"]]})
+        if parts == ["config"] and m == "PUT":
+            body = json.loads(req.body or b"{}")
+            builds.save_config(str(body.get("host", "")), int(body.get("port", 22) or 22))
+            builds.monitor.start()
+            return await send_json(w, {"ok": True})
+        if parts == ["test"] and m == "POST":
+            await builds.ensure_key()
+            got = await builds.call_json("version")
+            return await send_json(w, {"ok": True, **got})
+        if parts == ["worker-keys"] and m == "GET":
+            return await send_json(w, await builds.call_json("worker-keys"))
+        if parts == ["workers"] and m == "POST":
+            body = json.loads(req.body or b"{}")
+            await builds.add_worker(str(body.get("name", "")).strip(), str(body.get("key", "")))
+            return await send_json(w, {"ok": True})
+        if len(parts) == 2 and parts[0] == "workers" and m == "DELETE":
+            await builds.remove_worker(parts[1])
+            return await send_json(w, {"ok": True})
+    except (builds.BuildError, ValueError, TypeError) as e:
+        return await send_json(w, {"error": str(e)}, 400)
+    return await respond(w, 404, "Not found\n")
+
+
+async def builds_ws_api(ws: dict[str, str], req: Request, parts: list[str], w):
+    name, m = ws["WS_NAME"], req.method
+    try:
+        if parts == [] and m == "GET":
+            return await send_json(w, {"enabled": load_policy(name)["builds"], "jobs": builds.monitor.jobs(name),
+                                       **builds.overview()})
+        if parts == [] and m == "POST":
+            if not load_policy(name)["builds"]:
+                raise builds.BuildError("Turn on Apple builds for this workspace first (Access tab)")
+            job = await builds.submit(name, ws["WS_DIR"], json.loads(req.body or b"{}"), "ui")
+            return await send_json(w, job)
+        if len(parts) == 1 and m == "GET":
+            return await send_json(w, await builds.job(name, parts[0]))
+        if len(parts) == 2 and parts[1] == "log" and m == "GET":
+            data = await builds.job_log(name, parts[0], int(req.query.get("offset", "0") or 0))
+            return await respond(w, 200, data, "text/plain; charset=utf-8")
+        if len(parts) == 2 and parts[1] == "file" and m == "GET":
+            path = req.query.get("path", "")
+            data = await builds.job_file(name, parts[0], path)
+            ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            return await respond(w, 200, data, ctype if ctype in ("image/png", "application/json") else "text/plain")
+        if len(parts) == 2 and parts[1] in ("cancel", "abandon") and m == "POST":
+            await builds.cancel(name, parts[0], abandon=parts[1] == "abandon")
+            return await send_json(w, {"ok": True})
+        if len(parts) == 2 and parts[1] == "artifact" and m == "GET":
+            art = req.query.get("name", "")
+            proc = await builds.artifact_stream(name, parts[0], art)
+            first = await proc.stdout.read(65536)
+            if not first:
+                err = (await proc.stderr.read()).decode(errors="replace").strip()
+                await proc.wait()
+                raise builds.BuildError(err.removeprefix("aio-buildd: ") or "empty artifact")
+            w.write(("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                     f'Content-Disposition: attachment; filename="{name}-{parts[0]}-{art}"\r\n'
+                     "Connection: close\r\n\r\n").encode())
+            w.write(first)
+            while chunk := await proc.stdout.read(1 << 20):
+                w.write(chunk)
+                await w.drain()
+            await proc.wait()
+            return
+    except (builds.BuildError, ValueError) as e:
+        return await send_json(w, {"error": str(e)}, 400)
+    return await respond(w, 404, "Not found\n")
 
 
 async def settings_api(req: Request, parts: list[str], w):
@@ -3208,6 +3338,8 @@ def vm_proxy_env_text(ws: dict[str, str], pol: dict) -> str:
         if meta := token_meta(tid):
             env[meta["env_var"]] = pw
             env[base_url_var(tid)] = f"http://{relay}/pool_{tid.replace('-', '_')}"
+    if pol["builds"]:
+        env.update({"AIO_BUILD_KEY": pw, "AIO_BUILD_BASE_URL": f"http://{relay}/{builds.ROUTE}"})
     return "".join(f"{k}={v}\n" for k, v in env.items())
 
 
@@ -3337,6 +3469,7 @@ def vm_prepare(name: str) -> None:
     write_if_changed(cfg / "hostname", name + "\n")
     write_if_changed(cfg / "authorized_keys", (d / "id_ed25519.pub").read_text())
     write_if_changed(cfg / "proxy.env", vm_proxy_env_text(ws, pol))
+    sync_builds_mcp(ws["WS_DIR"], pol["builds"])
     write_if_changed(cfg / "ca.crt", pem)
     browser = cfg / "browser-compose.yaml", cfg / "browser.env", cfg / "chromium-ca-policy.json"
     if pol["vm_browser"]:
@@ -3490,11 +3623,17 @@ async def main():
     for ws in all_ws():
         write_container_files(ws)        # the container proxies' profiles, for the proxy service
         await open_sandbox_listener(ws)
+    try:
+        mcp_server = await builds.serve_mcp(load_ws, lambda n: load_policy(n)["builds"])
+    except OSError as e:          # the UI runs on without the agents' build tools
+        print(f"Apple builds: no MCP socket at {builds.MCP_SOCK}: {e}", flush=True)
+        mcp_server = None
+    builds.monitor.start()
     drop_ambient_caps()
     for addr in BIND:
         print(f"Agent Sandboxes UI on {SCHEME}://{addr}:{LISTEN_PORT}/", flush=True)
     await asyncio.gather(renew_daily(), backup_scheduler(), proxyd_startup(),
-                         *(s.serve_forever() for s in servers))
+                         *(s.serve_forever() for s in servers + ([mcp_server] if mcp_server else [])))
 
 
 def cli_prepare(name: str, aux: bool = False):
