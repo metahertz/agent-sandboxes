@@ -75,6 +75,13 @@ if [[ -d ~/.config/nono/hooks ]] && ! cmp -s nono/aio-env.sh ~/.config/nono/hook
   install -m 700 nono/aio-env.sh ~/.config/nono/hooks/
 fi
 
+# The Apple builds' git host, when it's on this machine (bin/install-buildhost)
+if [[ -f /usr/local/lib/agent-sandboxes/aio-buildd ]] && \
+    ! cmp -s buildhost/aio-buildd /usr/local/lib/agent-sandboxes/aio-buildd; then
+  say "Updating the build host's aio-buildd"
+  bin/install-buildhost >/dev/null
+fi
+
 # The tmux servers keep their old config until it's sourced again
 if changed ui/tmux.conf && tmux -L agent-sandboxes has-session 2>/dev/null; then
   say "Reloading the Claude sessions' tmux config"
@@ -107,7 +114,7 @@ if changed microvm/ bin/microvm-image libexec/ssh-proxy-connect; then
   note "The microVM guest changed: bin/microvm-image rebuilds the base image (new VMs only)."
 fi
 
-if changed ui/proxyd.py ui/common.py ui/gbroker.py systemd/agent-sandboxes-proxy.service; then
+if changed ui/proxyd.py ui/common.py ui/gbroker.py ui/builds.py systemd/agent-sandboxes-proxy.service; then
   say "Restarting the proxy service (open sandbox connections drop; requests in flight retry)"
   sudo systemctl restart agent-sandboxes-proxy
 fi

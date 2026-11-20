@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""agent-sandboxes Mac build worker: takes jobs from the build host (aio-buildd)
+and runs each in a throwaway Tart VM.
+
+It only ever connects out, over ssh, with a key that may do nothing but fetch
+the job, claim it, send its log and heartbeats, and push its result
+(refs/results/<id>). Per job:
+
+  1. fetch the job's commit (tag build/<id>) into a fresh checkout here
+  2. tart clone <image> aio-<ws>-<id>; tart run it with the checkout shared
+     read-only and an output folder shared read-write
+  3. tart exec: copy the source in, run the fixed xcodebuild steps for the
+     job's action (build, test, run = build + launch in the Simulator +
+     screenshot, archive = unsigned .xcarchive), copy the outputs out
+  4. push summary.json, build.log, test-summary.json and screenshots/ as
+     refs/results/<id>; upload a zipped archive as an artifact
+  5. stop and delete the VM, remove the checkout
+
+The job's code runs only inside the VM; nothing from this Mac goes in but the
+checkout. Python 3.9+ (the one with Xcode's command line tools will do).
+
+  aio-build-worker [--config ~/.aio-build/config.json] [--once]
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+VERSION = "1"
+CONFIG = Path(os.environ.get("AIO_BUILD_CONFIG", "~/.aio-build/config.json")).expanduser()
+DEFAULTS = {
+    "name": "", "host": "", "port": 22,
+    "key": "~/.aio-build/worker_ed25519", "known_hosts": "~/.aio-build/known_hosts",
+    "image": "ghcr.io/cirruslabs/macos-sequoia-xcode:latest",
+    "max_vms": 1,                       # Apple's licence: at most 2 macOS VMs per Mac
+    "tart": "tart",
+    "run_args": ["--no-graphics"],      # e.g. "--net-softnet" to keep the VM off your LAN
+    "vm_env": {},                       # e.g. {"HTTPS_PROXY": "http://proxy.lan:3128"}
+    "poll_seconds": 10, "boot_timeout": 300,
+    "work": "~/.aio-build/work",
+    "share_root": "/Volumes/My Shared Files",   # where macOS guests see tart run --dir shares
+    "ssh_args": [],                     # more ssh options, e.g. ["-F", "/dev/null"] to ignore ~/.ssh/config
+}
+MAX_RESULT_LOG = 5 << 20
+
+# Same rules as aio-buildd's check (it refused anything else at push time;
+# checked again because the commands below are built from these strings)
+SPEC_RULES = {
+    "action": re.compile(r"^(build|test|run|archive)$"),
+    "scheme": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,99}$"),
+    "project": re.compile(r"^$|^(?![/-])(?!.*(^|/)\.\.(/|$))[A-Za-z0-9 _.+/-]{1,200}$"),
+    "destination": re.compile(r"^$|^[A-Za-z0-9 _.,=:()+/-]{1,200}$"),
+    "configuration": re.compile(r"^$|^[A-Za-z0-9_-]{1,40}$"),
+    "workspace": re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$"),
+    "commit": re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$"),
+}
+ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+
+
+def log(msg: str):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+class Worker:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.name = cfg["name"]
+        self.user_host = cfg["host"]
+        self.ssh_base = ["ssh", "-i", str(Path(cfg["key"]).expanduser()), "-o", "IdentitiesOnly=yes",
+                         "-o", f"UserKnownHostsFile={Path(cfg['known_hosts']).expanduser()}",
+                         "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+                         "-o", "ServerAliveInterval=30", "-p", str(cfg["port"]), *cfg["ssh_args"]]
+        self.git_env = {**os.environ, "GIT_SSH_COMMAND": " ".join(shlex.quote(x) for x in self.ssh_base),
+                        "GIT_TERMINAL_PROMPT": "0"}
+        self.running: dict[tuple[str, str], threading.Event] = {}
+        self.lock = threading.Lock()
+        self.work = Path(cfg["work"]).expanduser()
+        self.facts = {"host": socket.gethostname(), "version": VERSION, "image": cfg["image"],
+                      "max_vms": cfg["max_vms"], "tart": self.out([cfg["tart"], "--version"]),
+                      "macos": self.out(["sw_vers", "-productVersion"])}
+
+    # ------------------------------------------------------------ plumbing
+    @staticmethod
+    def out(cmd: list[str]) -> str:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()[:100]
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def ssh(self, *cmd: str, input: bytes | None = None, timeout: int = 60) -> bytes:
+        p = subprocess.run(self.ssh_base + [self.user_host, " ".join(shlex.quote(c) for c in cmd)],
+                           input=input, capture_output=True, timeout=timeout)
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.decode(errors="replace").strip() or f"ssh {cmd[0]} failed")
+        return p.stdout
+
+    def repo_url(self, ws: str) -> str:
+        user, _, host = self.user_host.rpartition("@")
+        host = f"[{host}]" if ":" in host else host
+        return f"ssh://{user + '@' if user else ''}{host}:{self.cfg['port']}/{ws}.git"
+
+    def tart(self, *args: str, timeout: int = 600, check: bool = True) -> subprocess.CompletedProcess:
+        p = subprocess.run([self.cfg["tart"], *args], capture_output=True, text=True, timeout=timeout)
+        if check and p.returncode != 0:
+            raise RuntimeError(f"tart {args[0]}: {(p.stderr or p.stdout).strip()[:500]}")
+        return p
+
+    # ------------------------------------------------------------ loop
+    def heartbeat_loop(self):
+        while True:
+            try:
+                with self.lock:
+                    running = [list(k) for k in self.running]
+                reply = json.loads(self.ssh("heartbeat", input=json.dumps({**self.facts, "running": running}).encode())
+                                   or b"{}")
+                for ws, jid in reply.get("cancel", []):
+                    ev = self.running.get((ws, jid))
+                    if ev and not ev.is_set():
+                        log(f"{ws}/{jid}: cancel requested")
+                        ev.set()
+            except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as e:
+                log(f"heartbeat failed: {e}")
+            time.sleep(20)
+
+    def clean_leftovers(self):
+        """VMs from a run that crashed (named aio-…), not ours now."""
+        try:
+            vms = json.loads(self.tart("list", "--format", "json").stdout or "[]")
+        except (RuntimeError, ValueError, OSError):
+            return
+        for vm in vms:
+            name = vm.get("Name") or vm.get("name") or ""
+            if name.startswith("aio-") and (vm.get("Source") or vm.get("source", "local")) == "local":
+                log(f"removing leftover VM {name}")
+                self.tart("stop", name, check=False, timeout=120)
+                self.tart("delete", name, check=False, timeout=120)
+
+    def run_forever(self, once: bool = False):
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.clean_leftovers()
+        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+        log(f"worker {self.name}: {self.user_host}, image {self.cfg['image']}, up to {self.cfg['max_vms']} VM(s)")
+        while True:
+            with self.lock:
+                free = len(self.running) < int(self.cfg["max_vms"])
+            job = None
+            if free:
+                try:
+                    job = json.loads(self.ssh("next") or b"{}")
+                except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as e:
+                    log(f"next failed: {e}")
+            if job:
+                ev = threading.Event()
+                with self.lock:
+                    self.running[(job["workspace"], job["id"])] = ev
+                t = threading.Thread(target=self.run_job, args=(job, ev), daemon=True)
+                t.start()
+                if once:
+                    t.join()
+                    return
+                continue
+            if once and not self.running:
+                log("no job queued")
+                return
+            time.sleep(float(self.cfg["poll_seconds"]))
+
+    # ------------------------------------------------------------ one job
+    def run_job(self, job: dict, cancel: threading.Event):
+        ws, jid, spec = job["workspace"], job["id"], job.get("spec") or {}
+        key = (ws, jid)
+        started = time.time()
+        summary = {"status": "error", "worker": self.name, "started": started, "action": spec.get("action"),
+                   "scheme": spec.get("scheme"), "commit": job.get("commit"), "image": self.cfg["image"]}
+        tail = collections.deque(maxlen=4000)
+        workdir = Path(tempfile.mkdtemp(prefix=f"{ws}-{jid}-", dir=self.work))
+        vm = f"aio-{ws}-{jid}".lower()
+        progress = None
+        vm_proc = None
+        full_log = workdir / "build.log"
+        logf = full_log.open("ab")
+
+        def say(line: str):
+            data = (line.rstrip("\n") + "\n").encode(errors="replace")
+            logf.write(data)
+            tail.append(line.rstrip("\n"))
+            if progress and progress.poll() is None:
+                try:
+                    progress.stdin.write(data)
+                    progress.stdin.flush()
+                except OSError:
+                    pass
+
+        try:
+            progress = subprocess.Popen(self.ssh_base + [self.user_host, f"progress {ws} {jid}"],
+                                        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            bad = check(job, spec)
+            if bad:
+                raise JobError(f"refusing the job: {bad}")
+            say(f"== agent-sandboxes build {ws}/{jid} on {self.name} ({self.facts['host']})")
+            say(f"== {spec['action']} {spec['scheme']} at {job['commit'][:12]}, image {self.cfg['image']}")
+            src, out = workdir / "src", workdir / "out"
+            out.mkdir()
+            self.fetch(ws, jid, job["commit"], src)
+            say("== starting the VM")
+            self.tart("clone", self.cfg["image"], vm, timeout=1800)
+            vm_proc = subprocess.Popen([self.cfg["tart"], "run", vm, f"--dir=src:{src}:ro", f"--dir=out:{out}",
+                                        *self.cfg["run_args"]],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.wait_boot(vm, vm_proc, cancel)
+            say("== VM up; running the job")
+            limit = started + 60 * int(spec.get("timeout_min", 60))
+            env = [f"{k}={v}" for k, v in (self.cfg.get("vm_env") or {}).items()]
+            cmd = [self.cfg["tart"], "exec", vm, "/usr/bin/env", *env, "/bin/bash", "-lc",
+                   job_script(spec, self.cfg["share_root"])]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            reader = threading.Thread(target=lambda: [say(x.decode(errors="replace")) for x in p.stdout], daemon=True)
+            reader.start()
+            while p.poll() is None:
+                if cancel.is_set():
+                    p.kill()
+                    summary["status"] = "cancelled"
+                    break
+                if time.time() > limit:
+                    p.kill()
+                    summary["status"] = "timeout"
+                    break
+                time.sleep(1)
+            p.wait()
+            reader.join(10)
+            rc_file = out / "exit_code"
+            rc = int(rc_file.read_text().strip()) if rc_file.exists() and rc_file.read_text().strip().isdigit() else p.returncode
+            summary["exit_code"] = rc
+            if summary["status"] == "error":
+                summary["status"] = "passed" if rc == 0 else "failed"
+            xv = next((x for x in tail if x.startswith("Xcode ")), "")
+            summary["xcode"] = xv
+            say(f"== {summary['status']} (exit {rc})")
+            self.publish(ws, jid, out, summary, full_log, logf, say)
+        except Exception as e:      # noqa: BLE001 - anything: report it as the job's result
+            summary["error"] = str(e)[:2000]
+            say(f"== error: {e}")
+            try:
+                self.publish(ws, jid, workdir / "out", summary, full_log, logf, say)
+            except Exception as e2:  # noqa: BLE001
+                log(f"{ws}/{jid}: couldn't push the result: {e2}")
+        finally:
+            if vm_proc:
+                self.tart("stop", vm, check=False, timeout=120)
+                vm_proc.wait(60) if vm_proc.poll() is None else None
+            self.tart("delete", vm, check=False, timeout=120)
+            if progress:
+                try:
+                    progress.stdin.close()
+                    progress.wait(30)
+                except (OSError, subprocess.SubprocessError):
+                    progress.kill()
+            logf.close()
+            shutil.rmtree(workdir, ignore_errors=True)
+            with self.lock:
+                self.running.pop(key, None)
+            log(f"{ws}/{jid}: {summary['status']}")
+
+    def fetch(self, ws: str, jid: str, commit: str, src: Path):
+        src.mkdir()
+        g = ["git", "-C", str(src), "-c", "core.hooksPath=/dev/null"]
+        subprocess.run([*g, "init", "-q"], check=True)
+        p = subprocess.run([*g, "fetch", "-q", "--no-tags", self.repo_url(ws), f"refs/tags/build/{jid}"],
+                           env=self.git_env, capture_output=True, text=True, timeout=1800)
+        if p.returncode != 0:
+            raise JobError(f"git fetch: {p.stderr.strip()[:500]}")
+        subprocess.run([*g, "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", f"{commit}"],
+                       check=True, timeout=600)
+        subprocess.run([*g, "submodule", "update", "--init", "--recursive", "-q"], env=self.git_env,
+                       capture_output=True, timeout=1800)     # best effort: may need hosts the VM can't reach
+
+    def wait_boot(self, vm: str, proc: subprocess.Popen, cancel: threading.Event):
+        deadline = time.time() + int(self.cfg["boot_timeout"])
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise JobError(f"tart run exited ({proc.returncode})")
+            if cancel.is_set():
+                raise JobError("cancelled while starting")
+            if self.tart("exec", vm, "/usr/bin/true", check=False, timeout=30).returncode == 0:
+                return
+            time.sleep(3)
+        raise JobError("the VM didn't come up (is the Tart guest agent in the image?)")
+
+    def publish(self, ws, jid, out: Path, summary: dict, full_log: Path, logf, say):
+        summary["finished"] = time.time()
+        summary["seconds"] = round(summary["finished"] - summary["started"])
+        logf.flush()
+        for f in sorted(out.glob("*.zip")) if out.is_dir() else []:
+            name = re.sub(r"[^A-Za-z0-9._-]", "_", f.name)[:100]
+            try:
+                with f.open("rb") as fh:
+                    self.ssh("artifact", ws, jid, name, input=fh.read(), timeout=3600)
+                summary.setdefault("artifacts", []).append(name)
+                say(f"== uploaded {name}")
+            except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+                say(f"== couldn't upload {name}: {e}")
+        res = Path(tempfile.mkdtemp(prefix="result-", dir=self.work))
+        try:
+            data = full_log.read_bytes()
+            (res / "build.log").write_bytes(data[-MAX_RESULT_LOG:])
+            if out.is_dir():
+                if (out / "test-summary.json").is_file():
+                    shutil.copy(out / "test-summary.json", res / "test-summary.json")
+                shots = [p for p in out.glob("screenshots/*.png")][:20]
+                if shots:
+                    (res / "screenshots").mkdir()
+                    for p in shots:
+                        shutil.copy(p, res / "screenshots" / re.sub(r"[^A-Za-z0-9._-]", "_", p.name))
+            (res / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+            g = ["git", "-C", str(res), "-c", "core.hooksPath=/dev/null", "-c", f"user.name=aio-worker-{self.name}",
+                 "-c", "user.email=worker@agent-sandboxes.invalid"]
+            subprocess.run([*g, "init", "-q"], check=True)
+            subprocess.run([*g, "add", "-A"], check=True)
+            subprocess.run([*g, "commit", "-q", "-m", f"result of build/{jid}: {summary['status']}"], check=True)
+            p = subprocess.run([*g, "push", "-q", self.repo_url(ws), f"HEAD:refs/results/{jid}"],
+                               env=self.git_env, capture_output=True, text=True, timeout=600)
+            if p.returncode != 0:
+                raise RuntimeError(p.stderr.strip()[:500])
+        finally:
+            shutil.rmtree(res, ignore_errors=True)
+
+
+class JobError(Exception):
+    pass
+
+
+def check(job: dict, spec: dict) -> str:
+    if not ID_RE.match(job.get("id", "")):
+        return "bad job id"
+    for k, rx in SPEC_RULES.items():
+        if not isinstance(spec.get(k, ""), str) or not rx.match(spec.get(k, "")):
+            return f"bad {k}"
+    if spec["workspace"] != job.get("workspace") or spec["commit"] != job.get("commit"):
+        return "the spec doesn't match the job"
+    return ""
+
+
+def job_script(spec: dict, share_root: str) -> str:
+    """The fixed steps, run in the VM by bash. Every value from the job was
+    checked against SPEC_RULES and is quoted here as well."""
+    q = shlex.quote
+    project, action = spec.get("project", ""), spec["action"]
+    xb = ["xcodebuild", "-scheme", spec["scheme"], "-derivedDataPath", "$HOME/aio-dd"]
+    cd = "."
+    if project.endswith(".xcodeproj"):
+        xb[1:1] = ["-project", project]
+    elif project.endswith(".xcworkspace"):
+        xb[1:1] = ["-workspace", project]
+    elif project:
+        cd = project                    # a Swift package's folder
+    if spec.get("configuration"):
+        xb += ["-configuration", spec["configuration"]]
+    if spec.get("destination"):
+        xb += ["-destination", spec["destination"]]
+    args = " ".join("\"$HOME/aio-dd\"" if a == "$HOME/aio-dd" else q(a) for a in xb)
+    if action == "build" or action == "run":
+        run = f"{args} build"
+    elif action == "test":
+        run = f"{args} test -resultBundlePath \"$OUT/result.xcresult\""
+    else:
+        run = (f"{args} archive -archivePath \"$OUT/build.xcarchive\" CODE_SIGNING_ALLOWED=NO "
+               "CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=\"\"")
+    m = re.search(r"(?:^|,)name=([^,]+)", spec.get("destination", ""))
+    device = q(m[1]) if m else "booted"
+    lines = [
+        "set -uo pipefail",
+        f"SHARE={q(share_root)}",
+        "OUT=\"$HOME/aio-out\"; rm -rf \"$OUT\" \"$HOME/aio-src\"; mkdir -p \"$OUT/screenshots\"",
+        "finish() { rc=$?; [ -f \"$OUT/exit_code\" ] || echo $rc > \"$OUT/exit_code\";",
+        "  cp \"$OUT/exit_code\" \"$SHARE/out/\" 2>/dev/null; cp \"$OUT\"/test-summary.json \"$SHARE/out/\" 2>/dev/null;",
+        "  mkdir -p \"$SHARE/out/screenshots\"; cp \"$OUT\"/screenshots/*.png \"$SHARE/out/screenshots/\" 2>/dev/null;",
+        "  cp \"$OUT\"/*.zip \"$SHARE/out/\" 2>/dev/null; true; }",
+        "trap finish EXIT",
+        "ditto \"$SHARE/src\" \"$HOME/aio-src\" || exit 70",
+        f"cd \"$HOME/aio-src\"/{q(cd)} || exit 71",
+        "xcodebuild -version",
+        f"echo '$ ' {q(run)}",
+        f"{run}",
+        "rc=$?",
+    ]
+    if action == "test":
+        lines += ["xcrun xcresulttool get test-results summary --path \"$OUT/result.xcresult\" --compact "
+                  "> \"$OUT/test-summary.json\" 2>/dev/null || rm -f \"$OUT/test-summary.json\""]
+    if action == "archive":
+        lines += ["[ $rc = 0 ] && (cd \"$OUT\" && ditto -c -k --keepParent build.xcarchive build.xcarchive.zip)"]
+    if action == "run":
+        lines += [
+            "if [ $rc = 0 ]; then",
+            "  APP=$(find \"$HOME/aio-dd/Build/Products\" -maxdepth 2 -name '*.app' -type d | head -1)",
+            "  if [ -z \"$APP\" ]; then echo 'no .app was built'; rc=72; else",
+            "    BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \"$APP/Info.plist\")",
+            f"    xcrun simctl boot {device} 2>/dev/null; xcrun simctl bootstatus {device} -b",
+            f"    xcrun simctl install {device} \"$APP\" && xcrun simctl launch {device} \"$BID\" || rc=73",
+            "    sleep 8",
+            f"    xcrun simctl io {device} screenshot \"$OUT/screenshots/launch.png\" || true",
+            "  fi",
+            "fi",
+        ]
+    lines += ["echo $rc > \"$OUT/exit_code\"", "exit $rc"]
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--config", default=str(CONFIG))
+    ap.add_argument("--once", action="store_true", help="take at most one job, then exit")
+    a = ap.parse_args()
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(Path(a.config).expanduser().read_text()))
+    except (OSError, ValueError) as e:
+        sys.exit(f"aio-build-worker: can't read {a.config}: {e}")
+    if not cfg["name"] or not cfg["host"]:
+        sys.exit("aio-build-worker: set name and host in the config")
+    Worker(cfg).run_forever(once=a.once)
+
+
+if __name__ == "__main__":
+    main()

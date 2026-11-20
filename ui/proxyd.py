@@ -52,6 +52,7 @@ from common import (CONTAINER_PROXY_PORT, HTTP_BRIDGE, MAX_HEAD, NAME_RE, NONO_L
                     vm_browser, vm_cid, vm_proxy_port, wants_ws_proxy)
 from common import CONTAINER_PROXY_SECRETS, substitutions  # noqa: E402
 import gbroker  # noqa: E402
+import builds  # noqa: E402
 
 BROKER_LOG = NONO_LOGS.parent / "google-broker.log"   # one JSON line per decision (no tokens, no query values)
 BROKER_HOSTS = {"gmail.googleapis.com", "www.googleapis.com"}
@@ -425,11 +426,69 @@ async def broker_lookup(host: str, auth: str, target: str) -> tuple[int, bytes]:
         up_w.close()
 
 
+async def read_body(reader, headers: dict[str, str], limit: int) -> bytes:
+    """A request body, de-chunked."""
+    body = bytearray()
+    if "chunked" in headers.get("transfer-encoding", "").lower():
+        while True:
+            size = int((await reader.readuntil(b"\r\n")).split(b";", 1)[0].strip() or b"0", 16)
+            if size == 0:
+                while await reader.readuntil(b"\r\n") != b"\r\n":
+                    pass
+                break
+            body += (await reader.readexactly(size + 2))[:-2]
+            if len(body) > limit:
+                raise ValueError("body too large")
+    else:
+        n = int(headers.get("content-length") or 0)
+        if n > limit:
+            raise ValueError("body too large")
+        body += await reader.readexactly(n)
+    return bytes(body)
+
+
+async def bridge_builds(reader, w, m, lines: list[str]):
+    """/~build: the aio-builds MCP server (ui/builds.py), for workspaces with
+    Apple builds on. nono added the workspace's key; the UI gets the
+    workspace's name instead, on a socket only this service can reach."""
+    headers = {}
+    for line in lines[1:]:
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    ws = builds.workspace_for_key(headers.get("x-aio-build", ""))
+    if ws and not load_policy(ws)["builds"]:
+        ws = ""
+    if not ws:
+        send_json_error(w, 403, "Forbidden", "agent-sandboxes builds: Apple builds aren't on for this workspace "
+                                             "(its Access tab), or the key is wrong")
+        return
+    body = await asyncio.wait_for(read_body(reader, headers, 4 << 20), 60)
+    try:
+        up_r, up_w = await asyncio.open_unix_connection(str(builds.MCP_SOCK))
+    except OSError:
+        send_json_error(w, 502, "Bad Gateway", "agent-sandboxes builds: the web UI isn't running")
+        return
+    try:
+        keep = [x for x in lines[1:] if x.partition(":")[0].strip().lower() not in
+                HOP_HEADERS | {"x-aio-build", "x-aio-workspace", "content-length", "transfer-encoding"}]
+        up_w.write(("\r\n".join([f"{m[1]} {m[2] or '/'} HTTP/1.1", "Host: builds", *keep,
+                                  f"X-AIO-Workspace: {ws}", f"Content-Length: {len(body)}", "Connection: close"])
+                    + "\r\n\r\n").encode("latin-1") + body)
+        await up_w.drain()
+        while data := await asyncio.wait_for(up_r.read(65536), 300):    # build_status may wait 100 s
+            w.write(data)
+            await w.drain()
+    finally:
+        up_w.close()
+
+
 async def handle_bridge(reader, w):
     up_w = None
     try:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 30)
         lines = head[:-4].decode("latin-1").split("\r\n")
+        if mb := re.match(r"^([A-Z]+) /~build(/[^ ]*)? HTTP/1\.[01]$", lines[0]):
+            return await bridge_builds(reader, w, mb, lines)
         m = re.match(r"^([A-Z]+) /([a-z0-9][a-z0-9-]{0,39})(/[^ ]*)? HTTP/1\.[01]$", lines[0])
         meta = token_meta(m[2]) if m else None
         broker = bool(meta and meta.get("service") == "google" and meta.get("broker"))
