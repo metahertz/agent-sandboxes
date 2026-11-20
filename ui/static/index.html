@@ -865,7 +865,8 @@
       <div class="settings-form">
         <section class="card" id="builds-card">
           <div class="card-head"><h2>Apple builds</h2><span class="pill" id="bh-state">…</span></div>
-          <p class="hint">Xcode builds for workspaces with Apple builds ticked: this host pushes each job (a commit, tagged <code>build/&lt;id&gt;</code>) over ssh to a plain git build host, and Mac workers take them, each into a throwaway Tart VM. <code>bin/install-buildhost</code> sets up a build host on this machine; <code>buildhost/install-worker</code> sets up a Mac.</p>
+          <p class="hint">Xcode builds for workspaces with Apple builds ticked. There are three parts: this host queues each job (a commit, tagged <code>build/&lt;id&gt;</code>); the <strong>build host</strong>, a plain git queue over ssh between this host and the Macs, keeps the jobs, logs and results (usually this machine, set up by <code>bin/install-buildhost</code>); and <strong>Mac workers</strong> connect out to it, take jobs and run each in a throwaway Tart VM (set up by <code>buildhost/install-worker</code>).</p>
+          <p class="hint">Nothing here can reach a Mac: Macs only connect out, so they can sleep or sit behind NAT and pick jobs up when back, and several can share the queue. Put the build host on another Linux host only if the Macs can't reach this machine's ssh port.</p>
           <form id="bh-form" class="b-form">
             <div class="row">
               <label>Build host <input name="host" placeholder="aiogit@127.0.0.1" autocomplete="off" spellcheck="false"></label>
@@ -878,7 +879,7 @@
           <span class="g-copy"><code id="bh-key"></code> <button class="btn" type="button" id="bh-copy">Copy</button></span>
           <details class="bh-setup" id="bh-setup">
             <summary>Set up a build host and Mac workers</summary>
-            <h3>1. The build host</h3>
+            <h3>1. The build host (the queue)</h3>
             <p class="hint"><strong>On this machine</strong> (the usual case), in the agent-sandboxes folder; it needs an ssh server. It creates the <code>aiogit</code> user, gives this host's key the ui role and fills in the form above:</p>
             <div class="bh-cmd"><code>bin/install-buildhost &amp;&amp; sudo systemctl restart agent-sandboxes-ui</code> <button class="btn" type="button" data-copy>Copy</button></div>
             <p class="hint"><strong>Or on another Linux host</strong> with git and an ssh server: download the installer there, run it with this host's key, then set its address above as <code>aiogit@&lt;that host&gt;</code> and <em>Test connection</em>.</p>
