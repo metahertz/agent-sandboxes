@@ -235,3 +235,9 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 .b-shots img { max-height: 420px; border: 1px solid var(--line); border-radius: 6px; }
 .b-log { max-height: 60vh; }
 #bh-key { overflow-wrap: anywhere; }
+.bh-setup { margin: 4px 0 12px; }
+.bh-setup summary { cursor: pointer; font-weight: 550; margin-bottom: 8px; }
+.bh-setup h3 { margin: 12px 0 6px; font-size: 13px; }
+.bh-cmd { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 10px; }
+.bh-cmd code { flex: 1; overflow-wrap: anywhere; padding: 6px 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+.bh-setup a.btn { text-decoration: none; }

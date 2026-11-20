@@ -29,6 +29,7 @@ import fcntl
 import grp
 import hashlib
 import hmac
+import io
 import json
 import mimetypes
 import os
@@ -43,6 +44,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tarfile
 import termios
 import time
 import urllib.parse
@@ -1981,6 +1983,25 @@ async def monitoring_status() -> dict:
 # per-workspace builds, also the agent's through the aio-builds MCP server
 # (ui/builds.py)
 
+# Downloads for setting up the other machines: (top folder, files kept at
+# their repo paths, so the installers find their neighbours)
+BUILD_BUNDLES = {
+    "worker": ("aio-build-worker", ["buildhost/install-worker", "buildhost/aio-build-worker"]),
+    "buildhost": ("aio-buildhost", ["bin/install-buildhost", "buildhost/aio-buildd"]),
+}
+
+
+def build_bundle(top: str, files: list[str]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for f in files:
+            data = (ROOT / f).read_bytes()
+            info = tarfile.TarInfo(f"{top}/{f}")
+            info.size, info.mode, info.mtime = len(data), 0o755, int(time.time())
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 async def builds_api(req: Request, parts: list[str], w):
     m = req.method
     try:
@@ -1997,6 +2018,10 @@ async def builds_api(req: Request, parts: list[str], w):
             await builds.ensure_key()
             got = await builds.call_json("version")
             return await send_json(w, {"ok": True, **got})
+        if len(parts) == 2 and parts[0] == "download" and parts[1] in BUILD_BUNDLES and m == "GET":
+            top, files = BUILD_BUNDLES[parts[1]]
+            return await respond(w, 200, build_bundle(top, files), "application/gzip",
+                                 {"Content-Disposition": f'attachment; filename="{top}.tar.gz"'})
         if parts == ["worker-keys"] and m == "GET":
             return await send_json(w, await builds.call_json("worker-keys"))
         if parts == ["workers"] and m == "POST":
