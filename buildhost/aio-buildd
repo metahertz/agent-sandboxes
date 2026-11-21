@@ -319,9 +319,17 @@ def emit(obj):
 
 def cmd_watch():
     """A status snapshot now and on every change (polling: there's no daemon),
-    and at least every 20 s, so the reader knows we're alive."""
+    and at least every 20 s, so the reader knows we're alive. Ends when this
+    file is replaced (install-buildhost), so the UI reconnects to the new code."""
     last, sent = None, 0.0
+    me = SELF.stat()
     while True:
+        try:
+            now = SELF.stat()
+            if (now.st_ino, now.st_mtime_ns) != (me.st_ino, me.st_mtime_ns):
+                return
+        except OSError:
+            return
         fp = fingerprint()
         if fp != last or time.time() - sent > 20:
             emit({"type": "status", **status()})
