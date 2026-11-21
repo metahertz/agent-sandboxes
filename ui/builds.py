@@ -422,6 +422,95 @@ async def remove_worker(name: str):
     await call_json("remove-worker", name)
 
 
+# ---------------------------------------------------------------- into the workspace
+# The project folder is the agent's: any part of the path below it may be a
+# symlink it planted. Every step is opened relative to the last with
+# O_NOFOLLOW, and the file is written beside its final name and renamed.
+OUT_DIR = ".aio-builds"            # in the project folder; ignored by git (its own .gitignore)
+MAX_ARTIFACT = 4 << 30
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
+
+def ws_dir_fd(ws_dir: str, parts: list[str]) -> int:
+    """An fd for <ws_dir>/<parts…>, made as needed, never through a symlink."""
+    fd = os.open(ws_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for i, part in enumerate(parts):
+            if part != OUT_DIR and not NAME_RE.match(part):
+                raise BuildError(f"bad folder name {part!r}")
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                made = True
+            except FileExistsError:
+                made = False
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                raise BuildError(f"{'/'.join(parts[:i + 1])} in the project folder isn't a plain folder "
+                                 "(a symlink?): not writing there") from None
+            if made and i == 0 and part == OUT_DIR:
+                gi = os.open(".gitignore", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=nfd)
+                os.write(gi, b"# build outputs fetched by agent-sandboxes (aio-builds)\n*\n")
+                os.close(gi)
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+async def write_into_workspace(ws_dir: str, parts: list[str], name: str, chunks) -> str:
+    """Write the async iterable chunks to <ws_dir>/<parts…>/<name>; returns the
+    path relative to the project folder."""
+    if not NAME_RE.match(name):
+        raise BuildError("bad file name")
+    dfd = ws_dir_fd(ws_dir, parts)
+    tmp = f".{name}.{secrets.token_hex(4)}.part"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        size = 0
+        try:
+            with os.fdopen(fd, "wb") as f:
+                async for chunk in chunks:
+                    size += len(chunk)
+                    if size > MAX_ARTIFACT:
+                        raise BuildError("bigger than 4 GB: not copied")
+                    f.write(chunk)
+            os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+    return "/".join([*parts, name])
+
+
+async def fetch_artifact(ws: str, ws_dir: str, jid: str, name: str) -> str:
+    """A job's artifact into <project>/.aio-builds/<id>/<name>."""
+    proc = await artifact_stream(ws, jid, name)
+    err_box = []
+
+    async def chunks():
+        got = False
+        while chunk := await proc.stdout.read(1 << 20):
+            got = True
+            yield chunk
+        err = (await proc.stderr.read()).decode(errors="replace").strip()
+        if await proc.wait() != 0 or not got:
+            err_box.append(err.removeprefix("aio-buildd: ") or "empty artifact")
+            raise BuildError(err_box[0])
+    try:
+        return await write_into_workspace(ws_dir, [OUT_DIR, jid], name, chunks())
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+
 def remove_workspace(ws: str):
     mcp_key_path(ws).unlink(missing_ok=True)
     shutil.rmtree(MIRRORS / f"{ws}.git", ignore_errors=True)
@@ -472,6 +561,12 @@ TOOLS = [
      "description": "A finished build's summary, its test results (action test) and Simulator screenshots "
                     "(action run), as images.",
      "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "get_artifact",
+     "description": "Copy a finished build's artifact (e.g. build.xcarchive.zip from an archive build, or the "
+                    ".ipa of an export) into this project, at .aio-builds/<id>/<name> (git ignores that folder). "
+                    "build_result lists a build's artifacts.",
+     "inputSchema": {"type": "object", "required": ["id", "name"], "properties": {
+         "id": {"type": "string"}, "name": {"type": "string"}}}},
     {"name": "cancel_build",
      "description": "Cancel a queued or running build.",
      "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
@@ -553,9 +648,13 @@ async def tool_call(ws: str, ws_dir: str, name: str, args: dict) -> dict:
                 data = await job_file(ws, jid, f)
                 content.append({"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"})
             if j.get("artifacts"):
-                content.append({"type": "text", "text": "Artifacts (download in the web UI's Builds tab): "
+                content.append({"type": "text", "text": "Artifacts (get_artifact copies one into the project): "
                                 + ", ".join(j["artifacts"])})
             return {"content": content}
+        if name == "get_artifact":
+            jid, art = str(args.get("id") or ""), str(args.get("name") or "")
+            rel = await fetch_artifact(ws, ws_dir, jid, art)
+            return text(f"Copied to {rel} in the project folder.")
         if name == "cancel_build":
             jid = str(args.get("id") or "")
             await cancel(ws, jid)

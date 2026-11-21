@@ -882,7 +882,17 @@ async function showBuild(full) {
     el("img", { src: `${base}/file?path=${encodeURIComponent(f)}`, alt: f })));
   const arts = j.artifacts || [];
   $("#b-arts").replaceChildren(...(arts.length ? [el("span", { className: "muted", textContent: "Artifacts: " })] : []),
-    ...arts.map((a) => el("a", { className: "btn", href: `${base}/artifact?name=${encodeURIComponent(a)}`, textContent: `⬇ ${a}` })));
+    ...arts.flatMap((a) => {
+      const copy = el("button", { className: "btn", type: "button", textContent: "Copy into workspace",
+        title: `To .aio-builds/${j.id}/${a} in the project folder` });
+      copy.addEventListener("click", async () => {
+        copy.disabled = true;
+        try { const r = await api("POST", wsPath(w.name, `/builds/${j.id}/fetch?name=${encodeURIComponent(a)}`)); bMsg(`Copied to ${r.path} in the project folder.`); }
+        catch (e) { bMsg(e.message, true); }
+        copy.disabled = false;
+      });
+      return [el("a", { className: "btn", href: `${base}/artifact?name=${encodeURIComponent(a)}`, textContent: `⬇ ${a}` }), copy];
+    }));
 }
 
 async function buildAction(what) {

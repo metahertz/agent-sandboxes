@@ -2060,6 +2060,9 @@ async def builds_ws_api(ws: dict[str, str], req: Request, parts: list[str], w):
         if len(parts) == 2 and parts[1] in ("cancel", "abandon") and m == "POST":
             await builds.cancel(name, parts[0], abandon=parts[1] == "abandon")
             return await send_json(w, {"ok": True})
+        if len(parts) == 2 and parts[1] == "fetch" and m == "POST":
+            rel = await builds.fetch_artifact(name, ws["WS_DIR"], parts[0], req.query.get("name", ""))
+            return await send_json(w, {"ok": True, "path": rel})
         if len(parts) == 2 and parts[1] == "artifact" and m == "GET":
             art = req.query.get("name", "")
             proc = await builds.artifact_stream(name, parts[0], art)
