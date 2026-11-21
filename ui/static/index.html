@@ -333,6 +333,20 @@
             <p class="hint" id="b-d-meta"></p>
             <div class="b-shots" id="b-shots"></div>
             <div id="b-arts"></div>
+            <form id="b-export" class="b-form" hidden>
+              <h3>Sign this archive on a Mac</h3>
+              <div class="row">
+                <label>Identity <select name="identity"></select></label>
+                <label>Method <select name="method">
+                  <option value="app-store-connect">App Store / TestFlight (app-store-connect)</option>
+                  <option value="release-testing">Ad hoc (release-testing)</option>
+                  <option value="debugging">Development (debugging)</option>
+                  <option value="enterprise">Enterprise</option>
+                </select></label>
+              </div>
+              <label class="check"><input type="checkbox" name="upload"> <span>Upload to App Store Connect (TestFlight), with this workspace's App Store Connect key</span></label>
+              <div class="row"><button class="btn" type="submit">Export</button></div>
+            </form>
             <pre class="logs b-log" id="b-log"></pre>
           </section>
         </div>

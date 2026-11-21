@@ -70,6 +70,12 @@ if [[ -f /usr/local/lib/agent-sandboxes/aio-buildd ]] && \
   bin/install-buildhost >/dev/null
 fi
 
+# rcodesign, for signing on this host (the aio-builds MCP server's sign_ipa)
+if changed rcodesign.lock || [[ ! -x opt/rcodesign/rcodesign ]]; then
+  say "Installing rcodesign (bin/install-rcodesign)"
+  bin/install-rcodesign || note "rcodesign didn't install; sign_ipa won't work until bin/install-rcodesign does"
+fi
+
 # The tmux servers keep their old config until it's sourced again
 if changed ui/tmux.conf && tmux -L agent-sandboxes has-session 2>/dev/null; then
   say "Reloading the Claude sessions' tmux config"

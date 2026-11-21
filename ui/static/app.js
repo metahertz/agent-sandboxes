@@ -810,6 +810,7 @@ async function loadBuilds(fresh = false) {
   try { r = await api("GET", wsPath(w.name, "/builds")); }
   catch (e) { $("#b-status").textContent = e.message; bstate.timer = setTimeout(loadBuilds, 10000); return; }
   const online = r.workers.filter((x) => x.online);
+  bstate.signing = r.signing || [];
   $("#b-status").textContent = !r.host ? "No build host set up yet: Settings → Apple builds."
     : !r.connected ? `Build host ${r.host}: not connected${r.error ? ` (${r.error})` : ""}`
       : `Build host ${r.host} · Mac workers: ${r.workers.map((x) => `${x.name} (${x.online ? "online" : "offline"})`).join(", ") || "none yet"}`
@@ -863,6 +864,17 @@ async function showBuild(full) {
     .filter(Boolean).join(" · ");
   $("#b-cancel").hidden = !["queued", "running"].includes(j.state);
   $("#b-abandon").hidden = j.state !== "stale";
+  const exp = $("#b-export");
+  const canExport = j.spec?.action === "archive" && j.state === "passed" && (j.artifacts || []).includes("build.xcarchive.zip");
+  if (exp.dataset.job !== j.id) {
+    exp.dataset.job = j.id;
+    exp.hidden = !canExport;
+    if (canExport) {
+      const idents = bstate.signing || [];
+      exp.elements.identity.replaceChildren(...idents.map((s) => el("option", { value: s.id, textContent: `${s.id} (${s.name})` })));
+      if (!idents.length) exp.elements.identity.append(el("option", { value: "", textContent: "none assigned (Access tab)" }));
+    }
+  }
   // the log, from where we got to
   if (full || ACTIVE.includes(j.state) || j.log_size > bstate.offset) {
     try {
@@ -894,6 +906,18 @@ async function showBuild(full) {
       return [el("a", { className: "btn", href: `${base}/artifact?name=${encodeURIComponent(a)}`, textContent: `⬇ ${a}` }), copy];
     }));
 }
+
+$("#b-export").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const w = current(), f = ev.currentTarget.elements;
+  try {
+    const r = await api("POST", wsPath(w.name, "/builds/export"), { from: bstate.sel, identity: f.identity.value,
+      method: f.method.value, upload: f.upload.checked });
+    bMsg(`Queued export ${r.id}, sealed for ${r.workers.join(", ")}.`);
+    openBuild(r.id);
+  } catch (e) { bMsg(e.message, true); }
+  loadBuilds();
+});
 
 async function buildAction(what) {
   const w = current();

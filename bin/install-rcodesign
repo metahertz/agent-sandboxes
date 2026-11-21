@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Install rcodesign (apple-codesign, from indygreg/apple-platform-rs) into
+# opt/rcodesign/, for the aio-builds MCP server's sign_ipa: re-signing iOS and
+# macOS apps on this host with an identity from Keys & tokens → Apple signing.
+#
+#   bin/install-rcodesign            install the version in rcodesign.lock
+#
+# The release tarball is checked against the checksum in rcodesign.lock
+# (and against the release's own .sha256 file). bin/update-host runs this
+# when the lock changes.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../rcodesign.lock
+source "$ROOT/rcodesign.lock"
+V=$RCODESIGN_VERSION
+case $(uname -m) in
+  x86_64) arch=x86_64; pin=$RCODESIGN_SHA256_X86_64 ;;
+  aarch64|arm64) arch=aarch64; pin=$RCODESIGN_SHA256_AARCH64 ;;
+  *) echo "no rcodesign release for $(uname -m)" >&2; exit 1 ;;
+esac
+DEST="$ROOT/opt/rcodesign"
+if [[ -x $DEST/rcodesign && "$(cat "$DEST/VERSION" 2>/dev/null)" == "$V" ]]; then
+  echo "rcodesign $V is installed"
+  exit 0
+fi
+
+name="apple-codesign-$V-$arch-unknown-linux-musl"
+tag="apple-codesign/$V"
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+
+fetch() {  # asset name, output file: the release URL, else GitHub's API (another host)
+  curl -fsSL --retry 3 -o "$2" "https://github.com/indygreg/apple-platform-rs/releases/download/$tag/$1" && return
+  echo "    the download failed; trying GitHub's API" >&2
+  local id
+  id=$(curl -fsSL --retry 3 "https://api.github.com/repos/indygreg/apple-platform-rs/releases/tags/$tag" |
+    python3 -c 'import json,sys; print(next(a["id"] for a in json.load(sys.stdin)["assets"] if a["name"] == sys.argv[1]))' "$1")
+  curl -fsSL --retry 3 -H "Accept: application/octet-stream" -o "$2" \
+    "https://api.github.com/repos/indygreg/apple-platform-rs/releases/assets/$id"
+}
+
+echo "==> rcodesign $V ($arch)"
+fetch "$name.tar.gz" "$tmp/a.tgz"
+fetch "$name.tar.gz.sha256" "$tmp/a.sha256"
+got=$(sha256sum "$tmp/a.tgz" | cut -d' ' -f1)
+published=$(tr -s ' ' < "$tmp/a.sha256" | cut -d' ' -f1)
+if [[ $got != "$published" ]]; then
+  echo "checksum mismatch: the tarball is $got, the release says $published" >&2
+  exit 1
+fi
+if [[ -n $pin && $got != "$pin" ]]; then
+  echo "checksum mismatch: the tarball is $got, rcodesign.lock pins $pin" >&2
+  exit 1
+elif [[ -z $pin ]]; then
+  echo "    note: rcodesign.lock pins no checksum for $arch yet; this one matches the release's: $got"
+fi
+tar -xzf "$tmp/a.tgz" -C "$tmp"
+bin=$(find "$tmp" -type f -name rcodesign | head -1)
+[[ -n $bin ]] || { echo "no rcodesign in the tarball" >&2; exit 1; }
+mkdir -p "$DEST"
+install -m 755 "$bin" "$DEST/rcodesign.new"
+mv -f "$DEST/rcodesign.new" "$DEST/rcodesign"
+echo "$V" > "$DEST/VERSION"
+"$DEST/rcodesign" --version

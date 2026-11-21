@@ -14,10 +14,13 @@ Keys and what each may do:
       push to <workspace>.git: only new tags build/<id> (an annotated tag
         whose message is the job, checked here) and release/<name>
       status, watch, log, result, file, cancel, abandon, workers,
-      add-worker, remove-worker
+      add-worker, remove-worker, seal (an export job's keys, sealed for the
+      workers, before its tag)
   restrict,command="aio-buildd shell worker <name>" a Mac build worker
       fetch any repo; push only refs/results/<id> of a job it claimed
-      next (claim the oldest queued job), progress, heartbeat, artifact
+      next (claim the oldest queued job), progress, heartbeat, artifact,
+      seal-key (its public seal key, signed with its ssh key), and for an
+      export job it claimed: seal, source (the archive it exports)
 
 Every repo refuses deletions and non-fast-forward pushes, and fsck-checks
 what it receives. Layout under $AIO_BUILDD_BASE (default: this user's home):
@@ -28,7 +31,11 @@ what it receives. Layout under $AIO_BUILDD_BASE (default: this user's home):
   logs/<ws>/<id>.log      the live log, as the worker sends it
   artifacts/<ws>/<id>/    larger outputs (an .xcarchive, zipped)
   state/claims/<ws>/<id>.json, state/cancel/<ws>/<id>, state/abandon/<ws>/<id>
-  state/workers/<name>.json  the last heartbeat
+  state/workers/<name>.json  the last heartbeat; <name>.seal.json its seal key
+  state/seals/<ws>/<id>   an export job's signing keys, encrypted for the
+                          workers' seal keys (the UI checks those against the
+                          workers' ssh keys, not this host); deleted when the
+                          job ends
   hooks/                  core.hooksPath of every repo
 """
 from __future__ import annotations
@@ -65,9 +72,9 @@ KEEP_JOBS = 40                 # per repo, in status
 # ---------------------------------------------------------------- the job spec
 # The tag message. Strings are checked here (and again by the worker, which
 # builds the xcodebuild command from them) so none can carry shell syntax.
-ACTIONS = ("build", "test", "run", "archive")
+ACTIONS = ("build", "test", "run", "archive", "export")
 SPEC_RULES = {
-    "action": re.compile(r"^(build|test|run|archive)$"),
+    "action": re.compile(r"^(build|test|run|archive|export)$"),
     "scheme": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,99}$"),
     "project": re.compile(r"^$|^(?![/-])(?!.*(^|/)\.\.(/|$))[A-Za-z0-9 _.+/-]{1,200}$"),
     "destination": re.compile(r"^$|^[A-Za-z0-9 _.,=:()+/-]{1,200}$"),
@@ -77,19 +84,40 @@ SPEC_RULES = {
     "submitted": re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$"),
     "by": re.compile(r"^(agent|ui)$"),
 }
+# Only some jobs have these. export: sign the archive job `from` (same
+# workspace) with the sealed identity, for `method`; upload: to App Store
+# Connect. team: DEVELOPMENT_TEAM for an archive.
+OPTIONAL_RULES = {
+    "from": ID_RE,
+    "method": re.compile(r"^(app-store-connect|release-testing|debugging|enterprise)$"),
+    "upload": re.compile(r"^(yes|no)$"),
+    "identity": re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$"),
+    "team": re.compile(r"^[A-Z0-9]{10}$"),
+}
+MAX_SEAL = 2 << 20
 
 
 def check_spec(spec) -> str:
     """'' if the job spec is acceptable, else why not."""
     if not isinstance(spec, dict) or spec.get("v") != 1:
         return "the tag message must be a JSON object with \"v\": 1"
-    extra = set(spec) - set(SPEC_RULES) - {"v", "timeout_min"}
+    extra = set(spec) - set(SPEC_RULES) - set(OPTIONAL_RULES) - {"v", "timeout_min"}
     if extra:
         return f"unknown fields: {', '.join(sorted(extra))}"
     for k, rx in SPEC_RULES.items():
         v = spec.get(k, "")
         if not isinstance(v, str) or not rx.match(v):
             return f"bad or missing {k}"
+    for k, rx in OPTIONAL_RULES.items():
+        if k in spec and (not isinstance(spec[k], str) or not rx.match(spec[k])):
+            return f"bad {k}"
+    if spec["action"] == "export":
+        if not spec.get("from") or not spec.get("method"):
+            return "an export names the archive job (from) and the method"
+        if spec.get("upload") == "yes" and spec["method"] != "app-store-connect":
+            return "only an app-store-connect export can be uploaded"
+    elif {"from", "method", "upload", "identity"} & set(spec):
+        return "from, method, upload and identity are for exports"
     t = spec.get("timeout_min", 60)
     if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= 240:
         return "timeout_min must be 1-240"
@@ -154,9 +182,17 @@ def init_repo(repo: Path):
 
 
 def setup():
-    for d in (REPOS, LOGS, ARTIFACTS, STATE / "claims", STATE / "cancel", STATE / "abandon", STATE / "workers"):
+    for d in (REPOS, LOGS, ARTIFACTS, STATE / "claims", STATE / "cancel", STATE / "abandon", STATE / "workers",
+              STATE / "seals"):
         d.mkdir(parents=True, exist_ok=True)
+    (STATE / "seals").chmod(0o700)
     write_hooks()
+    for p in (STATE / "seals").glob("*/*"):           # an export that never ran: keys don't linger
+        try:
+            if time.time() - p.stat().st_mtime > 2 * 86400:
+                p.unlink()
+        except OSError:
+            pass
     if not EVENTS.exists():
         bump()
 
@@ -241,9 +277,13 @@ def workers_state() -> list[dict]:
     now = time.time()
     out = []
     for p in sorted((STATE / "workers").glob("*.json")):
+        if p.name.endswith(".seal.json"):
+            continue
         w = read_json(p)
         w["name"] = p.stem
         w["online"] = now - w.get("seen", 0) < STALE_AFTER
+        if seal := read_json(STATE / "workers" / f"{p.stem}.seal.json"):
+            w["seal"] = seal
         out.append(w)
     return out
 
@@ -337,7 +377,88 @@ def flag(kind: str, ws: str, jid: str):
     d = STATE / kind / ws
     d.mkdir(parents=True, exist_ok=True)
     (d / jid).touch()
+    drop_seal(ws, jid)
     bump()
+    emit({"ok": True})
+
+
+def seal_path(ws: str, jid: str) -> Path:
+    return STATE / "seals" / ws / jid
+
+
+def drop_seal(ws: str, jid: str):
+    seal_path(ws, jid).unlink(missing_ok=True)
+
+
+def cmd_seal_put(ws: str, jid: str):
+    """The UI: an export job's sealed keys, before it pushes the job's tag."""
+    repo_path(ws)
+    if not ID_RE.match(jid):
+        die("bad job id")
+    data = sys.stdin.buffer.read(MAX_SEAL + 1)
+    if len(data) > MAX_SEAL:
+        die("seal too large")
+    try:
+        if not isinstance(json.loads(data).get("workers"), dict):
+            raise ValueError
+    except (ValueError, AttributeError):
+        die("that isn't a seal")
+    p = seal_path(ws, jid)
+    p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = p.with_name(f".{jid}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    tmp.rename(p)
+    emit({"ok": True})
+
+
+def job_spec(repo: Path, jid: str) -> dict:
+    try:
+        body = git(repo, "cat-file", "tag", f"refs/tags/build/{jid}").decode(errors="replace")
+        return json.loads(body.partition("\n\n")[2].split("\n-----BEGIN")[0])
+    except (RuntimeError, ValueError):
+        return {}
+
+
+def cmd_seal_get(worker: str, ws: str, jid: str):
+    own_claim(worker, ws, jid)
+    p = seal_path(ws, jid)
+    if not p.is_file():
+        die("no sealed keys for this job (cancelled, or already used)")
+    sys.stdout.buffer.write(p.read_bytes())
+
+
+def cmd_source(worker: str, ws: str, jid: str):
+    """An export job's input: the archive of the job it exports."""
+    own_claim(worker, ws, jid)
+    spec = job_spec(repo_path(ws), jid)
+    if spec.get("action") != "export" or not ID_RE.match(spec.get("from", "")):
+        die("not an export job")
+    p = ARTIFACTS / ws / spec["from"] / "build.xcarchive.zip"
+    if not p.is_file():
+        die("the archive job has no build.xcarchive.zip")
+    with p.open("rb") as f:
+        while chunk := f.read(1 << 20):
+            sys.stdout.buffer.write(chunk)
+
+
+def cmd_seal_key(worker: str):
+    """The worker's public seal key and its ssh signature (ssh-keygen -Y sign,
+    namespace aio-seal). Kept for the UI, which checks the signature itself."""
+    try:
+        got = json.loads(sys.stdin.read(32768))
+        pem, sig = str(got["pem"]), str(got["sig"])
+    except (ValueError, KeyError, TypeError):
+        die("expected {\"pem\": …, \"sig\": …}")
+    if not pem.startswith("-----BEGIN PUBLIC KEY-----") or "-----BEGIN SSH SIGNATURE-----" not in sig \
+            or len(pem) > 8192 or len(sig) > 8192:
+        die("that isn't a public key and an ssh signature")
+    p = STATE / "workers" / f"{worker}.seal.json"
+    new = {"pem": pem, "sig": sig}
+    if read_json(p) != new:
+        p.write_text(json.dumps(new))
+        bump()
     emit({"ok": True})
 
 
@@ -459,6 +580,7 @@ def cmd_remove_worker(name: str):
     marker = f" shell worker {name}\" "
     write_keys([x for x in key_lines() if marker not in x])
     (STATE / "workers" / f"{name}.json").unlink(missing_ok=True)
+    (STATE / "workers" / f"{name}.seal.json").unlink(missing_ok=True)
     bump()
     emit({"ok": True})
 
@@ -499,9 +621,10 @@ UI_CMDS = {"status": (0, lambda: emit(status())), "watch": (0, cmd_watch), "log"
            "cancel": (2, lambda ws, j: flag("cancel", ws, j)), "abandon": (2, lambda ws, j: flag("abandon", ws, j)),
            "workers": (0, lambda: emit({"workers": workers_state()})), "worker-keys": (0, cmd_worker_keys),
            "add-worker": (1, cmd_add_worker), "remove-worker": (1, cmd_remove_worker),
-           "version": (0, lambda: emit({"version": file_version()}))}
+           "seal": (2, cmd_seal_put), "version": (0, lambda: emit({"version": file_version()}))}
 WORKER_CMDS = {"next": (0, cmd_next), "progress": (2, cmd_progress), "heartbeat": (0, cmd_heartbeat),
-               "artifact": (3, cmd_artifact)}
+               "artifact": (3, cmd_artifact), "seal": (2, cmd_seal_get), "source": (2, cmd_source),
+               "seal-key": (0, cmd_seal_key)}
 
 
 def shell(role: str, worker: str = ""):
@@ -569,6 +692,16 @@ def check_update(role: str, worker: str, repo: Path, ws: str, old: str, new: str
                 return why
             if spec["workspace"] != ws or spec["commit"] != fields.get("object"):
                 return "the job's workspace or commit doesn't match"
+            if spec["action"] == "export":
+                src = next((j for j in jobs(ws, 1, only=spec["from"]) if j["id"] == spec["from"]), None)
+                if not src or src["spec"].get("action") != "archive" or src.get("state") != "passed":
+                    return "an export needs a passed archive job of this workspace (from)"
+                if "build.xcarchive.zip" not in src["artifacts"]:
+                    return "the archive job has no build.xcarchive.zip"
+                if src["commit"] != spec["commit"]:
+                    return "an export's commit is its archive job's"
+                if not seal_path(ws, m[1]).is_file():
+                    return "send the export's sealed keys first (seal)"
             return ""
         if m := re.fullmatch(r"refs/tags/release/(.+)", ref):
             return "" if RELEASE_RE.match(m[1]) else "bad release tag name"
@@ -600,7 +733,11 @@ def main():
     if a == ["hook", "pre-receive"]:
         return pre_receive()
     if a == ["hook", "post-receive"]:
-        sys.stdin.read()
+        ws = Path(os.environ.get("GIT_DIR", ".")).resolve().name.removesuffix(".git")
+        for line in sys.stdin.read().splitlines():
+            ref = line.split(" ", 2)[-1]
+            if (m := re.fullmatch(r"refs/results/(.+)", ref)) and ID_RE.match(m[1]) and WS_RE.match(ws):
+                drop_seal(ws, m[1])            # the export is over: its keys go
         return bump()
     if a == ["init"]:
         setup()

@@ -85,7 +85,9 @@ flowchart LR
 | `bin/claude-in <name>` | Claude Code inside nono for one workspace (prepares agent + profile); nono's log goes to `monitoring/data/nono-logs/<name>.log`, outside the sandbox |
 | `ui/builds.py`, `buildhost/aio-buildd`, `buildhost/aio-build-worker` | Apple builds: the UI's side (submit, monitor, the aio-builds MCP server); the git build host's only command; the Mac worker |
 | `bin/install-buildhost`, `buildhost/install-worker` | Set up a build host (user `aiogit`, `/usr/local/lib/agent-sandboxes/aio-buildd`); set up a Mac worker (`~/.aio-build`, a LaunchAgent) |
-| `secrets/builds/` ✱ | The UI's build host key, address and `known_hosts`; each workspace's MCP key; clean mirrors the jobs are pushed from |
+| `secrets/builds/` ✱ | The UI's build host key, address and `known_hosts`; each workspace's MCP key; clean mirrors the jobs are pushed from; `workers.json`, the workers' ssh keys as added here (they vouch for the workers' seal keys) |
+| `ui/applesign.py`, `secrets/apple/identities/` ✱ | Apple signing identities (`.p12`, password, provisioning profiles); sealing them for a Mac; signing on this host |
+| `bin/asc-token`, `bin/install-rcodesign`, `rcodesign.lock`, `opt/rcodesign/` ✱ | App Store Connect JWTs for nono's proxy; rcodesign for `sign_ipa` |
 | `libexec/ssh-proxy-connect` | SSH `ProxyCommand` through nono's proxy (readable in the sandbox) |
 | `compose.workspace.yaml` | Container template (compose project `aio-<name>`) |
 | `bin/microvm`, `bin/microvm-image`, `microvm/guest/` | MicroVM workspaces: start / stop / ssh a VM (systemd `--user` unit `aio-vm-<name>`); build the base image; the guest's own scripts and units |
@@ -331,7 +333,10 @@ without any way to reach the Mac. There are three parts:
      - *build*;
      - *test* (an `.xcresult` summary);
      - *run*: build, install and launch in the Simulator, then a screenshot;
-     - *archive*: an unsigned `.xcarchive`, zipped, kept as an artifact.
+     - *archive*: an ad-hoc signed `.xcarchive` (so the binary carries the project's
+       entitlements; unsigned if ad-hoc signing fails), zipped, kept as an artifact;
+     - *export*: sign an archive with an identity from Keys & tokens (see *Signing and
+       TestFlight* below).
   4. Push the result.
   5. Delete the VM.
 
@@ -344,7 +349,11 @@ MCP server, `aio-builds`, with these tools:
 - `build_status`, which can wait for the build to finish
 - `build_log`
 - `build_result`, which returns screenshots as images
+- `get_artifact`, which copies a build's artifact into the project, at `.aio-builds/<id>/`
+  (git ignores that folder). The folder is the agent's, so the copy never follows a
+  symlink in it.
 - `cancel_build`
+- `export_build` and `sign_ipa`, for workspaces with a signing identity (below)
 
 It reaches the server like an API token route. nono's proxy adds the workspace's key
 (`X-AIO-Build`), and the proxy service's bridge (`/~build`) passes the request to the web UI
@@ -387,8 +396,67 @@ The Mac's settings are in `~/.aio-build/config.json`:
 - `ssh_args`
 
 What a build may reach on the network is the Mac's and Tart's to decide. The agent-sandboxes
-allowlist doesn't cover the VM. Signing and App Store uploads aren't part of this: archives
-are unsigned. `release/*` tags are reserved for a separate signing service.
+allowlist doesn't cover the VM.
+
+#### Signing and TestFlight
+
+Signing and deploy keys live in *Keys & tokens*, are ticked per workspace, and never enter a
+sandbox. There are two kinds:
+
+- **App Store Connect API key** (an API token, service *App Store Connect API*): a team key's
+  `.p8`, key ID and issuer ID.
+  - The `.p8` stays in `secrets/tokens/`. For each request, nono's proxy runs `bin/asc-token`
+    outside the sandbox (a `cmd://` credential); it signs a JWT with the key (ES256, 19
+    minutes, cached for 15) and the proxy injects it. The agent sees `$ASC_TOKEN`, a
+    placeholder.
+  - Its access preset is a list of nono endpoint rules (default-deny). *TestFlight* allows
+    builds, build uploads, beta groups, testers and beta localizations. *Full API* allows
+    whatever the key's role does.
+  - Apple's upload URLs for build bytes are pre-signed, on `*.blobstore.apple.com`, which is
+    allowed for a workspace with a key.
+  - Give the key the least role that does the job (App Manager for TestFlight).
+- **Apple signing identity** (*Keys & tokens → Apple signing*): a certificate with its private
+  key (`.p12`) and its provisioning profiles.
+  - Kept in `secrets/apple/identities/<id>/`.
+  - A private key is used for signing, which no proxy can do on the agent's behalf. So the
+    agent asks the `aio-builds` MCP server, which needs *Apple builds* on too.
+  - A profile for another team, or one that doesn't include the certificate, is refused.
+
+The agent signs in one of two ways:
+
+- **`export_build`: on a Mac, with Xcode.** It signs a passed *archive* build with
+  `xcodebuild -exportArchive`, in a fresh VM where no project code runs. The method picks the
+  identity's profiles of that type: `app-store-connect`, `release-testing` (ad hoc),
+  `debugging` or `enterprise`.
+  - With `upload`, Xcode uploads the build to App Store Connect (TestFlight), with the
+    workspace's App Store Connect key.
+  - Otherwise the signed `.ipa` is the job's artifact, which `get_artifact` brings into the
+    project.
+  - **How the keys get there:** the identity (and for an upload, the `.p8`) is sealed for
+    the Mac workers. Each worker has an RSA *seal key* (`~/.aio-build/seal.pem`), whose public
+    half it signs with its ssh key (`ssh-keygen -Y sign`). The UI checks that signature against
+    the worker's ssh key as you added it (`secrets/builds/workers.json`), so the build host
+    can't substitute a key of its own. The keys are then encrypted (AES-256 plus HMAC, the key
+    wrapped with RSA-OAEP for each worker) and held on the build host until the job ends.
+    Only the worker that claimed the job can fetch them.
+  - **On the Mac:** the keys are unsealed into the job's folder (0700) and shared read-only
+    into the VM. There they're imported into a keychain of their own, which is deleted along
+    with the VM.
+- **`sign_ipa`: on this host, with [rcodesign](https://github.com/indygreg/apple-platform-rs).**
+  It re-signs an `.ipa`, a zipped `.xcarchive` or a zipped `.app`, from the project or from a
+  build's artifact. The result goes to `.aio-builds/signed/` in the project.
+  - It embeds the profile, and signs app extensions with the identity's profile for their own
+    bundle ID.
+  - The entitlements signed in are the app's own, from its ad-hoc signature, as far as the
+    profile grants them. It reports what was left out.
+  - `bin/install-rcodesign` installs the version pinned in `rcodesign.lock` into
+    `opt/rcodesign/`, and `update-host` keeps it current.
+  - rcodesign runs on this host with the key, against an app the agent supplied. That app is
+    unpacked here with checks first: no paths outside its folder, no links out, and caps on
+    size and file count.
+
+  Apple's own tools on the Mac are the surer path for App Store and TestFlight builds.
+  `sign_ipa` is for quick ad-hoc and development builds.
 
 ### Import
 

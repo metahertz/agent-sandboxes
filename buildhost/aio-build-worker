@@ -11,10 +11,19 @@ the job, claim it, send its log and heartbeats, and push its result
      read-only and an output folder shared read-write
   3. tart exec: copy the source in, run the fixed xcodebuild steps for the
      job's action (build, test, run = build + launch in the Simulator +
-     screenshot, archive = unsigned .xcarchive), copy the outputs out
+     screenshot, archive = an ad-hoc signed .xcarchive), copy the outputs out
   4. push summary.json, build.log, test-summary.json and screenshots/ as
-     refs/results/<id>; upload a zipped archive as an artifact
+     refs/results/<id>; upload a zipped archive or an .ipa as an artifact
   5. stop and delete the VM, remove the checkout
+
+An export job signs an archive job's .xcarchive with an identity from the
+UI (Keys & tokens -> Apple signing), and can upload it to App Store
+Connect. No project code runs: the VM gets the archive and the keys, and
+runs xcodebuild -exportArchive. The keys come sealed for this worker: the
+UI encrypts them to its seal key (~/.aio-build/seal.pem, RSA; its public half
+is signed with the worker's ssh key, which the UI checks), and the build
+host only ever holds ciphertext. They're unsealed into the job's folder
+(0700), shared read-only into the VM, and deleted with it.
 
 The job's code runs only inside the VM; nothing from this Mac goes in but the
 checkout. Python 3.9+ (the one with Xcode's command line tools will do).
@@ -38,7 +47,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1"
+VERSION = "2"
 CONFIG = Path(os.environ.get("AIO_BUILD_CONFIG", "~/.aio-build/config.json")).expanduser()
 DEFAULTS = {
     "name": "", "host": "", "port": 22,
@@ -58,7 +67,7 @@ MAX_RESULT_LOG = 5 << 20
 # Same rules as aio-buildd's check (it refused anything else at push time;
 # checked again because the commands below are built from these strings)
 SPEC_RULES = {
-    "action": re.compile(r"^(build|test|run|archive)$"),
+    "action": re.compile(r"^(build|test|run|archive|export)$"),
     "scheme": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,99}$"),
     "project": re.compile(r"^$|^(?![/-])(?!.*(^|/)\.\.(/|$))[A-Za-z0-9 _.+/-]{1,200}$"),
     "destination": re.compile(r"^$|^[A-Za-z0-9 _.,=:()+/-]{1,200}$"),
@@ -67,6 +76,14 @@ SPEC_RULES = {
     "commit": re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$"),
 }
 ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+OPTIONAL_RULES = {
+    "from": ID_RE,
+    "method": re.compile(r"^(app-store-connect|release-testing|debugging|enterprise)$"),
+    "upload": re.compile(r"^(yes|no)$"),
+    "identity": re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$"),
+    "team": re.compile(r"^[A-Z0-9]{10}$"),
+}
+SEAL_KEY = Path("~/.aio-build/seal.pem").expanduser()
 
 
 def log(msg: str):
@@ -117,9 +134,72 @@ class Worker:
             raise RuntimeError(f"tart {args[0]}: {(p.stderr or p.stdout).strip()[:500]}")
         return p
 
+    # ------------------------------------------------------------ the seal key
+    def seal_key(self) -> dict:
+        """This worker's RSA seal key (made once), its public half and an ssh
+        signature over it with the worker's key: what the UI encrypts export
+        keys to, after checking the signature against the key it added."""
+        pub = SEAL_KEY.with_suffix(".pub.pem")
+        if not SEAL_KEY.is_file():
+            SEAL_KEY.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            old = os.umask(0o077)
+            try:
+                subprocess.run(["openssl", "genrsa", "-out", str(SEAL_KEY), "4096"], check=True, capture_output=True)
+            finally:
+                os.umask(old)
+            pub.unlink(missing_ok=True)
+        sig = pub.with_name(pub.name + ".sig")
+        if not pub.is_file() or not sig.is_file():
+            subprocess.run(["openssl", "rsa", "-in", str(SEAL_KEY), "-pubout", "-out", str(pub)], check=True,
+                           capture_output=True)
+            sig.unlink(missing_ok=True)
+            subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-n", "aio-seal", "-f",
+                            str(Path(self.cfg["key"]).expanduser()), str(pub)], check=True, capture_output=True)
+        return {"pem": pub.read_text(), "sig": sig.read_text()}
+
+    def unseal(self, sealed: bytes, dest: Path):
+        """The export's keys: RSA-OAEP unwraps the AES and HMAC keys, the HMAC
+        is checked, then AES-256-CBC decrypts a tar of the files."""
+        import base64
+        import hashlib
+        import hmac
+        import io
+        import tarfile
+        box = json.loads(sealed)
+        wrapped = base64.b64decode(box["workers"][self.name])
+        p = subprocess.run(["openssl", "pkeyutl", "-decrypt", "-inkey", str(SEAL_KEY),
+                            "-pkeyopt", "rsa_padding_mode:oaep"], input=wrapped, capture_output=True, timeout=60)
+        if p.returncode != 0 or len(p.stdout) != 64:
+            raise JobError("couldn't unwrap the sealed keys (sealed for another seal key?)")
+        k_enc, k_mac = p.stdout[:32], p.stdout[32:]
+        iv, ct = base64.b64decode(box["iv"]), base64.b64decode(box["ct"])
+        if not hmac.compare_digest(hmac.new(k_mac, iv + ct, hashlib.sha256).digest(), base64.b64decode(box["mac"])):
+            raise JobError("the sealed keys were tampered with (HMAC mismatch)")
+        p = subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-K", k_enc.hex(), "-iv", iv.hex()],
+                           input=ct, capture_output=True, timeout=60)
+        if p.returncode != 0:
+            raise JobError("couldn't decrypt the sealed keys")
+        dest.mkdir(mode=0o700)
+        with tarfile.open(fileobj=io.BytesIO(p.stdout)) as t:
+            for m in t.getmembers():
+                if not m.isfile() or not re.match(r"^(profiles/)?[A-Za-z0-9._-]{1,100}$", m.name):
+                    raise JobError(f"unexpected file in the sealed keys: {m.name[:60]}")
+                target = dest / m.name
+                target.parent.mkdir(mode=0o700, exist_ok=True)
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(t.extractfile(m).read())
+
     # ------------------------------------------------------------ loop
     def heartbeat_loop(self):
+        sealed_at = 0.0
         while True:
+            if time.time() - sealed_at > 600:
+                try:
+                    self.ssh("seal-key", input=json.dumps(self.seal_key()).encode())
+                    sealed_at = time.time()
+                except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+                    log(f"couldn't register the seal key: {e}")
             try:
                 with self.lock:
                     running = [list(k) for k in self.running]
@@ -212,18 +292,32 @@ class Worker:
             say(f"== {spec['action']} {spec['scheme']} at {job['commit'][:12]}, image {self.cfg['image']}")
             src, out = workdir / "src", workdir / "out"
             out.mkdir()
-            self.fetch(ws, jid, job["commit"], src)
+            if spec["action"] == "export":
+                # No checkout: the archive job's .xcarchive and the sealed keys
+                say(f"== export of {spec['from']} ({spec['method']}{', upload' if spec.get('upload') == 'yes' else ''}),"
+                    f" identity {spec.get('identity', '?')}")
+                src.mkdir(mode=0o700)
+                with (src / "build.xcarchive.zip").open("wb") as f:
+                    p = subprocess.run(self.ssh_base + [self.user_host, f"source {ws} {jid}"], stdout=f,
+                                       stderr=subprocess.PIPE, timeout=3600)
+                if p.returncode != 0:
+                    raise JobError(f"couldn't get the archive: {p.stderr.decode(errors='replace').strip()[:300]}")
+                self.unseal(self.ssh("seal", ws, jid), src / "keys")
+                say("== keys unsealed for this job")
+                shares = [f"--dir=in:{src}:ro", f"--dir=out:{out}"]
+            else:
+                self.fetch(ws, jid, job["commit"], src)
+                shares = [f"--dir=src:{src}:ro", f"--dir=out:{out}"]
             say("== starting the VM")
             self.tart("clone", self.cfg["image"], vm, timeout=1800)
-            vm_proc = subprocess.Popen([self.cfg["tart"], "run", vm, f"--dir=src:{src}:ro", f"--dir=out:{out}",
-                                        *self.cfg["run_args"]],
+            vm_proc = subprocess.Popen([self.cfg["tart"], "run", vm, *shares, *self.cfg["run_args"]],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.wait_boot(vm, vm_proc, cancel)
             say("== VM up; running the job")
             limit = started + 60 * int(spec.get("timeout_min", 60))
             env = [f"{k}={v}" for k, v in (self.cfg.get("vm_env") or {}).items()]
-            cmd = [self.cfg["tart"], "exec", vm, "/usr/bin/env", *env, "/bin/bash", "-lc",
-                   job_script(spec, self.cfg["share_root"])]
+            script = (export_script if spec["action"] == "export" else job_script)(spec, self.cfg["share_root"])
+            cmd = [self.cfg["tart"], "exec", vm, "/usr/bin/env", *env, "/bin/bash", "-lc", script]
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             reader = threading.Thread(target=lambda: [say(x.decode(errors="replace")) for x in p.stdout], daemon=True)
             reader.start()
@@ -244,6 +338,9 @@ class Worker:
             summary["exit_code"] = rc
             if summary["status"] == "error":
                 summary["status"] = "passed" if rc == 0 else "failed"
+            if spec["action"] == "export":
+                summary.update({"from": spec["from"], "method": spec["method"], "identity": spec.get("identity", ""),
+                                "uploaded": spec.get("upload") == "yes" and rc == 0})
             xv = next((x for x in tail if x.startswith("Xcode ")), "")
             summary["xcode"] = xv
             say(f"== {summary['status']} (exit {rc})")
@@ -301,7 +398,8 @@ class Worker:
         summary["finished"] = time.time()
         summary["seconds"] = round(summary["finished"] - summary["started"])
         logf.flush()
-        for f in sorted(out.glob("*.zip")) if out.is_dir() else []:
+        outputs = [f for ext in ("zip", "ipa", "pkg") for f in out.glob(f"*.{ext}")] if out.is_dir() else []
+        for f in sorted(outputs):
             name = re.sub(r"[^A-Za-z0-9._-]", "_", f.name)[:100]
             try:
                 with f.open("rb") as fh:
@@ -346,6 +444,11 @@ def check(job: dict, spec: dict) -> str:
     for k, rx in SPEC_RULES.items():
         if not isinstance(spec.get(k, ""), str) or not rx.match(spec.get(k, "")):
             return f"bad {k}"
+    for k, rx in OPTIONAL_RULES.items():
+        if k in spec and (not isinstance(spec[k], str) or not rx.match(spec[k])):
+            return f"bad {k}"
+    if spec["action"] == "export" and not (spec.get("from") and spec.get("method")):
+        return "an export needs from and method"
     if spec["workspace"] != job.get("workspace") or spec["commit"] != job.get("commit"):
         return "the spec doesn't match the job"
     return ""
@@ -374,8 +477,13 @@ def job_script(spec: dict, share_root: str) -> str:
     elif action == "test":
         run = f"{args} test -resultBundlePath \"$OUT/result.xcresult\""
     else:
-        run = (f"{args} archive -archivePath \"$OUT/build.xcarchive\" CODE_SIGNING_ALLOWED=NO "
-               "CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=\"\"")
+        # Ad-hoc signed ("-"), so the binary carries the project's entitlements
+        # for export_build / sign_ipa to re-sign with; unsigned if that fails
+        team = f" DEVELOPMENT_TEAM={q(spec['team'])}" if spec.get("team") else ""
+        run = (f"{args} archive -archivePath \"$OUT/build.xcarchive\" CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual "
+               f"CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES PROVISIONING_PROFILE_SPECIFIER={team}")
+        unsigned = (f"{args} archive -archivePath \"$OUT/build.xcarchive\" CODE_SIGNING_ALLOWED=NO "
+                    "CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=\"\"")
     m = re.search(r"(?:^|,)name=([^,]+)", spec.get("destination", ""))
     device = q(m[1]) if m else "booted"
     lines = [
@@ -391,9 +499,16 @@ def job_script(spec: dict, share_root: str) -> str:
         f"cd \"$HOME/aio-src\"/{q(cd)} || exit 71",
         "xcodebuild -version",
         f"echo '$ ' {q(run)}",
-        f"{run}",
-        "rc=$?",
+        f"{run} 2>&1 | tee \"$OUT/first.log\"; rc=${{PIPESTATUS[0]}}" if action == "archive" else f"{run}; rc=$?",
     ]
+    if action == "archive":
+        lines += [
+            "if [ $rc != 0 ] && grep -qiE 'sign|provision' \"$OUT/first.log\"; then",
+            "  echo '== ad-hoc signing failed; archiving unsigned (no entitlements in the binary: signing uses the "
+            "profile'\\''s)'",
+            f"  rm -rf \"$OUT/build.xcarchive\"; {unsigned}; rc=$?",
+            "fi",
+        ]
     if action == "test":
         lines += ["xcrun xcresulttool get test-results summary --path \"$OUT/result.xcresult\" --compact "
                   "> \"$OUT/test-summary.json\" 2>/dev/null || rm -f \"$OUT/test-summary.json\""]
@@ -413,6 +528,51 @@ def job_script(spec: dict, share_root: str) -> str:
             "fi",
         ]
     lines += ["echo $rc > \"$OUT/exit_code\"", "exit $rc"]
+    return "\n".join(lines) + "\n"
+
+
+def export_script(spec: dict, share_root: str) -> str:
+    """An export, in the VM: the archive and the unsealed keys are in the
+    read-only share in/. A keychain of its own holds the certificate for
+    codesign; xcodebuild -exportArchive signs (and with keys/asc.p8 and an
+    upload destination in ExportOptions.plist, uploads). No project code runs."""
+    q = shlex.quote
+    lines = [
+        "set -uo pipefail",
+        f"SHARE={q(share_root)}",
+        "IN=\"$SHARE/in\"; K=\"$IN/keys\"; OUT=\"$HOME/aio-out\"; W=\"$HOME/aio-export\"",
+        "KC=\"$HOME/Library/Keychains/aio-export.keychain-db\"",
+        "PROFILES=(\"$HOME/Library/MobileDevice/Provisioning Profiles\" "
+        "\"$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles\")",
+        "rm -rf \"$OUT\" \"$W\"; mkdir -p \"$OUT\" \"$W\"",
+        "finish() { rc=$?; [ -f \"$OUT/exit_code\" ] || echo $rc > \"$OUT/exit_code\";",
+        "  cp \"$OUT/exit_code\" \"$SHARE/out/\" 2>/dev/null; cp \"$OUT\"/export/*.ipa \"$OUT\"/export/*.pkg \"$SHARE/out/\" 2>/dev/null;",
+        "  security delete-keychain \"$KC\" 2>/dev/null; rm -f \"${PROFILES[0]}\"/aio-* \"${PROFILES[1]}\"/aio-*; true; }",
+        "trap finish EXIT",
+        "cd \"$W\" && ditto -x -k \"$IN/build.xcarchive.zip\" . || exit 70",
+        "[ -d \"$W/build.xcarchive\" ] || { echo 'no build.xcarchive in the archive job'\\''s zip'; exit 70; }",
+        "KCPW=$(uuidgen)",
+        "security create-keychain -p \"$KCPW\" \"$KC\" && security set-keychain-settings -lut 3600 \"$KC\" "
+        "&& security unlock-keychain -p \"$KCPW\" \"$KC\" || exit 74",
+        "security import \"$K/cert.p12\" -k \"$KC\" -f pkcs12 -P \"$(cat \"$K/password\")\" -T /usr/bin/codesign "
+        "-T /usr/bin/security -T /usr/bin/productbuild >/dev/null || { echo \"couldn't import the certificate\"; exit 75; }",
+        "security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k \"$KCPW\" \"$KC\" >/dev/null || exit 76",
+        "security list-keychains -d user -s \"$KC\" $(security list-keychains -d user | tr -d '\"')",
+        "for d in \"${PROFILES[@]}\"; do mkdir -p \"$d\"; for p in \"$K\"/profiles/*.mobileprovision; do "
+        "cp \"$p\" \"$d/aio-$(basename \"$p\")\"; done; done",
+        "AUTH=()",
+        "if [ -f \"$K/asc.p8\" ]; then AUTH=(-authenticationKeyPath \"$K/asc.p8\" -authenticationKeyID "
+        "\"$(cat \"$K/asc_key_id\")\" -authenticationKeyIssuerID \"$(cat \"$K/asc_issuer_id\")\"); fi",
+        "xcodebuild -version",
+        "echo '$ xcodebuild -exportArchive' \"($(/usr/libexec/PlistBuddy -c 'Print :method' \"$K/ExportOptions.plist\"),"
+        " $(/usr/libexec/PlistBuddy -c 'Print :destination' \"$K/ExportOptions.plist\"))\"",
+        "xcodebuild -exportArchive -archivePath \"$W/build.xcarchive\" -exportPath \"$OUT/export\" "
+        "-exportOptionsPlist \"$K/ExportOptions.plist\" ${AUTH[@]+\"${AUTH[@]}\"}",
+        "rc=$?",
+        "ls -l \"$OUT/export\" 2>/dev/null",
+        "echo $rc > \"$OUT/exit_code\"",
+        "exit $rc",
+    ]
     return "\n".join(lines) + "\n"
 
 

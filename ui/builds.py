@@ -40,6 +40,7 @@ CONFIG_FILE = BUILDS_DIR / "config.json"
 UI_KEY = BUILDS_DIR / "ui_ed25519"
 KNOWN_HOSTS = BUILDS_DIR / "known_hosts"
 MCP_KEYS = BUILDS_DIR / "mcp"               # one per workspace with builds on: what nono injects
+WORKER_KEYS = BUILDS_DIR / "workers.json"   # {name: ssh public key}, as added here: vouches for seal keys
 MIRRORS = BUILDS_DIR / "mirrors"
 MCP_SOCK = RUNTIME / "builds-mcp.sock"      # the proxy service's bridge connects here
 ROUTE = "aio_build"                          # nono route: $AIO_BUILD_BASE_URL, $AIO_BUILD_KEY
@@ -52,13 +53,15 @@ HOST_RE = re.compile(r"^([a-z_][a-z0-9_-]{0,31}@)?([A-Za-z0-9][A-Za-z0-9.-]{0,25
 WORKER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 # The job spec; the build host and the worker check the same rules
 SPEC_RULES = {
-    "action": re.compile(r"^(build|test|run|archive)$"),
+    "action": re.compile(r"^(build|test|run|archive|export)$"),
     "scheme": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,99}$"),
     "project": re.compile(r"^$|^(?![/-])(?!.*(^|/)\.\.(/|$))[A-Za-z0-9 _.+/-]{1,200}$"),
     "destination": re.compile(r"^$|^[A-Za-z0-9 _.,=:()+/-]{1,200}$"),
     "configuration": re.compile(r"^$|^[A-Za-z0-9_-]{1,40}$"),
 }
 FINAL = {"passed", "failed", "error", "cancelled", "timeout", "abandoned"}
+TEAM_RE = re.compile(r"^[A-Z0-9]{10}$")
+METHODS = ("app-store-connect", "release-testing", "debugging", "enterprise")
 
 
 class BuildError(Exception):
@@ -319,8 +322,15 @@ def clean_spec(params: dict) -> dict:
         if not rx.match(v):
             raise BuildError(f"{k}: {'required' if not v else 'not allowed: ' + v[:60]}")
         spec[k] = v
+    if spec["action"] == "export":
+        raise BuildError("an export is export_build's: it signs an archive build")
     if spec["action"] in ("test", "run") and not spec["destination"].startswith("platform="):
         raise BuildError(f"{spec['action']} needs a destination, e.g. platform=iOS Simulator,name=iPhone 16")
+    team = str(params.get("team") or "").strip()
+    if team:
+        if spec["action"] != "archive" or not TEAM_RE.match(team):
+            raise BuildError("team: an archive's 10-character Apple team ID")
+        spec["team"] = team
     t = params.get("timeout_min", 60)
     try:
         t = int(t)
@@ -352,24 +362,120 @@ async def submit(ws: str, ws_dir: str, params: dict, by: str) -> dict:
         MIRRORS.mkdir(mode=0o700, parents=True, exist_ok=True)
         await git("init", "-q", "--bare", str(mirror), env=env)
     g = ("--git-dir", str(mirror), "-c", "core.hooksPath=/dev/null", "-c", "protocol.file.allow=always")
-    jid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3)
+    jid = new_job_id()
     tmp_ref = f"refs/src/{jid}"
     await git(*g, "fetch", "-q", "--no-tags", "--no-write-fetch-head", f"file://{src}",
               f"+{ref}:{tmp_ref}", env=env, timeout=600)
     try:
         commit = await git(*g, "rev-parse", "--verify", f"{tmp_ref}^{{commit}}", env=env)
-        spec.update(workspace=ws, commit=commit, by=by,
-                    submitted=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        msg = json.dumps(spec, indent=1, sort_keys=True) + "\n"
-        await git(*g, "-c", "user.name=agent-sandboxes", "-c", "user.email=builds@agent-sandboxes.invalid",
-                  "tag", "-a", "-F", "-", f"build/{jid}", commit, env=env, input=msg.encode())
-        await git(*g, "push", "-q", repo_url(ws), f"refs/tags/build/{jid}", env=env, timeout=900)
+        await push_job(ws, jid, spec, commit, by)
     finally:
         try:
             await git(*g, "update-ref", "-d", tmp_ref, env=env)
         except BuildError:
             pass
     return {"workspace": ws, "id": jid, "commit": commit, "spec": spec, "state": "queued"}
+
+
+def new_job_id() -> str:
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3)
+
+
+async def push_job(ws: str, jid: str, spec: dict, commit: str, by: str):
+    """Tag the commit (already in the workspace's mirror) build/<id> with the
+    job as the message, and push the tag."""
+    mirror = MIRRORS / f"{ws}.git"
+    env = git_env(MIRRORS)
+    g = ("--git-dir", str(mirror), "-c", "core.hooksPath=/dev/null")
+    spec.update(workspace=ws, commit=commit, by=by, submitted=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    msg = json.dumps(spec, indent=1, sort_keys=True) + "\n"
+    await git(*g, "-c", "user.name=agent-sandboxes", "-c", "user.email=builds@agent-sandboxes.invalid",
+              "tag", "-a", "-F", "-", f"build/{jid}", commit, env=env, input=msg.encode())
+    await git(*g, "push", "-q", repo_url(ws), f"refs/tags/build/{jid}", env=env, timeout=900)
+
+
+# ---------------------------------------------------------------- exports (signing on a Mac)
+def pinned_worker_keys() -> dict:
+    try:
+        return json.loads(WORKER_KEYS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def pin_worker_key(name: str, key: str | None):
+    keys = pinned_worker_keys()
+    if key:
+        keys[name] = " ".join(key.split()[:2])
+    else:
+        keys.pop(name, None)
+    BUILDS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = WORKER_KEYS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(keys, indent=1) + "\n")
+    tmp.chmod(0o600)
+    tmp.replace(WORKER_KEYS)
+
+
+async def seal_recipients() -> dict[str, str]:
+    """Workers whose seal key is signed by their ssh key (as pinned here)."""
+    import applesign
+    pinned = pinned_worker_keys()
+    missing = [w["name"] for w in monitor.workers() if w["name"] not in pinned]
+    if missing:          # added before keys were pinned here: take the build host's once
+        for k in (await call_json("worker-keys")).get("workers", []):
+            if k["name"] in missing:
+                pin_worker_key(k["name"], k["key"])
+        pinned = pinned_worker_keys()
+    out = {}
+    for w in monitor.workers():
+        if w.get("seal") and w["name"] in pinned and await asyncio.to_thread(
+                applesign.verify_seal_key, w["name"], pinned[w["name"]], w["seal"]):
+            out[w["name"]] = w["seal"]["pem"]
+    return out
+
+
+async def submit_export(ws: str, params: dict, policy: dict, asc_lookup, by: str) -> dict:
+    """An export job: sign archive job `from` with an identity, on a Mac."""
+    import applesign
+    src_id = str(params.get("from") or params.get("id") or "").strip()
+    check_job(ws, src_id)
+    iid = str(params.get("identity") or "").strip()
+    if iid not in policy["signing"]:
+        raise BuildError(f"Signing identity {iid!r} isn't assigned to this workspace"
+                         + (f" (it has: {', '.join(policy['signing'])})" if policy["signing"] else ""))
+    method = str(params.get("method") or "app-store-connect")
+    if method not in METHODS:
+        raise BuildError(f"method: one of {', '.join(METHODS)}")
+    upload = params.get("upload") in (True, "yes", "true")
+    if upload and method != "app-store-connect":
+        raise BuildError("Only an app-store-connect export can be uploaded")
+    asc = None
+    if upload:
+        asc = asc_lookup()
+        if not asc:
+            raise BuildError("Uploading needs an App Store Connect API key assigned to this workspace (Keys & tokens)")
+    src = await job(ws, src_id)
+    if src.get("spec", {}).get("action") != "archive" or src.get("state") != "passed":
+        raise BuildError(f"{src_id} isn't a passed archive build")
+    if "build.xcarchive.zip" not in src.get("artifacts", []):
+        raise BuildError(f"{src_id} has no build.xcarchive.zip")
+    recipients = await seal_recipients()
+    if not recipients:
+        raise BuildError("No Mac worker has a verified seal key yet: update the worker (buildhost/aio-build-worker, "
+                         "version 2+) and restart it; it registers one on start")
+    try:
+        files = await asyncio.to_thread(applesign.export_files, iid, method, asc)
+        sealed = await asyncio.to_thread(applesign.seal, files, recipients)
+    except applesign.SignError as e:
+        raise BuildError(str(e)) from None
+    jid = new_job_id()
+    await call_json("seal", ws, jid, input=sealed)
+    t = params.get("timeout_min", 30)
+    spec = {"v": 1, "action": "export", "scheme": src["spec"].get("scheme", ""), "project": "", "destination": "",
+            "configuration": "", "from": src_id, "method": method, "upload": "yes" if upload else "no",
+            "identity": iid, "timeout_min": max(1, min(240, int(t) if str(t).isdigit() else 30))}
+    await push_job(ws, jid, spec, src["commit"], by)
+    return {"workspace": ws, "id": jid, "commit": src["commit"], "spec": spec, "state": "queued",
+            "workers": sorted(recipients)}
 
 
 # ---------------------------------------------------------------- job ops
@@ -414,12 +520,14 @@ async def add_worker(name: str, key: str):
     if not WORKER_RE.match(name):
         raise BuildError("Worker name: lowercase letters, digits and -")
     await call_json("add-worker", name, input=key.strip().encode())
+    pin_worker_key(name, key)
 
 
 async def remove_worker(name: str):
     if not WORKER_RE.match(name):
         raise BuildError("bad worker name")
     await call_json("remove-worker", name)
+    pin_worker_key(name, None)
 
 
 # ---------------------------------------------------------------- into the workspace
@@ -511,6 +619,42 @@ async def fetch_artifact(ws: str, ws_dir: str, jid: str, name: str) -> str:
             await proc.wait()
 
 
+def asc_key_for(ws: str) -> dict | None:
+    """The first App Store Connect key assigned to the workspace: for an upload."""
+    from common import load_policy, token_meta, SECRETS as S
+    for tid in load_policy(ws)["tokens"]:
+        if (m := token_meta(tid)) and m.get("service") == "appstoreconnect":
+            return {"p8": (S / "tokens" / tid).read_bytes(), "key_id": m["key_id"], "issuer_id": m["issuer_id"]}
+    return None
+
+
+def open_in_workspace(ws_dir: str, rel: str) -> int:
+    """A read-only fd for a regular file in the project, never through a symlink."""
+    parts = [p for p in rel.strip().split("/") if p not in ("", ".")]
+    if not parts or ".." in parts or rel.startswith("/") or len(parts) > 40:
+        raise BuildError("path: a file inside the project folder, relative to it")
+    fd = os.open(ws_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                raise BuildError(f"{part}: not a plain folder in the project") from None
+            os.close(fd)
+            fd = nfd
+        try:
+            ffd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError:
+            raise BuildError(f"{rel}: no such file (or a symlink)") from None
+        import stat
+        if not stat.S_ISREG(os.fstat(ffd).st_mode):
+            os.close(ffd)
+            raise BuildError(f"{rel}: not a regular file")
+        return ffd
+    finally:
+        os.close(fd)
+
+
 def remove_workspace(ws: str):
     mcp_key_path(ws).unlink(missing_ok=True)
     shutil.rmtree(MIRRORS / f"{ws}.git", ignore_errors=True)
@@ -525,7 +669,9 @@ INSTRUCTIONS = (
     "VM that is deleted afterwards. It builds a commit of this workspace's git repository (HEAD by default): "
     "commit your changes first, uncommitted changes aren't sent. Typical loop: apple_build, then "
     "build_status with wait_seconds until it finishes, then build_log / build_result. Builds are unsigned "
-    "(no App Store or device signing here).")
+    "(ad-hoc). Signing, with an identity the user assigned to this workspace (you never get its keys): "
+    "export_build signs an archive build on the Mac with Xcode, and can upload it to TestFlight; sign_ipa "
+    "re-signs an .ipa or app on the host. get_artifact copies a build's output into the project.")
 
 TOOLS = [
     {"name": "apple_build",
@@ -544,7 +690,37 @@ TOOLS = [
          "configuration": {"type": "string", "description": "Debug or Release (the scheme's default if empty)"},
          "ref": {"type": "string", "description": "branch or tag to build (default HEAD)"},
          "repo": {"type": "string", "description": "the repo's folder within the project, if not the top"},
+         "team": {"type": "string", "description": "archive only: the Apple team ID (DEVELOPMENT_TEAM), "
+                                                   "e.g. that of the signing identity"},
          "timeout_min": {"type": "integer", "minimum": 1, "maximum": 240, "default": 60}}}},
+    {"name": "export_build",
+     "description": "Sign a passed archive build with one of this workspace's Apple signing identities, on a Mac "
+                    "with xcodebuild -exportArchive (a fresh VM; no project code runs; the keys are sealed for "
+                    "that job). method app-store-connect (App Store / TestFlight), release-testing (ad hoc), "
+                    "debugging (development) or enterprise picks the identity's profiles of that type. "
+                    "upload: send it to App Store Connect (TestFlight) with the workspace's App Store Connect key; "
+                    "otherwise the signed .ipa is the job's artifact (get_artifact). Returns the export's job id.",
+     "inputSchema": {"type": "object", "required": ["from", "identity"], "properties": {
+         "from": {"type": "string", "description": "the archive build's id"},
+         "identity": {"type": "string", "description": "a signing identity assigned to this workspace"},
+         "method": {"type": "string", "enum": ["app-store-connect", "release-testing", "debugging", "enterprise"],
+                    "default": "app-store-connect"},
+         "upload": {"type": "boolean", "default": False},
+         "timeout_min": {"type": "integer", "minimum": 1, "maximum": 240, "default": 30}}}},
+    {"name": "sign_ipa",
+     "description": "Re-sign an app on the host with rcodesign and a signing identity assigned to this workspace, "
+                    "embedding one of its provisioning profiles. Input: a file in the project (path: an .ipa, a "
+                    "zipped .xcarchive or a zipped .app) or a build's artifact (id + name). The entitlements signed "
+                    "in are the app's own as far as the profile grants them (what's dropped is reported). Writes "
+                    ".aio-builds/signed/<name>.ipa (.zip for a macOS app) in the project.",
+     "inputSchema": {"type": "object", "required": ["identity", "profile"], "properties": {
+         "path": {"type": "string", "description": "a file in the project, relative to its folder"},
+         "id": {"type": "string", "description": "or: a build's id …"},
+         "name": {"type": "string", "description": "… and its artifact's name"},
+         "identity": {"type": "string"},
+         "profile": {"type": "string", "description": "the profile's UUID, name or bundle ID (the app's); "
+                                                      "extensions use the identity's profile for their own bundle ID"},
+         "output": {"type": "string", "description": "file name to write (default: <app>-<identity>.ipa)"}}}},
     {"name": "build_status",
      "description": "One build's state (queued, running, passed, failed, error, cancelled, timeout), or with no id "
                     "the recent builds and whether a Mac worker is online. wait_seconds (up to 100) waits for "
@@ -651,6 +827,21 @@ async def tool_call(ws: str, ws_dir: str, name: str, args: dict) -> dict:
                 content.append({"type": "text", "text": "Artifacts (get_artifact copies one into the project): "
                                 + ", ".join(j["artifacts"])})
             return {"content": content}
+        if name == "export_build":
+            from common import load_policy
+            j = await submit_export(ws, args, load_policy(ws), lambda: asc_key_for(ws), "agent")
+            return text(f"Queued export {j['id']} of {j['spec']['from']} ({j['spec']['method']}"
+                        f"{', upload to App Store Connect' if j['spec']['upload'] == 'yes' else ''}), sealed for "
+                        f"{', '.join(j['workers'])}. Next: build_status with id and wait_seconds"
+                        + ("." if j["spec"]["upload"] == "yes" else "; then get_artifact for the .ipa."))
+        if name == "sign_ipa":
+            import applesign
+            from common import load_policy
+            try:
+                rel, notes = await applesign.sign_on_host(ws, ws_dir, load_policy(ws), args)
+            except applesign.SignError as e:
+                return text(str(e), True)
+            return text(f"Signed: {rel} in the project folder." + (f"\n{notes}" if notes else ""))
         if name == "get_artifact":
             jid, art = str(args.get("id") or ""), str(args.get("name") or "")
             rel = await fetch_artifact(ws, ws_dir, jid, art)

@@ -1,0 +1,7 @@
+# rcodesign for sign_ipa (bin/install-rcodesign): apple-codesign from
+# https://github.com/indygreg/apple-platform-rs/releases
+RCODESIGN_VERSION=0.29.0
+# sha256 of apple-codesign-<version>-<arch>-unknown-linux-musl.tar.gz; empty: the
+# release's own .sha256 is checked, and the installer prints the hash to pin here
+RCODESIGN_SHA256_X86_64=
+RCODESIGN_SHA256_AARCH64=

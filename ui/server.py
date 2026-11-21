@@ -2176,12 +2176,22 @@ async def builds_ws_api(ws: dict[str, str], req: Request, parts: list[str], w):
     name, m = ws["WS_NAME"], req.method
     try:
         if parts == [] and m == "GET":
-            return await send_json(w, {"enabled": load_policy(name)["builds"], "jobs": builds.monitor.jobs(name),
+            pol = load_policy(name)
+            return await send_json(w, {"enabled": pol["builds"], "jobs": builds.monitor.jobs(name),
+                                       "signing": [{"id": im["id"], "name": im["name"]} for i in pol["signing"]
+                                                   if (im := applesign.meta(i))],
                                        **builds.overview()})
         if parts == [] and m == "POST":
             if not load_policy(name)["builds"]:
                 raise builds.BuildError("Turn on Apple builds for this workspace first (Access tab)")
             job = await builds.submit(name, ws["WS_DIR"], json.loads(req.body or b"{}"), "ui")
+            return await send_json(w, job)
+        if parts == ["export"] and m == "POST":
+            pol = load_policy(name)
+            if not pol["builds"]:
+                raise builds.BuildError("Turn on Apple builds for this workspace first (Access tab)")
+            job = await builds.submit_export(name, json.loads(req.body or b"{}"), pol,
+                                             lambda: builds.asc_key_for(name), "ui")
             return await send_json(w, job)
         if len(parts) == 1 and m == "GET":
             return await send_json(w, await builds.job(name, parts[0]))
