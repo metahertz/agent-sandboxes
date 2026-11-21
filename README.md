@@ -369,7 +369,7 @@ builds commits only: uncommitted changes aren't sent. A repo whose `.git` borrow
 from elsewhere (alternates, symlinks) is refused. The *Builds* tab shows the same jobs, with
 live logs, screenshots, artifacts, and a form to queue one yourself.
 
-**Setting it up** (*Settings → Apple builds → Set up a build host and Mac workers* has these steps,
+**Setting it up** (*Build workers → Apple builds → Set up a build host and Mac workers* has these steps,
 with the commands filled in and downloads of the installers for another build host and for the Mac):
 
 1. On this host: `bin/install-buildhost`. It needs an ssh server, and it:
@@ -379,11 +379,11 @@ with the commands filled in and downloads of the installers for another build ho
    - points the UI at `aiogit@127.0.0.1`.
 
    For a build host elsewhere, run `bin/install-buildhost --ui-key '<key>'` there, with
-   the key shown under *Settings → Apple builds*, and set its address in that card.
-2. Restart the UI. *Settings → Apple builds* should say *connected*.
+   the key shown under *Build workers → Apple builds*, and set its address in that card.
+2. Restart the UI. *Build workers → Apple builds* should say *connected*.
 3. On the Mac (Apple silicon, [Tart](https://tart.run) installed):
    `buildhost/install-worker --host aiogit@<this host>`. It sets up `~/.aio-build` and a
-   LaunchAgent, and prints the worker's key. Add that key under *Settings → Apple builds →
+   LaunchAgent, and prints the worker's key. Add that key under *Build workers → Apple builds →
    Mac workers*. Then `tart pull` the image once.
 4. Tick *Apple builds* in a workspace's Access tab and restart its agent.
 
@@ -469,6 +469,8 @@ The agent signs in one of two ways:
 
 ![Settings: HTTPS CA download, monitoring, local Grafana, telemetry, and the CLAUDE.md notes editor](docs/screenshots/settings.png)
 
+- **Build workers** (sidebar): the build host and Mac workers for Apple builds. See
+  [Apple builds](#apple-builds).
 - **Settings** (sidebar): monitoring — dashboards link, local or external Prometheus /
   Loki, local Grafana address and retention, Claude Code telemetry — with *Save & apply*
   and *Stop monitoring*. See [Monitoring](#monitoring).

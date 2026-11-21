@@ -53,6 +53,9 @@
       <button id="host-btn" class="ws-item pool-item" type="button" aria-current="false">
         <span class="n">Host</span><span class="sub">A shell on this host; update and restart the setup</span>
       </button>
+      <button id="workers-btn" class="ws-item pool-item" type="button" aria-current="false">
+        <span class="n">Build workers</span><span class="sub">Build host and Mac workers for Apple builds</span>
+      </button>
       <button id="settings-btn" class="ws-item pool-item" type="button" aria-current="false">
         <span class="n">Settings</span><span class="sub">Sign-in, monitoring, backups and sandbox notes</span>
       </button>
@@ -202,7 +205,7 @@
           <section class="card">
             <h2>Apple builds</h2>
             <label class="check"><input type="checkbox" name="builds"> <span>Let the agent build, test and run this repo's Xcode project on the Mac build worker <span class="muted">(the aio-builds MCP server)</span></span></label>
-            <p class="hint">Each job is a commit of the project's git repository, pushed by this host to the build host and run by a Mac worker in a fresh macOS VM that's deleted afterwards. The agent gets MCP tools only, never a key or a connection to the build host or the Mac. Set up the build host and workers under Settings → Apple builds. Restart the agent to apply.</p>
+            <p class="hint">Each job is a commit of the project's git repository, pushed by this host to the build host and run by a Mac worker in a fresh macOS VM that's deleted afterwards. The agent gets MCP tools only, never a key or a connection to the build host or the Mac. Set up the build host and workers under Build workers. Restart the agent to apply.</p>
           </section>
           <section class="card vm-only">
             <h2>Browser container</h2>
@@ -495,6 +498,59 @@
       </div>
     </section>
 
+    <section id="workers" class="pool" hidden>
+      <header class="detail-head"><div class="title">
+        <h1>Build workers</h1>
+        <p class="meta">Machines outside this host that build workspaces' code for platforms it can't: Apple (Xcode) on Macs, for now.</p>
+      </div></header>
+
+      <div class="pool-body">
+      <div class="settings-form">
+        <section class="card" id="builds-card">
+          <div class="card-head"><h2>Apple builds</h2><span class="pill" id="bh-state">…</span></div>
+          <p class="hint">Xcode builds for workspaces with Apple builds ticked. There are three parts: this host queues each job (a commit, tagged <code>build/&lt;id&gt;</code>); the <strong>build host</strong>, a plain git queue over ssh between this host and the Macs, keeps the jobs, logs and results (usually this machine, set up by <code>bin/install-buildhost</code>); and <strong>Mac workers</strong> connect out to it, take jobs and run each in a throwaway Tart VM (set up by <code>buildhost/install-worker</code>).</p>
+          <p class="hint">Nothing here can reach a Mac: Macs only connect out, so they can sleep or sit behind NAT and pick jobs up when back, and several can share the queue. Put the build host on another Linux host only if the Macs can't reach this machine's ssh port.</p>
+          <form id="bh-form" class="b-form">
+            <div class="row">
+              <label>Build host <input name="host" placeholder="aiogit@127.0.0.1" autocomplete="off" spellcheck="false"></label>
+              <label>Port <input name="port" type="number" min="1" max="65535" value="22"></label>
+            </div>
+            <div class="row"><button class="btn primary" type="submit">Save</button>
+              <button class="btn" type="button" id="bh-test">Test connection</button></div>
+          </form>
+          <p class="hint">This host's key, for the build host's <code>aio-buildd ui-key</code> (the installer adds it for a build host on this machine):</p>
+          <span class="g-copy"><code id="bh-key"></code> <button class="btn" type="button" id="bh-copy">Copy</button></span>
+          <details class="bh-setup" id="bh-setup">
+            <summary>Set up a build host and Mac workers</summary>
+            <h3>1. The build host (the queue)</h3>
+            <p class="hint"><strong>On this machine</strong> (the usual case), in the agent-sandboxes folder; it needs an ssh server. It creates the <code>aiogit</code> user, gives this host's key the ui role and fills in the form above:</p>
+            <div class="bh-cmd"><code>bin/install-buildhost &amp;&amp; sudo systemctl restart agent-sandboxes-ui</code> <button class="btn" type="button" data-copy>Copy</button></div>
+            <p class="hint"><strong>Or on another Linux host</strong> with git and an ssh server: download the installer there, run it with this host's key, then set its address above as <code>aiogit@&lt;that host&gt;</code> and <em>Test connection</em>.</p>
+            <div class="row"><a class="btn" href="/api/builds/download/buildhost" download>⬇ aio-buildhost.tar.gz</a></div>
+            <div class="bh-cmd"><code id="bh-cmd-host"></code> <button class="btn" type="button" data-copy>Copy</button></div>
+            <h3>2. A Mac worker</h3>
+            <p class="hint">On a Mac with Apple silicon, <a href="https://tart.run" target="_blank" rel="noopener">Tart</a> and Python 3.9+ (<code>xcode-select --install</code>), logged in as the user whose VMs it should use. It only connects out, to the build host's ssh port, which must be reachable from the Mac. Download the worker, then run:</p>
+            <div class="row"><a class="btn" href="/api/builds/download/worker" download>⬇ aio-build-worker.tar.gz</a></div>
+            <div class="bh-cmd"><code id="bh-cmd-mac"></code> <button class="btn" type="button" data-copy>Copy</button></div>
+            <p class="hint">It installs into <code>~/.aio-build</code> with a LaunchAgent, and prints the worker's name and key: add them under <em>Mac workers</em> below. Then pull the image once (<code>tart pull ghcr.io/cirruslabs/macos-sequoia-xcode:latest</code>), so the first build doesn't wait for it.</p>
+            <h3>3. A workspace</h3>
+            <p class="hint">Tick <em>Apple builds</em> on its Access tab and restart its agent.</p>
+          </details>
+          <h3>Mac workers</h3>
+          <div class="keylist" id="bh-workers"></div>
+          <form id="bh-add" class="b-form">
+            <div class="row">
+              <label>Name <input name="name" placeholder="mac-mini" autocomplete="off" spellcheck="false"></label>
+              <label>Public key <span class="muted">(the one <code>install-worker</code> printed)</span> <input name="key" placeholder="ssh-ed25519 AAAA…" autocomplete="off" spellcheck="false"></label>
+            </div>
+            <div class="row"><button class="btn" type="submit">Add worker</button></div>
+          </form>
+          <p class="form-msg" id="bh-msg" role="status"></p>
+        </section>
+      </div>
+      </div>
+    </section>
+
     <section id="settings" class="pool" hidden>
       <header class="detail-head"><div class="title">
         <h1>Settings</h1>
@@ -671,49 +727,6 @@
           <p class="hint" style="margin-top:10px">To restore, copy a tarball back, look inside with <code>tar -tf FILE</code>, then extract to a scratch folder (<code>tar -xf FILE -C DIR</code>) or in place (<code>-C /</code>; stop the UI and Claude first). Paths are stored relative to <code>/</code>, and <code>BACKUP-MANIFEST.json</code> lists what's inside.</p>
           <h3>Recent runs</h3>
           <div class="matrix-wrap"><table class="matrix" id="bk-runs"></table></div>
-        </section>
-      </div>
-      <div class="settings-form">
-        <section class="card" id="builds-card">
-          <div class="card-head"><h2>Apple builds</h2><span class="pill" id="bh-state">…</span></div>
-          <p class="hint">Xcode builds for workspaces with Apple builds ticked. There are three parts: this host queues each job (a commit, tagged <code>build/&lt;id&gt;</code>); the <strong>build host</strong>, a plain git queue over ssh between this host and the Macs, keeps the jobs, logs and results (usually this machine, set up by <code>bin/install-buildhost</code>); and <strong>Mac workers</strong> connect out to it, take jobs and run each in a throwaway Tart VM (set up by <code>buildhost/install-worker</code>).</p>
-          <p class="hint">Nothing here can reach a Mac: Macs only connect out, so they can sleep or sit behind NAT and pick jobs up when back, and several can share the queue. Put the build host on another Linux host only if the Macs can't reach this machine's ssh port.</p>
-          <form id="bh-form" class="b-form">
-            <div class="row">
-              <label>Build host <input name="host" placeholder="aiogit@127.0.0.1" autocomplete="off" spellcheck="false"></label>
-              <label>Port <input name="port" type="number" min="1" max="65535" value="22"></label>
-            </div>
-            <div class="row"><button class="btn primary" type="submit">Save</button>
-              <button class="btn" type="button" id="bh-test">Test connection</button></div>
-          </form>
-          <p class="hint">This host's key, for the build host's <code>aio-buildd ui-key</code> (the installer adds it for a build host on this machine):</p>
-          <span class="g-copy"><code id="bh-key"></code> <button class="btn" type="button" id="bh-copy">Copy</button></span>
-          <details class="bh-setup" id="bh-setup">
-            <summary>Set up a build host and Mac workers</summary>
-            <h3>1. The build host (the queue)</h3>
-            <p class="hint"><strong>On this machine</strong> (the usual case), in the agent-sandboxes folder; it needs an ssh server. It creates the <code>aiogit</code> user, gives this host's key the ui role and fills in the form above:</p>
-            <div class="bh-cmd"><code>bin/install-buildhost &amp;&amp; sudo systemctl restart agent-sandboxes-ui</code> <button class="btn" type="button" data-copy>Copy</button></div>
-            <p class="hint"><strong>Or on another Linux host</strong> with git and an ssh server: download the installer there, run it with this host's key, then set its address above as <code>aiogit@&lt;that host&gt;</code> and <em>Test connection</em>.</p>
-            <div class="row"><a class="btn" href="/api/builds/download/buildhost" download>⬇ aio-buildhost.tar.gz</a></div>
-            <div class="bh-cmd"><code id="bh-cmd-host"></code> <button class="btn" type="button" data-copy>Copy</button></div>
-            <h3>2. A Mac worker</h3>
-            <p class="hint">On a Mac with Apple silicon, <a href="https://tart.run" target="_blank" rel="noopener">Tart</a> and Python 3.9+ (<code>xcode-select --install</code>), logged in as the user whose VMs it should use. It only connects out, to the build host's ssh port, which must be reachable from the Mac. Download the worker, then run:</p>
-            <div class="row"><a class="btn" href="/api/builds/download/worker" download>⬇ aio-build-worker.tar.gz</a></div>
-            <div class="bh-cmd"><code id="bh-cmd-mac"></code> <button class="btn" type="button" data-copy>Copy</button></div>
-            <p class="hint">It installs into <code>~/.aio-build</code> with a LaunchAgent, and prints the worker's name and key: add them under <em>Mac workers</em> below. Then pull the image once (<code>tart pull ghcr.io/cirruslabs/macos-sequoia-xcode:latest</code>), so the first build doesn't wait for it.</p>
-            <h3>3. A workspace</h3>
-            <p class="hint">Tick <em>Apple builds</em> on its Access tab and restart its agent.</p>
-          </details>
-          <h3>Mac workers</h3>
-          <div class="keylist" id="bh-workers"></div>
-          <form id="bh-add" class="b-form">
-            <div class="row">
-              <label>Name <input name="name" placeholder="mac-mini" autocomplete="off" spellcheck="false"></label>
-              <label>Public key <span class="muted">(the one <code>install-worker</code> printed)</span> <input name="key" placeholder="ssh-ed25519 AAAA…" autocomplete="off" spellcheck="false"></label>
-            </div>
-            <div class="row"><button class="btn" type="submit">Add worker</button></div>
-          </form>
-          <p class="form-msg" id="bh-msg" role="status"></p>
         </section>
       </div>
 

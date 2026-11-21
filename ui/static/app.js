@@ -7,8 +7,9 @@ const POOL_HASH = "#~keys";
 const SETTINGS_HASH = "#~settings";
 const IMPORT_HASH = "#~import";
 const HOST_HASH = "#~host";
-const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings", [IMPORT_HASH]: "import", [HOST_HASH]: "host" };
-const PAGES = { pool: "#pool", import: "#import", host: "#host", settings: "#settings" };   // view -> section
+const WORKERS_HASH = "#~workers";
+const VIEW_OF_HASH = { [POOL_HASH]: "pool", [SETTINGS_HASH]: "settings", [IMPORT_HASH]: "import", [HOST_HASH]: "host", [WORKERS_HASH]: "workers" };
+const PAGES = { pool: "#pool", import: "#import", host: "#host", workers: "#workers", settings: "#settings" };   // view -> section
 const state = {
   workspaces: [],
   view: VIEW_OF_HASH[location.hash] || "ws",
@@ -160,7 +161,7 @@ function select(name) {
   if (state.tab === "builds") loadBuilds(true);
 }
 
-const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), host: () => loadHost(), settings: () => loadSettings() };
+const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), host: () => loadHost(), workers: () => loadBuildHost(), settings: () => loadSettings() };
 
 function showPage(view) {
   state.view = view;
@@ -811,7 +812,7 @@ async function loadBuilds(fresh = false) {
   catch (e) { $("#b-status").textContent = e.message; bstate.timer = setTimeout(loadBuilds, 10000); return; }
   const online = r.workers.filter((x) => x.online);
   bstate.signing = r.signing || [];
-  $("#b-status").textContent = !r.host ? "No build host set up yet: Settings → Apple builds."
+  $("#b-status").textContent = !r.host ? "No build host set up yet: Build workers → Apple builds."
     : !r.connected ? `Build host ${r.host}: not connected${r.error ? ` (${r.error})` : ""}`
       : `Build host ${r.host} · Mac workers: ${r.workers.map((x) => `${x.name} (${x.online ? "online" : "offline"})`).join(", ") || "none yet"}`
         + (online.length ? "" : " · jobs wait in the queue until a worker is online");
@@ -945,7 +946,7 @@ $("#b-form").addEventListener("submit", async (ev) => {
   } catch (e) { bMsg(e.message, true); }
 });
 
-// ------------------------------------------------------------------ Apple builds (Settings: build host, workers)
+// ------------------------------------------------------------------ Apple builds (Build workers page: build host, Mac workers)
 
 function bhMsg(text, isErr = false) { const e = $("#bh-msg"); e.textContent = text; e.classList.toggle("err", isErr); }
 
@@ -1625,7 +1626,6 @@ $("#auth-logout-others").addEventListener("click", async () => {
 
 async function loadSettings() {
   loadAuth();
-  loadBuildHost();
   try {
     const st = await api("GET", "settings/monitoring");
     loadClaudeMd();

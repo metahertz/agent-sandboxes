@@ -123,7 +123,7 @@ def repo_url(ws: str) -> str:
 
 async def call(*cmd: str, input: bytes | None = None, timeout: float = 30) -> bytes:
     if not config()["host"]:
-        raise BuildError("No build host set up (Settings → Apple builds)")
+        raise BuildError("No build host set up (Build workers → Apple builds)")
     p = await asyncio.create_subprocess_exec(
         *ssh_base(), config()["host"], " ".join(shlex.quote(c) for c in cmd),
         stdin=asyncio.subprocess.PIPE if input is not None else asyncio.subprocess.DEVNULL,
@@ -346,7 +346,7 @@ async def submit(ws: str, ws_dir: str, params: dict, by: str) -> dict:
     if not WS_RE.match(ws):
         raise BuildError("bad workspace")
     if not config()["host"]:
-        raise BuildError("No build host is set up (Settings → Apple builds)")
+        raise BuildError("No build host is set up (Build workers → Apple builds)")
     spec = clean_spec(params)
     ref = str(params.get("ref") or "HEAD").strip()
     sub = str(params.get("repo") or "").strip().strip("/")

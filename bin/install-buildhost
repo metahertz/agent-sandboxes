@@ -7,7 +7,7 @@
 #                                         UI its key and points it here
 #   bin/install-buildhost --ui-key 'ssh-ed25519 AAAA…'
 #                                         on another Linux host, with the key
-#                                         the UI shows (Settings → Apple builds);
+#                                         the UI shows (Build workers → Apple builds);
 #                                         then set this host in the UI
 #
 # Options: --user NAME (default aiogit), --home DIR (default /var/lib/NAME).
@@ -33,7 +33,7 @@ note() { printf '\033[33m    %s\033[0m\n' "$*"; }
 
 if [[ $(uname -s) == Darwin ]]; then
   echo "This sets up the build host (the git queue), on Linux: run it on the agent-sandboxes host." >&2
-  echo "On a Mac, set up a worker instead: buildhost/install-worker (Settings → Apple builds, step 2)." >&2
+  echo "On a Mac, set up a worker instead: buildhost/install-worker (Build workers → Apple builds, step 2)." >&2
   exit 1
 fi
 [[ -f $SRC ]] || { echo "can't find $SRC" >&2; exit 1; }
@@ -85,8 +85,8 @@ if (( LOCAL )); then
     fi
   fi
   note "Restart the web UI to pick it up: sudo systemctl restart agent-sandboxes-ui"
-  note "Then add a Mac: run buildhost/install-worker on it, and paste its key under Settings → Apple builds."
+  note "Then add a Mac: run buildhost/install-worker on it, and paste its key under Build workers → Apple builds."
   note "The Mac connects to this host's ssh port ($port) as $GUSER: it must be reachable from the Mac."
 else
-  say "Done. In the web UI (Settings → Apple builds), set the build host to $GUSER@$(hostname -f 2>/dev/null || hostname)"
+  say "Done. In the web UI (Build workers → Apple builds), set the build host to $GUSER@$(hostname -f 2>/dev/null || hostname)"
 fi

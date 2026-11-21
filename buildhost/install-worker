@@ -7,7 +7,7 @@
 #
 # Installs into ~/.aio-build: the worker, its ssh key, config.json, and a
 # LaunchAgent that keeps it running while you're logged in. Prints the key
-# to add under Settings → Apple builds in the web UI. Needs Tart
+# to add under Build workers → Apple builds in the web UI. Needs Tart
 # (https://tart.run; 2.x with `tart exec`) and an image with Xcode and the
 # Tart guest agent (Cirrus Labs' *-xcode images have both).
 set -euo pipefail
@@ -76,7 +76,7 @@ launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
 echo
-echo "Installed. In the web UI, Settings → Apple builds → Mac workers, add:"
+echo "Installed. In the web UI, Build workers → Apple builds → Mac workers, add:"
 echo "  name: $NAME"
 echo "  key:  $(cat "$D/worker_ed25519.pub")"
 echo
