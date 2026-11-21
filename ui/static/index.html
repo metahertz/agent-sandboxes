@@ -172,6 +172,11 @@
             <div class="checks" id="acc-tokens"></div>
           </section>
           <section class="card">
+            <h2>Apple signing</h2>
+            <p class="hint">Identities Claude may have things signed with, through the <code>aio-builds</code> MCP server (so Apple builds must be on too). Claude never gets the key or the .p12. Applies at once.</p>
+            <div class="checks" id="acc-signing"></div>
+          </section>
+          <section class="card">
             <h2>Network</h2>
             <p class="hint">Outbound traffic from Claude and everything it runs passes through nono's filtering proxy. An allowed host is reachable on any port, unless you list it with ports: then only those (port changes apply at once, the rest when Claude restarts). Programs that ignore <code>HTTPS_PROXY</code> (database clients, for example) can't connect; SSH and git are set up to use it. Restart Claude to apply.</p>
             <div class="radios" id="acc-net"></div>
@@ -392,6 +397,25 @@
             <p class="form-msg" role="status"></p>
           </form>
           <div class="matrix-wrap"><table class="matrix" id="m-tokens"></table></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>Apple signing</h2>
+            <button class="btn" type="button" data-add="signing">+ Add identity</button></div>
+          <p class="hint">A signing certificate with its private key (<code>.p12</code>) and its provisioning profiles, for workspaces with Apple builds. They stay on this host: a key is used for signing, which no proxy can do on the agent's behalf, so the agent asks the <code>aio-builds</code> MCP server instead. <code>export_build</code> signs an archive on a Mac with Xcode (sealed for that one job, deleted with its VM) and can upload it to TestFlight with an App Store Connect key; <code>sign_ipa</code> re-signs on this host with rcodesign.</p>
+          <form class="add-form" id="add-signing" hidden>
+            <div class="row">
+              <label>Name <input name="id" required pattern="[a-z0-9][a-z0-9\-]{0,39}" placeholder="acme-distribution" autocomplete="off"></label>
+              <label>Certificate (.p12) <input type="file" name="p12" accept=".p12,.pfx" required></label>
+              <label>Its password <input name="password" type="password" autocomplete="off"></label>
+            </div>
+            <label>Provisioning profiles <span class="muted">(.mobileprovision; more can be added later)</span> <input type="file" name="profiles" accept=".mobileprovision,.provisionprofile" multiple></label>
+            <p class="hint">Export the certificate from Keychain Access (My Certificates → the certificate → Export, as .p12); download profiles from developer.apple.com → Certificates, IDs &amp; Profiles → Profiles.</p>
+            <div class="row"><button class="btn primary" type="submit">Add</button>
+              <button class="btn ghost" type="button" data-cancel>Cancel</button></div>
+            <p class="form-msg" role="status"></p>
+          </form>
+          <div class="matrix-wrap"><table class="matrix" id="m-signing"></table></div>
         </section>
         <p class="form-msg" id="pool-msg" role="status"></p>
       </div>

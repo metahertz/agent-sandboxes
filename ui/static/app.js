@@ -1030,6 +1030,11 @@ async function loadAccess() {
     tok.replaceChildren(...pool.tokens.map((t) =>
       checkItem("token", t.id, policy.tokens.includes(t.id), t.id, `${t.label} → $${t.env_var}`)));
     if (!pool.tokens.length) tok.append(el("p", { className: "muted", textContent: "No API tokens in the pool yet — add one under Keys & tokens." }));
+    const sig = $("#acc-signing");
+    sig.replaceChildren(...(pool.signing || []).map((s) =>
+      checkItem("signing", s.id, (policy.signing || []).includes(s.id), s.id,
+        `${s.name} · ${s.profiles.map((p) => `${p.bundle_id} (${p.type})`).join(", ") || "no profiles"}`)));
+    if (!(pool.signing || []).length) sig.append(el("p", { className: "muted", textContent: "No signing identities yet — add one under Keys & tokens." }));
     $("#acc-net").replaceChildren(...Object.entries(pool.netModes).map(([mode, desc]) =>
       el("label", { className: "check" }, el("input", { type: "radio", name: "mode", value: mode, checked: policy.network.mode === mode }),
         el("span", {}, el("strong", { textContent: mode }), " ", el("span", { className: "muted", textContent: desc })))));
@@ -1063,6 +1068,7 @@ async function saveAccess(restart) {
   const body = {
     ssh_keys: $$('input[name="ssh"]:checked', form).map((i) => i.value),
     tokens: $$('input[name="token"]:checked', form).map((i) => i.value),
+    signing: $$('input[name="signing"]:checked', form).map((i) => i.value),
     network: { mode: form.elements.mode?.value || "claude-code", allow: lines(form.elements.allow.value), deny: lines(form.elements.deny.value),
       container: form.elements.container.value || "open", listen: lines(form.elements.listen.value) },
     limits: { memory: form.elements.memory.value.trim(), pids: Number(form.elements.pids.value || 0),
@@ -1106,7 +1112,7 @@ function poolMsg(text, isErr = false) {
 
 function renderMatrix(table, kind, items, describe) {
   const wss = poolData.workspaces;
-  const head = el("tr", {}, el("th", { textContent: kind === "ssh" ? "Key" : "Token" }),
+  const head = el("tr", {}, el("th", { textContent: { ssh: "Key", tokens: "Token", signing: "Identity" }[kind] }),
     ...wss.map((n) => el("th", { className: "ws-col", textContent: n, title: n })), el("th"));
   const rows = items.map((it) => {
     const tds = wss.map((n) => {
@@ -1116,7 +1122,7 @@ function renderMatrix(table, kind, items, describe) {
         cb.disabled = true;
         try {
           await api("PUT", `pool/${kind}/${encodeURIComponent(it.id)}/workspaces`, { workspaces: want });
-          poolMsg(kind === "ssh" ? `${it.id}: applied to running sessions.` : `${it.id}: restart Claude in ${n} to apply.`);
+          poolMsg(kind === "tokens" ? `${it.id}: restart Claude in ${n} to apply.` : `${it.id}: applied.`);
         } catch (e) {
           cb.checked = !cb.checked;
           poolMsg(e.message, true);
@@ -1135,6 +1141,19 @@ function renderMatrix(table, kind, items, describe) {
       });
       actions.append(copy);
     }
+    if (kind === "signing") {
+      const pick = el("input", { type: "file", accept: ".mobileprovision,.provisionprofile", hidden: true, multiple: true });
+      const add = el("button", { className: "btn ghost", type: "button", textContent: "+ Profile" });
+      add.addEventListener("click", () => pick.click());
+      pick.addEventListener("change", async () => {
+        try {
+          for (const f of pick.files) await api("POST", `pool/signing/${encodeURIComponent(it.id)}/profiles`, { profile: await fileB64(f) });
+          poolMsg(`${it.id}: profile added.`);
+        } catch (e) { poolMsg(e.message, true); }
+        loadPool();
+      });
+      actions.append(add, pick);
+    }
     const del = el("button", { className: "btn ghost danger", type: "button", textContent: "Delete" });
     del.addEventListener("click", async () => {
       if (!confirm(`Delete ${it.id}? It is removed from ${it.workspaces.length || "no"} workspace(s) and from disk.`)) return;
@@ -1144,10 +1163,37 @@ function renderMatrix(table, kind, items, describe) {
       refresh();
     });
     actions.append(del);
-    return el("tr", {}, el("td", { className: "item" }, el("strong", { textContent: it.id }), el("div", { className: "muted", textContent: describe(it) })), ...tds, actions);
+    const item = el("td", { className: "item" }, el("strong", { textContent: it.id }), el("div", { className: "muted", textContent: describe(it) }));
+    if (kind === "signing") item.append(signingProfiles(it));
+    return el("tr", {}, item, ...tds, actions);
   });
   if (!items.length) rows.push(el("tr", {}, el("td", { className: "muted note", colSpan: wss.length + 2, textContent: "None yet." })));
   table.replaceChildren(el("thead", {}, head), el("tbody", {}, ...rows));
+}
+
+const fileB64 = async (file) => {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+};
+const day = (iso) => (iso || "").slice(0, 10);
+
+function signingProfiles(it) {
+  const list = el("ul", { className: "sign-profiles" });
+  for (const p of it.profiles) {
+    const gone = new Date(p.expires) < new Date();
+    const del = el("button", { className: "btn ghost danger small", type: "button", textContent: "×", title: `Remove ${p.name}` });
+    del.addEventListener("click", async () => {
+      if (!confirm(`Remove the profile ${p.name}?`)) return;
+      try { await api("DELETE", `pool/signing/${encodeURIComponent(it.id)}/profiles/${p.uuid}`); } catch (e) { poolMsg(e.message, true); }
+      loadPool();
+    });
+    list.append(el("li", { className: gone ? "bad" : "" }, `${p.name} · ${p.bundle_id} · ${p.type}${p.devices ? ` (${p.devices} devices)` : ""} · `,
+      el("span", { textContent: gone ? `expired ${day(p.expires)}` : `until ${day(p.expires)}` }), " ", del));
+  }
+  if (!it.profiles.length) list.append(el("li", { className: "muted", textContent: "No provisioning profiles yet: add one (+ Profile)." }));
+  return list;
 }
 
 async function loadPool() {
@@ -1157,6 +1203,8 @@ async function loadPool() {
     return poolMsg(e.message, true);
   }
   renderMatrix($("#m-ssh"), "ssh", poolData.ssh, (k) => `${k.type} ${k.fingerprint} · ${k.comment}`);
+  renderMatrix($("#m-signing"), "signing", poolData.signing || [], (s) =>
+    `${s.name} · team ${s.team} · ${new Date(s.expires) < new Date() ? "EXPIRED " : "until "}${day(s.expires)}`);
   renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => `${t.label} (${t.upstream}) → $${t.env_var}`
     + (t.upstream.startsWith("http://") ? ` · call it via $${baseUrlVar(t.id)}` : ""));
   const sel = $("#tok-service");
@@ -1223,6 +1271,14 @@ $("#add-ssh").addEventListener("submit", (ev) => {
   const generate = f.how.value === "generate";
   submitAdd(ev.currentTarget, "pool/ssh", { id: f.id.value.trim(), comment: f.comment.value.trim() || undefined,
     generate, private_key: generate ? undefined : f.private_key.value });
+});
+$("#add-signing").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const form = ev.currentTarget, f = form.elements;
+  try {
+    submitAdd(form, "pool/signing", { id: f.id.value.trim(), password: f.password.value,
+      p12: await fileB64(f.p12.files[0]), profiles: await Promise.all([...f.profiles.files].map(fileB64)) });
+  } catch (e) { $(".form-msg", form).textContent = e.message; }
 });
 $("#add-tokens").addEventListener("submit", (ev) => {
   ev.preventDefault();

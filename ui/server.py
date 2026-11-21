@@ -61,6 +61,7 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
                     token_meta, vm_browser, vm_cid)
 import auth  # noqa: E402
 import builds  # noqa: E402
+import applesign  # noqa: E402
 
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
 CLAUDE_IN = ROOT / "bin" / "claude-in"
@@ -1024,6 +1025,10 @@ def validate_policy(body: dict) -> dict:
     pol["claude_md"] = body.get("claude_md") is True
     pol["vm_browser"] = body.get("vm_browser") is True
     pol["builds"] = body.get("builds") is True
+    pol["signing"] = clean_list(body.get("signing", []), ITEM_RE, "Signing identities")
+    for i in pol["signing"]:
+        if not applesign.meta(i):
+            raise ValueError(f"No signing identity '{i}'")
     return pol
 
 
@@ -1053,7 +1058,11 @@ async def pool_listing() -> dict:
         if (meta := token_meta(tid)) and (TOKEN_POOL / tid).is_file():
             tokens.append({"id": tid, **{k: meta[k] for k in ("service", "upstream", "env_var", "label")},
                            "workspaces": [n for n, pol in policies.items() if tid in pol["tokens"]]})
-    return {"ssh": keys, "tokens": tokens, "workspaces": sorted(policies),
+    signing = [{**{k: v for k, v in m.items() if k != "profiles"},
+                "profiles": [{k: v for k, v in x.items() if k not in ("entitlements", "certs")} for x in m["profiles"]],
+                "workspaces": [n for n, pol in policies.items() if m["id"] in pol["signing"]]}
+               for m in applesign.identities()]
+    return {"ssh": keys, "tokens": tokens, "signing": signing, "workspaces": sorted(policies),
             "services": {k: {"label": v["label"], "env_var": v["env_var"], "upstream": v["upstream"]}
                          for k, v in TOKEN_SERVICES.items()},
             "ascPresets": {k: v["label"] for k, v in ASC_PRESETS.items()},
@@ -1161,8 +1170,11 @@ def add_token(body: dict) -> dict:
     return {"id": tid, **meta}
 
 
+POLICY_KEY = {"ssh": "ssh_keys", "token": "tokens", "signing": "signing"}
+
+
 async def remove_pool_item(kind: str, iid: str):
-    key = "ssh_keys" if kind == "ssh" else "tokens"
+    key = POLICY_KEY[kind]
     for ws in all_ws():
         pol = load_policy(ws["WS_NAME"])
         if iid in pol[key]:
@@ -1174,13 +1186,15 @@ async def remove_pool_item(kind: str, iid: str):
             await sync_agent(ws["WS_NAME"])
         for p in (SSH_POOL / iid, SSH_POOL / f"{iid}.pub"):
             p.unlink(missing_ok=True)
+    elif kind == "signing":
+        applesign.remove_identity(iid)
     else:
         for p in (TOKEN_POOL / iid, TOKEN_POOL / f"{iid}.json"):
             p.unlink(missing_ok=True)
 
 
 async def assign(kind: str, iid: str, workspaces: list[str]):
-    key = "ssh_keys" if kind == "ssh" else "tokens"
+    key = POLICY_KEY[kind]
     wanted = set(clean_list(workspaces, NAME_RE, "Workspaces"))
     known = {ws["WS_NAME"] for ws in all_ws()}
     if wanted - known:
@@ -1431,7 +1445,19 @@ def builds_lines(pol: dict) -> str:
     return ("\n- Apple builds: the aio-builds MCP server (apple_build, build_status, build_log, build_result, "
             "cancel_build) builds, tests or runs this repo's Xcode project on a Mac build worker, in a fresh "
             "macOS VM per job. It builds a commit (HEAD by default): commit first, uncommitted changes aren't "
-            "sent. You can't reach the Mac or its git host any other way.")
+            "sent. You can't reach the Mac or its git host any other way. get_artifact copies a build's "
+            "artifact into .aio-builds/ in the project." + signing_lines(pol))
+
+
+def signing_lines(pol: dict) -> str:
+    ids = [m for i in pol["signing"] if (m := applesign.meta(i))]
+    if not ids:
+        return ""
+    return ("\n- Apple signing: these identities (certificate + private key + provisioning profiles) are on the "
+            "host; you never get the key files, only signing done for you. export_build signs an archive build "
+            "on the Mac with Xcode (and can upload it to TestFlight); sign_ipa re-signs an .ipa or .app on the "
+            "host with rcodesign. "
+            + " ".join(applesign.summary(m) for m in ids))
 
 
 def network_summary(pol: dict) -> str:
@@ -1606,9 +1632,29 @@ async def pool_api(req: Request, parts: list[str], w):
             return await send_json(w, await add_ssh_key(body), 201)
         if parts == ["tokens"] and m == "POST":
             return await send_json(w, add_token(body), 201)
-        if len(parts) >= 2 and parts[0] in ("ssh", "tokens") and ITEM_RE.match(parts[1]):
-            kind, iid = ("ssh" if parts[0] == "ssh" else "token"), parts[1]
-            exists = (SSH_POOL / iid).is_file() if kind == "ssh" else token_meta(iid) is not None
+        if parts == ["signing"] and m == "POST":
+            try:
+                p12 = base64.b64decode(str(body.get("p12", "")), validate=True)
+                profiles = [base64.b64decode(str(x), validate=True) for x in body.get("profiles", []) or []][:20]
+            except ValueError:
+                raise ValueError("Bad file upload") from None
+            if not ITEM_RE.match(str(body.get("id", ""))) or token_meta(str(body.get("id"))):
+                raise ValueError("Name: lowercase letters, digits and dashes, max 40, not a token's name")
+            return await send_json(w, await asyncio.to_thread(
+                applesign.add_identity, str(body.get("id")), p12, str(body.get("password", "")), profiles), 201)
+        if len(parts) >= 3 and parts[0] == "signing" and parts[2] == "profiles" and applesign.meta(parts[1]):
+            if parts[3:] == [] and m == "POST":
+                try:
+                    raw = base64.b64decode(str(body.get("profile", "")), validate=True)
+                except ValueError:
+                    raise ValueError("Bad file upload") from None
+                return await send_json(w, applesign.add_profile(parts[1], raw), 201)
+            if len(parts) == 4 and m == "DELETE":
+                return await send_json(w, applesign.remove_profile(parts[1], parts[3]))
+        if len(parts) >= 2 and parts[0] in ("ssh", "tokens", "signing") and ITEM_RE.match(parts[1]):
+            kind, iid = {"ssh": "ssh", "tokens": "token", "signing": "signing"}[parts[0]], parts[1]
+            exists = ((SSH_POOL / iid).is_file() if kind == "ssh" else token_meta(iid) is not None if kind == "token"
+                      else applesign.meta(iid) is not None)
             if not exists:
                 return await send_json(w, {"error": "Not found"}, 404)
             if parts[2:] == [] and m == "DELETE":
@@ -1617,7 +1663,7 @@ async def pool_api(req: Request, parts: list[str], w):
             if parts[2:] == ["workspaces"] and m == "PUT":
                 await assign(kind, iid, body.get("workspaces", []))
                 return await send_json(w, {"ok": True})
-    except (ValueError, json.JSONDecodeError) as e:
+    except (ValueError, json.JSONDecodeError, applesign.SignError) as e:
         return await send_json(w, {"error": str(e)}, 400)
     except RuntimeError as e:
         return await send_json(w, {"error": str(e)}, 500)

@@ -51,6 +51,7 @@ PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("
 
 DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False, "vm_browser": False,
                   "builds": False,      # Apple builds: the aio-builds MCP server (ui/builds.py)
+                  "signing": [],        # Apple signing identities it may sign with (ui/applesign.py)
                   "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open", "listen": []},
                   "limits": {"memory": "", "pids": 0, "cpus": 0, "disk": "",
                              "browser_memory": "", "browser_cpus": 0}}
@@ -110,6 +111,8 @@ def load_policy(name: str) -> dict:
     pol["claude_md"] = saved.get("claude_md") is True
     pol["vm_browser"] = saved.get("vm_browser") is True
     pol["builds"] = saved.get("builds") is True
+    pol["signing"] = [i for i in saved.get("signing", []) if isinstance(i, str) and ITEM_RE.match(i)
+                      and (SECRETS / "apple" / "identities" / i / "meta.json").is_file()]
     return pol
 
 
