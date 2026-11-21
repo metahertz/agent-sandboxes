@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Print a current App Store Connect API token (a JWT) for one pool token.
+
+nono's proxy runs this (outside the sandbox, as you) for a workspace's App
+Store Connect key: its credential_capture entry in the workspace profile
+names the pool token. The JWT goes into the upstream request only; the
+sandbox sees a placeholder. The .p8 private key never leaves this host.
+Never prints anything else on stdout.
+
+    asc-token <pool-token-id>
+
+The JWT is ES256 (stdlib Python has no ECDSA: openssl signs), valid for 19
+minutes (Apple allows 20); the profile caches it for 15.
+"""
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("AIO_ROOT", Path(__file__).resolve().parent.parent))
+POOL = ROOT / "secrets" / "tokens"
+LIFETIME = 19 * 60
+
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def der_to_raw(sig: bytes) -> bytes:
+    """openssl's DER ECDSA signature (SEQUENCE of two INTEGERs) -> r||s, 32 bytes each."""
+    if len(sig) < 8 or sig[0] != 0x30:
+        raise ValueError("unexpected signature from openssl")
+    i = 2 if sig[1] < 0x80 else 2 + (sig[1] & 0x7F)
+    out = b""
+    for _ in range(2):
+        if sig[i] != 0x02:
+            raise ValueError("unexpected signature from openssl")
+        n = sig[i + 1]
+        v = sig[i + 2:i + 2 + n].lstrip(b"\0")
+        if len(v) > 32:
+            raise ValueError("unexpected signature from openssl")
+        out += v.rjust(32, b"\0")
+        i += 2 + n
+    return out
+
+
+def jwt(tid: str, now: int | None = None) -> str:
+    if not re.match(r"^[a-z0-9][a-z0-9-]{0,39}$", tid):
+        raise ValueError("bad token id")
+    meta = json.loads((POOL / f"{tid}.json").read_text())
+    if meta.get("service") != "appstoreconnect":
+        raise ValueError(f"{tid} isn't an App Store Connect key")
+    now = int(time.time()) if now is None else now
+    head = {"alg": "ES256", "kid": meta["key_id"], "typ": "JWT"}
+    body = {"iss": meta["issuer_id"], "iat": now, "exp": now + LIFETIME, "aud": "appstoreconnect-v1"}
+    signing_input = f"{b64(json.dumps(head, separators=(',', ':')).encode())}." \
+                    f"{b64(json.dumps(body, separators=(',', ':')).encode())}"
+    p = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(POOL / tid)],
+                       input=signing_input.encode(), capture_output=True, timeout=15)
+    if p.returncode != 0:
+        raise ValueError("openssl couldn't sign with the key: " + p.stderr.decode(errors="replace").strip()[-200:])
+    return f"{signing_input}.{b64(der_to_raw(p.stdout))}"
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit("usage: asc-token <pool-token-id>")
+    try:
+        tok = jwt(sys.argv[1])
+    except (ValueError, OSError, KeyError, subprocess.SubprocessError) as e:
+        print(f"asc-token: {e}", file=sys.stderr)
+        sys.exit(1)
+    os.write(1, tok.encode() + b"\n")

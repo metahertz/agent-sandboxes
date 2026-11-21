@@ -1163,6 +1163,8 @@ async function loadPool() {
   if (!sel.options.length) {
     for (const [k, v] of Object.entries(poolData.services)) sel.append(el("option", { value: k, textContent: `${v.label} → $${v.env_var}` }));
     sel.append(el("option", { value: "custom", textContent: "Custom HTTP(S) API…" }));
+    for (const [k, v] of Object.entries(poolData.ascPresets || {})) $("#tok-asc-preset").append(el("option", { value: k, textContent: v }));
+    $("#tok-asc-preset").value = "testflight";
   }
 }
 
@@ -1176,6 +1178,7 @@ $$(".add-form [data-cancel]").forEach((b) => b.addEventListener("click", () => {
   f.reset();
   f.hidden = true;
   $(".form-msg", f).textContent = "";
+  tokServiceChanged();
 }));
 $("#add-ssh").addEventListener("change", (ev) => {
   if (ev.target.name === "how") ev.currentTarget.elements.private_key.hidden = ev.target.value !== "import";
@@ -1183,7 +1186,18 @@ $("#add-ssh").addEventListener("change", (ev) => {
 // nono's route for a pool token; http:// APIs can only be reached through it
 const baseUrlVar = (id) => `POOL_${id.replace(/-/g, "_").toUpperCase()}_BASE_URL`;
 
-$("#tok-service").addEventListener("change", (ev) => ($("#tok-custom").hidden = ev.target.value !== "custom"));
+function tokServiceChanged() {
+  const v = $("#tok-service").value, asc = v === "appstoreconnect";
+  $("#tok-custom").hidden = v !== "custom";
+  $("#tok-asc").hidden = !asc;
+  $("#tok-secret").hidden = asc;
+  $("#add-tokens").elements.secret.required = !asc;
+}
+$("#tok-service").addEventListener("change", tokServiceChanged);
+$("#add-tokens").elements.asc_file.addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  if (file) $("#add-tokens").elements.asc_p8.value = await file.text();
+});
 
 async function submitAdd(form, path, body) {
   const out = $(".form-msg", form);
@@ -1194,7 +1208,7 @@ async function submitAdd(form, path, body) {
     form.reset();
     form.hidden = true;
     out.textContent = "";
-    $("#tok-custom").hidden = true;
+    tokServiceChanged();
     form.elements.private_key && (form.elements.private_key.hidden = true);
     poolMsg(res.public ? `Added ${res.id}. Public key: ${res.public}` : `Added ${res.id}.`);
     loadPool();
@@ -1214,7 +1228,9 @@ $("#add-tokens").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const f = ev.currentTarget.elements;
   const service = f.service.value;
-  submitAdd(ev.currentTarget, "pool/tokens", { id: f.id.value.trim(), service, secret: f.secret.value,
+  const asc = service === "appstoreconnect";
+  submitAdd(ev.currentTarget, "pool/tokens", { id: f.id.value.trim(), service, secret: asc ? f.asc_p8.value : f.secret.value,
+    asc: asc ? { key_id: f.asc_key_id.value.trim(), issuer_id: f.asc_issuer_id.value.trim(), preset: f.asc_preset.value } : undefined,
     custom: service === "custom" ? { upstream: f.upstream.value.trim(), header: f.header.value.trim(),
       format: f.format.value.trim(), env_var: f.env_var.value.trim() } : undefined });
 });

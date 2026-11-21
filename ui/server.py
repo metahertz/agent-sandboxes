@@ -64,6 +64,7 @@ import builds  # noqa: E402
 
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
 CLAUDE_IN = ROOT / "bin" / "claude-in"
+ASC_TOKEN = ROOT / "bin" / "asc-token"       # nono's proxy runs it for App Store Connect keys
 MCP_TEMPLATE = ROOT / "mcp.json.template"
 CLAUDE_MD_DEFAULT = ROOT / "ui" / "claude-md-additions.md"   # sandbox notes for workspaces' CLAUDE.md
 CLAUDE_MD_CUSTOM = ROOT / "state" / "claude-md-additions.md"  # the Settings page's edited copy
@@ -802,7 +803,51 @@ TOKEN_SERVICES = {
                "inject_header": "Authorization", "credential_format": "Bearer {}", "env_var": "OPENAI_API_KEY"},
     "gemini": {"label": "Gemini API", "upstream": "https://generativelanguage.googleapis.com",
                "inject_header": "x-goog-api-key", "credential_format": "{}", "env_var": "GEMINI_API_KEY"},
+    # An API key (.p8) never goes in: nono's proxy asks bin/asc-token for a
+    # short-lived JWT signed with it (a cmd:// credential). Uploading a build's
+    # bytes goes to pre-signed URLs on Apple's storage hosts (allow_hosts).
+    "appstoreconnect": {"label": "App Store Connect API", "upstream": "https://api.appstoreconnect.apple.com",
+                        "inject_header": "Authorization", "credential_format": "Bearer {}", "env_var": "ASC_TOKEN",
+                        "allow_hosts": ["*.blobstore.apple.com"]},
 }
+# What a pool token's route may carry over to nono's custom_credentials
+ROUTE_EXTRAS = ("endpoint_rules",)
+ASC_CACHE_TTL = 15 * 60                       # asc-token's JWTs last 19 minutes
+ASC_KEY_ID_RE = re.compile(r"^[A-Z0-9]{8,12}$")
+ASC_ISSUER_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# App Store Connect presets: endpoint_rules (default-deny) for nono's proxy
+ASC_PRESETS = {
+    "full": {"label": "Full API (whatever the key's role allows)", "rules": None},
+    "testflight": {"label": "TestFlight: builds, uploads, beta groups and testers", "rules": [
+        *(("GET", p) for p in (
+            "/v1/apps", "/v1/apps/*", "/v1/apps/*/builds", "/v1/apps/*/buildUploads", "/v1/apps/*/betaGroups",
+            "/v1/apps/*/preReleaseVersions", "/v1/builds", "/v1/builds/*", "/v1/builds/*/betaGroups",
+            "/v1/builds/*/buildBetaDetail", "/v1/builds/*/betaBuildLocalizations", "/v1/buildUploads/*",
+            "/v1/buildUploads/*/buildUploadFiles", "/v1/buildUploadFiles/*", "/v1/betaGroups", "/v1/betaGroups/*",
+            "/v1/betaGroups/*/builds", "/v1/betaGroups/*/betaTesters", "/v1/betaTesters", "/v1/betaTesters/*",
+            "/v1/buildBetaDetails/*", "/v1/betaBuildLocalizations", "/v1/betaBuildLocalizations/*",
+            "/v1/preReleaseVersions", "/v1/preReleaseVersions/*")),
+        *(("POST", p) for p in (
+            "/v1/buildUploads", "/v1/buildUploadFiles", "/v1/betaGroups", "/v1/betaTesters",
+            "/v1/betaGroups/*/relationships/builds", "/v1/betaGroups/*/relationships/betaTesters",
+            "/v1/builds/*/relationships/betaGroups", "/v1/betaBuildLocalizations",
+            "/v1/betaAppReviewSubmissions", "/v1/buildBetaNotifications")),
+        *(("PATCH", p) for p in (
+            "/v1/buildUploads/*", "/v1/buildUploadFiles/*", "/v1/builds/*", "/v1/buildBetaDetails/*",
+            "/v1/betaBuildLocalizations/*", "/v1/betaGroups/*")),
+        ("DELETE", "/v1/betaGroups/*/relationships/betaTesters")]},
+}
+
+
+def check_asc_key(pem: str) -> str:
+    """The .p8: an EC P-256 private key openssl can sign with."""
+    pem = pem.strip().replace("\r\n", "\n") + "\n"
+    if not pem.startswith("-----BEGIN PRIVATE KEY-----") or len(pem) > 4096:
+        raise ValueError("The .p8 file's contents: -----BEGIN PRIVATE KEY----- …")
+    p = subprocess.run(["openssl", "pkey", "-noout", "-text"], input=pem.encode(), capture_output=True, timeout=15)
+    if p.returncode != 0 or b"prime256v1" not in p.stdout and b"P-256" not in p.stdout:
+        raise ValueError("That isn't an App Store Connect key (.p8: an EC P-256 private key)")
+    return pem
 
 
 def private_write(path: Path, data: str | bytes):
@@ -1011,6 +1056,7 @@ async def pool_listing() -> dict:
     return {"ssh": keys, "tokens": tokens, "workspaces": sorted(policies),
             "services": {k: {"label": v["label"], "env_var": v["env_var"], "upstream": v["upstream"]}
                          for k, v in TOKEN_SERVICES.items()},
+            "ascPresets": {k: v["label"] for k, v in ASC_PRESETS.items()},
             "netModes": NET_MODES}
 
 
@@ -1061,9 +1107,28 @@ def add_token(body: dict) -> dict:
     if (TOKEN_POOL / f"{tid}.json").exists():
         raise ValueError(f"Token '{tid}' already exists")
     secret = str(body.get("secret", "")).strip()
+    service = str(body.get("service", ""))
+    if service == "appstoreconnect":
+        a = body.get("asc", {}) or {}
+        key_id, issuer = str(a.get("key_id", "")).strip(), str(a.get("issuer_id", "")).strip().lower()
+        preset = str(a.get("preset") or "testflight")
+        if not ASC_KEY_ID_RE.match(key_id):
+            raise ValueError("Key ID: the 10 letters and digits in the key's name (AuthKey_<ID>.p8)")
+        if not ASC_ISSUER_RE.match(issuer):
+            raise ValueError("Issuer ID: the UUID above the keys list (Users and Access → Integrations)")
+        if preset not in ASC_PRESETS:
+            raise ValueError("Unknown access preset")
+        secret = check_asc_key(secret)
+        meta = {"service": service, **TOKEN_SERVICES[service], "key_id": key_id, "issuer_id": issuer,
+                "preset": preset}
+        meta["label"] = f"App Store Connect, {ASC_PRESETS[preset]['label'].split(':')[0]} (key {key_id})"
+        if rules := ASC_PRESETS[preset]["rules"]:
+            meta["endpoint_rules"] = [{"method": m, "path": p} for m, p in rules]
+        private_write(TOKEN_POOL / tid, secret)
+        private_write(TOKEN_POOL / f"{tid}.json", json.dumps(meta, indent=2) + "\n")
+        return {"id": tid, **meta}
     if not secret or len(secret) > 8192 or any(c in secret for c in "\r\n\0"):
         raise ValueError("Paste the token (single line)")
-    service = str(body.get("service", ""))
     if service in TOKEN_SERVICES:
         meta = {"service": service, **TOKEN_SERVICES[service]}
     elif service == "custom":
@@ -1203,6 +1268,11 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
     allow = [parse_net_entry(x, "", True) for x in pol["network"]["allow"]]
     if is_microvm(ws) and mode != "open":
         allow += [(h, 0, 0) for h in VM_EXTRA_HOSTS]
+    if mode != "open":
+        # Hosts a token's service needs without its credential (App Store
+        # Connect's pre-signed upload URLs)
+        allow += [(h, 0, 0) for tid in pol["tokens"] if (meta := token_meta(tid))
+                  for h in meta.get("allow_hosts", [])]
     if allow:
         net["allow_domain"] = list(dict.fromkeys(h for h, _, _ in allow))
         if any(lo for _, lo, _ in allow):
@@ -1215,13 +1285,20 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
         # its own servers (on any address: nono can't limit that), and connecting to them
         net["listen_port"] = ports
         net["open_port"] += ports
-    creds = {}
+    creds, capture = {}, {}
     for tid in pol["tokens"]:
         meta = token_meta(tid)
-        creds["pool_" + tid.replace("-", "_")] = {
+        route = "pool_" + tid.replace("-", "_")
+        creds[route] = {
             "upstream": bridge_upstream(tid, meta["upstream"]), "credential_key": f"file://{TOKEN_POOL / tid}",
             "inject_header": meta["inject_header"], "credential_format": meta["credential_format"],
             "env_var": meta["env_var"]}
+        creds[route].update({k: meta[k] for k in ROUTE_EXTRAS if meta.get(k)})
+        if meta["service"] == "appstoreconnect":
+            # A JWT signed with the key, made by nono outside the sandbox
+            creds[route]["credential_key"] = f"cmd://{route}"
+            capture[route] = {"command": ["/usr/bin/python3", "-I", str(ASC_TOKEN), tid],
+                              "timeout_secs": 20, "cache_ttl_secs": ASC_CACHE_TTL}
     if pol["builds"]:
         # The aio-builds MCP server: the bridge (/~build) knows the workspace by this key
         creds[builds.ROUTE] = {"upstream": f"http://{HTTP_BRIDGE[0]}:{HTTP_BRIDGE[1]}/~build",
@@ -1243,7 +1320,7 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
                     "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{OTLP_PORT}",
                     "OTEL_RESOURCE_ATTRIBUTES": f"workspace={name}",
                     "OTEL_METRIC_EXPORT_INTERVAL": "30000"})
-    return {
+    prof = {
         "meta": {"name": f"ws-{name}", "version": "1.0.0",
                  "description": f"Generated by agent-sandboxes for workspace {name}; edit in the web UI"},
         "extends": "claude-browser",
@@ -1255,6 +1332,9 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
         "network": net,
         "environment": {"set_vars": env},
     }
+    if capture:
+        prof["credential_capture"] = capture
+    return prof
 
 
 def profile_text(ws: dict[str, str]) -> str:
@@ -1325,6 +1405,16 @@ def token_lines(pol: dict) -> str:
         if not (meta := token_meta(tid)):
             continue
         env, var = meta["env_var"], base_url_var(tid)
+        if meta["service"] == "appstoreconnect":
+            scope = ("Only these calls are let through: TestFlight builds, build uploads, beta groups, testers "
+                     "and beta localizations; anything else gets 403." if meta.get("endpoint_rules")
+                     else "Whatever the key's role allows.")
+            out.append(f"- App Store Connect API ({tid}): call `{meta['upstream']}` (or `${var}`) plus the path, "
+                       f"with the header `Authorization: Bearer ${env}`. `${env}` is a placeholder: the proxy "
+                       "swaps in a fresh signed JWT, so don't make your own and never ask for the .p8 key. "
+                       f"{scope} Uploading a build's bytes goes to the pre-signed URLs the API returns "
+                       "(*.blobstore.apple.com, allowed), without the Authorization header.")
+            continue
         header = f"{meta['inject_header']}: {meta['credential_format'].replace('{}', '$' + env)}"
         if meta["upstream"].startswith("http://"):
             how = (f"call **`${var}`** plus the path, never `{meta['upstream']}` itself "

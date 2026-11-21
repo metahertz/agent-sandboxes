@@ -376,7 +376,17 @@
               <label>Env var <input name="env_var" placeholder="EXAMPLE_API_KEY"></label>
               <p class="hint">For an <code>http://</code> API, Claude calls <code>$POOL_&lt;NAME&gt;_BASE_URL</code> (e.g. <code>$POOL_GRAFANA_RO_BASE_URL/api/search</code>) instead of the real URL; the token is added on the way and travels unencrypted from this host to the API. HTTPS APIs work at their own URL too.</p>
             </div>
-            <label>Token <input name="secret" type="password" required autocomplete="off"></label>
+            <div id="tok-asc" hidden>
+              <p class="hint">An App Store Connect <strong>team</strong> API key (App Store Connect → Users and Access → Integrations → App Store Connect API). The <code>.p8</code> stays on this host: the proxy signs a short-lived token with it for each workspace's requests, so the agent only ever sees a placeholder. Give the key the least role that does the job (App Manager for TestFlight).</p>
+              <div class="row">
+                <label>Key ID <input name="asc_key_id" placeholder="2X9R4HXF34" autocomplete="off" spellcheck="false"></label>
+                <label>Issuer ID <input name="asc_issuer_id" placeholder="57246542-96fe-1a63-e053-0824d011072a" autocomplete="off" spellcheck="false"></label>
+                <label>Access <select name="asc_preset" id="tok-asc-preset"></select></label>
+              </div>
+              <label>The .p8 file <input type="file" name="asc_file" accept=".p8"></label>
+              <textarea name="asc_p8" rows="5" spellcheck="false" placeholder="-----BEGIN PRIVATE KEY----- … (or pick the file above)"></textarea>
+            </div>
+            <label id="tok-secret">Token <input name="secret" type="password" required autocomplete="off"></label>
             <div class="row"><button class="btn primary" type="submit">Add</button>
               <button class="btn ghost" type="button" data-cancel>Cancel</button></div>
             <p class="form-msg" role="status"></p>
