@@ -31,6 +31,11 @@ BIN=/usr/local/lib/agent-sandboxes/aio-buildd
 say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 note() { printf '\033[33m    %s\033[0m\n' "$*"; }
 
+if [[ $(uname -s) == Darwin ]]; then
+  echo "This sets up the build host (the git queue), on Linux: run it on the agent-sandboxes host." >&2
+  echo "On a Mac, set up a worker instead: buildhost/install-worker (Settings → Apple builds, step 2)." >&2
+  exit 1
+fi
 [[ -f $SRC ]] || { echo "can't find $SRC" >&2; exit 1; }
 command -v git >/dev/null || { echo "git isn't installed (sudo apt install git)" >&2; exit 1; }
 command -v sshd >/dev/null || [[ -x /usr/sbin/sshd ]] || {
