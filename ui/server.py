@@ -142,6 +142,48 @@ def sandbox_prefix(name: str) -> str:
     return "/__s/" + session_value(f"sbx:{name}:{CAP_SALT}")[:40]
 
 
+# When each Claude pane's screen last changed, for the sidebar. tmux's own
+# window_activity also counts redraws: attaching the web terminal resizes the
+# window, and Claude repaints. So: a hash of the visible text, counted as a change
+# only at the same size as the last look (a resize just takes a new baseline).
+TERM_SEEN: dict[str, dict] = {}         # workspace -> {"hash", "size", "changed", "settle"}
+_term_poll = {"at": 0.0, "lock": None}
+
+
+async def term_changes(live: dict[str, tuple[int, str]]) -> dict[str, int]:
+    """live: workspace -> (tmux window_activity, "WxH") for running sessions.
+    Returns workspace -> when its screen last changed (epoch seconds)."""
+    lock = _term_poll["lock"] = _term_poll["lock"] or asyncio.Lock()
+    async with lock:
+        for n in set(TERM_SEEN) - set(live):
+            del TERM_SEEN[n]
+        if live and time.time() - _term_poll["at"] >= 2:       # several browsers poll: once per 2 s
+            _term_poll["at"] = time.time()
+            cmd = list(TMUX)
+            for i, n in enumerate(sorted(live)):
+                cmd += ([";"] if i else []) + ["display-message", "-p", f"\x1eAIO {n}",
+                                               ";", "capture-pane", "-p", "-t", f"=cl-{n}:"]
+            rc, out, _ = await run(*cmd, timeout=10)
+            screens = {}
+            for chunk in out.split("\x1eAIO ")[1:]:
+                name, _, text = chunk.partition("\n")
+                screens[name] = hashlib.sha256(text.encode()).hexdigest()
+            now = int(time.time())
+            for n, (act, size) in live.items():
+                h, old = screens.get(n), TERM_SEEN.get(n)
+                if h is None:
+                    continue
+                if old is None:                 # first look (or the UI restarted): tmux's time, as a start
+                    TERM_SEEN[n] = {"hash": h, "size": size, "changed": act, "settle": 0}
+                elif old["size"] != size:       # resized: Claude repaints, nothing new;
+                    old.update(hash=h, size=size, settle=1)    # nor on the next look (a late repaint)
+                elif old["settle"]:
+                    old.update(hash=h, settle=old["settle"] - 1)
+                elif old["hash"] != h:
+                    old.update(hash=h, changed=now)
+        return {n: TERM_SEEN[n]["changed"] for n in live if n in TERM_SEEN}
+
+
 async def run(*cmd: str, timeout: float = 120, preexec_fn=None) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.DEVNULL,
@@ -600,16 +642,21 @@ async def status_all() -> list[dict]:
     # @aio_bell: when the pane last rang the bell (tmux.conf's alert-bell hook),
     # which Claude does when it finishes or needs you (claude-in's hooks)
     _, panes, _ = await run(*TMUX, "list-panes", "-a", "-F",
-                            "#{session_name}\t#{pane_dead}\t#{window_activity}\t#{@aio_bell}\t#{pane_title}")
-    claude, seen = {}, {}
-    now = int(time.time())
+                            "#{session_name}\t#{pane_dead}\t#{window_activity}\t#{@aio_bell}\t#{pane_title}"
+                            "\t#{window_width}x#{window_height}")
+    claude, seen, live = {}, {}, {}
     for line in panes.splitlines():
-        s, dead, act, bell, title = (line.split("\t", 4) + ["", "", "", ""])[:5]
+        s, dead, act, bell, title, size = (line.split("\t", 5) + [""] * 5)[:6]
         if s.startswith("cl-"):
             claude[s[3:]] = "exited" if dead == "1" else "running"
-            act_i = int(act) if act.isdigit() else 0
-            seen[s[3:]] = {"activity": act_i, "idle": max(0, now - act_i) if act_i else None,
-                           "bell": int(bell) if bell.isdigit() else 0, "title": title[:120]}
+            seen[s[3:]] = {"bell": int(bell) if bell.isdigit() else 0, "title": title[:120]}
+            if dead != "1":
+                live[s[3:]] = (int(act) if act.isdigit() else 0, size)
+    changed = await term_changes(live)
+    now = int(time.time())
+    for n, t in seen.items():
+        c = changed.get(n, 0)
+        t.update(activity=c, idle=max(0, now - c) if c else None)
     vms = await vm_states()
     out = []
     for ws in all_ws():
