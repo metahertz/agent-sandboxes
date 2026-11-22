@@ -44,6 +44,8 @@ VM_CID_BASE = 1000                     # guest CID = 1000 + slot (sandbox port 8
 VM_BROWSER_PORT = 8080                 # the AIO container in the VM (Browser container ticked): guest vsock port
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")          # pool key / token ids
+TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")     # a workspace tag (sidebar group)
+MAX_TAGS = 8
 DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 MAX_HEAD = 64 * 1024
 PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("proxyd.py"),
@@ -52,6 +54,7 @@ PROXYD_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("
 DEFAULT_POLICY = {"ssh_keys": [], "tokens": [], "claude_md": False, "vm_browser": False,
                   "builds": False,      # Apple builds: the aio-builds MCP server (ui/builds.py)
                   "signing": [],        # Apple signing identities it may sign with (ui/applesign.py)
+                  "tags": [],           # sidebar groups; the UI's only, nothing is enforced by them
                   "network": {"mode": "claude-code", "allow": [], "deny": [], "container": "open", "listen": []},
                   "limits": {"memory": "", "pids": 0, "cpus": 0, "disk": "",
                              "browser_memory": "", "browser_cpus": 0}}
@@ -113,6 +116,7 @@ def load_policy(name: str) -> dict:
     pol["builds"] = saved.get("builds") is True
     pol["signing"] = [i for i in saved.get("signing", []) if isinstance(i, str) and ITEM_RE.match(i)
                       and (SECRETS / "apple" / "identities" / i / "meta.json").is_file()]
+    pol["tags"] = [t for t in saved.get("tags", []) if isinstance(t, str) and TAG_RE.match(t)][:MAX_TAGS]
     return pol
 
 

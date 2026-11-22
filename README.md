@@ -165,6 +165,22 @@ Screenshots are from a demo setup (made-up workspaces, keys and tokens).
 
 - **New workspace** in the sidebar: name + optional folder (default `~/projects/<name>`).
   Creates the folder, `.mcp.json`, key and port, and starts the container.
+- **The sidebar with many workspaces:**
+  - **Activity:** a spinner while Claude is working; an accent dot when it has finished
+    or needs you; a grey dot for output you haven't seen. The tab title counts the
+    workspaces waiting for you.
+    - "Finished or needs you" is the terminal bell. `claude-in` gives Claude `Stop` and
+      `Notification` hooks that ring it, on top of your own settings. tmux notes when it
+      rang (`@aio_bell`, a hook in `ui/tmux.conf`).
+    - "Seen" means you had that workspace open. It's remembered per browser.
+  - **Filter** (`/`): by name, folder, or `#tag`. Enter opens the first match, Esc clears.
+  - **Sort:** A–Z, or most recent activity first. **☰** toggles compact rows.
+  - **Tags:** set in the workspace's header (*+ Tag*), saved with its Access settings
+    (`tags` in the policy), and used only for display. The sidebar groups workspaces by
+    their first tag; groups collapse, and a collapsed one shows how many are waiting.
+    **☆** pins a workspace to the top (per browser).
+  - **Theme:** *Auto* (the system's), *Light* or *Dark*, at the foot of the sidebar,
+    per browser. Terminals stay dark in both.
 - **Tabs:** *Claude* (sandboxed session, survives closing the tab) · *Browser* (live VNC,
   shared with Claude) · *VS Code* and *Terminal* (inside the container) · *Access* (SSH
   keys, API tokens, network allowlist, memory/process limits) · *Files* (browse, download

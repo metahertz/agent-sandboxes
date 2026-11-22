@@ -16,6 +16,12 @@ case "${1:-}" in
 esac
 
 ROOT="${AIO_ROOT:-$HOME/agent-sandboxes}"
+# Claude rings the terminal bell when it finishes a turn or needs you (a
+# permission prompt, or idle input); tmux notes the time (ui/tmux.conf) and the
+# web UI's sidebar shows the workspace as waiting. Added to the user's own
+# settings, not replacing them. A sandbox that can't open /dev/tty just stays quiet.
+BELL="printf '\\\\a' 2>/dev/null >/dev/tty || true"   # \\\\ is \\ in JSON, \ in the shell
+HOOKS='{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'"$BELL"'"}]}],"Notification":[{"hooks":[{"type":"command","command":"'"$BELL"'"}]}]}}'
 WS_ROOT="${AIO_WORKSPACES:-$ROOT/workspaces}"
 name="${1:?usage: claude-in [--shell | --exec] <workspace> [claude args... | command]}"; shift
 env_file="$WS_ROOT/$name.env"
@@ -33,7 +39,7 @@ if [[ "${WS_KIND:-}" == microvm ]]; then
     exit 1
   fi
   case $mode in
-    claude) remote="cd /project && exec aio-claude${WS_PROMPT:+ --append-system-prompt $(printf '%q' "$WS_PROMPT")}$(printf ' %q' "$@")"
+    claude) remote="cd /project && exec aio-claude --settings $(printf '%q' "$HOOKS")${WS_PROMPT:+ --append-system-prompt $(printf '%q' "$WS_PROMPT")}$(printf ' %q' "$@")"
             tty=(-t) ;;
     shell)  remote="cd /project && exec bash -l"; tty=(-t) ;;
     exec)   remote="cd /project && ${1:?--exec needs a command}"; tty=() ;;
@@ -74,7 +80,7 @@ fi
 [[ -n "$WS_MEMORY" ]] && cmd+=(--memory "$WS_MEMORY")
 [[ "$WS_PIDS" != 0 ]] && cmd+=(--max-processes "$WS_PIDS")
 case $mode in
-  claude) cmd+=(-- claude ${WS_PROMPT:+--append-system-prompt "$WS_PROMPT"} "$@"); unit="claude-$name-$$" ;;
+  claude) cmd+=(-- claude --settings "$HOOKS" ${WS_PROMPT:+--append-system-prompt "$WS_PROMPT"} "$@"); unit="claude-$name-$$" ;;
   shell)  cmd+=(-- bash -l); unit="shell-$name-$$" ;;
   exec)   cmd+=(-- sh -c "${1:?--exec needs a command}"); unit="exec-$name-$$" ;;
 esac

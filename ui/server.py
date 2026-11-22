@@ -52,7 +52,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLICY, DOMAIN_RE,  # noqa: E402
-                    EGRESS_PORT_OFFSET, HTTP_BRIDGE, ITEM_RE, MAX_HEAD, NAME_RE, PROXYD_SOCK, ROOT, RUNTIME,
+                    EGRESS_PORT_OFFSET, HTTP_BRIDGE, ITEM_RE, MAX_HEAD, MAX_TAGS, NAME_RE, TAG_RE, PROXYD_SOCK, ROOT, RUNTIME,
                     SANDBOX_PORTS, SECRETS, SSH_POOL, TOKEN_POOL, VM_BROWSER_PORT, VM_PROXY_OFFSET,
                     VM_RELAY_PORT, VM_ROOT,
                     WS_ROOT, all_ws, container_ca_paths, container_filtered, container_net,
@@ -521,6 +521,15 @@ async def api(req: Request, w):
 
     if action == ["policy"] and m in ("GET", "PUT"):
         return await policy_api(ws, req, w)
+    if action == ["tags"] and m == "PUT":
+        try:
+            tags = clean_tags(json.loads(req.body or b"{}").get("tags"))
+        except (ValueError, json.JSONDecodeError) as e:
+            return await send_json(w, {"error": str(e)}, 400)
+        pol = load_policy(ws["WS_NAME"])
+        pol["tags"] = tags
+        save_policy(ws["WS_NAME"], pol)
+        return await send_json(w, {"tags": tags})
 
     if action == ["sandbox-link"] and m == "GET":
         return await send_json(w, {"prefix": sandbox_prefix(name),
@@ -588,12 +597,19 @@ async def status_all() -> list[dict]:
     for line in ps.splitlines():
         n, state, detail = (line.split("\t") + ["", ""])[:3]
         states[n] = (state, detail)
-    _, panes, _ = await run(*TMUX, "list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}")
-    claude = {}
+    # @aio_bell: when the pane last rang the bell (tmux.conf's alert-bell hook),
+    # which Claude does when it finishes or needs you (claude-in's hooks)
+    _, panes, _ = await run(*TMUX, "list-panes", "-a", "-F",
+                            "#{session_name}\t#{pane_dead}\t#{window_activity}\t#{@aio_bell}\t#{pane_title}")
+    claude, seen = {}, {}
+    now = int(time.time())
     for line in panes.splitlines():
-        s, dead = (line.split("\t") + [""])[:2]
+        s, dead, act, bell, title = (line.split("\t", 4) + ["", "", "", ""])[:5]
         if s.startswith("cl-"):
             claude[s[3:]] = "exited" if dead == "1" else "running"
+            act_i = int(act) if act.isdigit() else 0
+            seen[s[3:]] = {"activity": act_i, "idle": max(0, now - act_i) if act_i else None,
+                           "bell": int(bell) if bell.isdigit() else 0, "title": title[:120]}
     vms = await vm_states()
     out = []
     for ws in all_ws():
@@ -608,6 +624,7 @@ async def status_all() -> list[dict]:
                     "kind": "microvm" if vm else "sandbox", "browser": not vm or pol["vm_browser"],
                     "container": state, "containerDetail": detail,
                     "claude": claude.get(n, "stopped"),
+                    "term": seen.get(n), "tags": pol["tags"],
                     "sshKeys": len(pol["ssh_keys"]), "tokens": len(pol["tokens"]),
                     "network": pol["network"]["mode"], "builds": pol["builds"],
                     "policyPending": not vm and claude.get(n) == "running" and policy_pending(ws)})
@@ -881,6 +898,20 @@ def agent_sock(name: str) -> Path:
 
 def save_policy(name: str, pol: dict):
     private_write(policy_path(name), json.dumps(pol, indent=2, sort_keys=True) + "\n")
+
+
+def clean_tags(v) -> list[str]:
+    """A workspace's tags: lowercase words, the first one its sidebar group."""
+    if not isinstance(v, list) or len(v) > MAX_TAGS:
+        raise ValueError(f"Tags: at most {MAX_TAGS}")
+    out = []
+    for t in v:
+        t = str(t).strip().lower().lstrip("#")
+        if not TAG_RE.match(t):
+            raise ValueError(f"Tag {t!r}: letters, digits and dashes, up to 24")
+        if t not in out:
+            out.append(t)
+    return out
 
 
 def clean_list(v, pattern: re.Pattern, what: str, limit: int = 100) -> list[str]:
@@ -1602,6 +1633,7 @@ async def policy_api(ws: dict[str, str], req: Request, w):
         except (ValueError, json.JSONDecodeError) as e:
             return await send_json(w, {"error": str(e)}, 400)
         old = load_policy(name)
+        pol["tags"] = old["tags"]           # edited on their own (PUT …/tags)
         save_policy(name, pol)
         if old["ssh_keys"] != pol["ssh_keys"]:
             await sync_agent(name)

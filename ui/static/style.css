@@ -1,5 +1,5 @@
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   --bg: #f6f6f4;
   --surface: #ffffff;
   --sunken: #eeeeea;
@@ -15,8 +15,10 @@
   --radius: 8px;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 }
+/* Theme: Auto follows the system; the sidebar's switch sets data-theme on <html> (theme.js) */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
     --bg: #131312;
     --surface: #1c1c1a;
     --sunken: #242422;
@@ -30,6 +32,21 @@
     --bad: #f87171;
     --term-bg: #111110;
   }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #131312;
+  --surface: #1c1c1a;
+  --sunken: #242422;
+  --line: #33332f;
+  --fg: #e8e8e3;
+  --muted: #9a9a93;
+  --accent: #f97316;
+  --accent-fg: #1b1004;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --term-bg: #111110;
 }
 
 * { box-sizing: border-box; }
@@ -244,3 +261,40 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 .sign-profiles { margin: 4px 0 0; padding-left: 18px; font-size: 12px; color: var(--muted); }
 .sign-profiles li.bad { color: var(--bad); }
 .btn.small { padding: 0 6px; min-height: 0; line-height: 1.4; }
+
+/* ---- sidebar: filter, sort, groups, activity; theme switch; workspace tags */
+.ws-tools { display: flex; gap: 6px; align-items: center; }
+.ws-tools input { flex: 1; font-size: 13px; padding: 5px 8px; }
+.ws-tools select { padding: 5px 6px; }
+.btn.icon { padding: 4px 8px; }
+.btn.icon[aria-pressed="true"] { background: var(--sunken); border-color: var(--line); }
+.ws-group { all: unset; cursor: pointer; display: flex; align-items: center; gap: 6px; padding: 10px 10px 3px; font-size: 11.5px; font-weight: 620; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.ws-group:hover { color: var(--fg); }
+.ws-group:focus-visible, .ws-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ws-group .caret { display: inline-block; transition: transform .15s; font-size: 9px; }
+.ws-group[aria-expanded="false"] .caret { transform: rotate(-90deg); }
+.ws-group .count { font-weight: 400; letter-spacing: 0; }
+.ws-group .waiting-count { margin-left: auto; text-transform: none; letter-spacing: 0; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 0 6px; font-size: 11px; }
+.ws-item.compact { padding: 5px 10px; }
+.ws-item.compact .sub { display: none; }
+.ws-item .n { display: flex; align-items: center; gap: 6px; }
+.ws-item .n .label { overflow: hidden; text-overflow: ellipsis; }
+.ws-item.waiting .n { font-weight: 700; }
+.act { flex: none; width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; }
+.act.working { border: 2px solid var(--accent); border-right-color: transparent; animation: act-spin .9s linear infinite; }
+.act.waiting { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent); }
+.act.unread { background: var(--muted); width: 6px; height: 6px; margin: 1px; }
+@keyframes act-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .act.working { animation: none; border-right-color: var(--accent); opacity: .65; } }
+.theme-switch { display: flex; gap: 2px; margin-top: 10px; padding: 2px; background: var(--sunken); border-radius: 7px; }
+.theme-switch button { all: unset; cursor: pointer; flex: 1; text-align: center; font-size: 12px; padding: 3px 0; border-radius: 5px; color: var(--muted); }
+.theme-switch button:hover { color: var(--fg); }
+.theme-switch button[aria-pressed="true"] { background: var(--surface); color: var(--fg); box-shadow: 0 1px 2px rgb(0 0 0 / .14); }
+.theme-switch button:focus-visible { outline: 2px solid var(--accent); }
+.title-row { display: flex; align-items: center; gap: 4px; }
+#d-pin { font-size: 15px; line-height: 1; padding: 3px 6px; color: var(--muted); }
+#d-pin[aria-pressed="true"] { color: var(--accent); }
+.d-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 6px; }
+.tag { font-size: 11.5px; padding: 0 8px; border-radius: 999px; background: var(--sunken); border: 1px solid var(--line); color: var(--muted); line-height: 1.6; }
+.d-tags input { font-size: 12.5px; padding: 2px 7px; width: 260px; max-width: 100%; }
+.d-tags .btn { font-size: 12px; padding: 1px 8px; }

@@ -49,37 +49,237 @@ async function refresh() {
     return;
   }
   if (state.selected && !current()) state.selected = null;
+  noteSeen();
   renderList();
   renderDetail();
 }
 
+// ------------------------------------------------------------------ sidebar: activity, filter, sort, groups
+
+// Per-browser preferences (localStorage can be blocked: then they last until reload).
+const prefs = {
+  read(k, dflt) {
+    try { const v = JSON.parse(localStorage.getItem(`aio-${k}`)); return v ?? dflt; } catch { return dflt; }
+  },
+  write(k, v) {
+    try { localStorage.setItem(`aio-${k}`, JSON.stringify(v)); } catch { /* private mode */ }
+  },
+};
+const side = {
+  filter: "",
+  sort: prefs.read("sort", "name") === "activity" ? "activity" : "name",
+  compact: prefs.read("compact", false) === true,
+  pinned: new Set(prefs.read("pinned", [])),
+  collapsed: new Set(prefs.read("collapsed", [])),
+  // workspace -> the newest tmux activity / bell time you've seen (the host's clock, so no skew)
+  seen: prefs.read("seen", {}),
+};
+const WORKING_SECS = 8;     // output this recent: Claude is working (it redraws while it does)
+const lastTime = (w) => Math.max(w.term?.activity || 0, w.term?.bell || 0);
+const viewing = (name) => state.view === "ws" && state.selected === name && !document.hidden;
+
+// What the sidebar shows for a workspace's Claude terminal:
+//   waiting: it rang the bell (finished, or needs you) since you last looked
+//   working: printing right now;  unread: printed since you last looked
+function termState(w) {
+  const t = w.term;
+  if (!t || w.claude !== "running") return "";
+  const busy = t.idle !== null && t.idle < WORKING_SECS && t.activity > t.bell + 3;
+  if (busy) return "working";
+  if (viewing(w.name)) return "";
+  const seen = side.seen[w.name] || 0;
+  if (t.bell > seen) return "waiting";
+  if (t.activity > seen) return "unread";
+  return "";
+}
+
+function noteSeen() {
+  let changed = false;
+  for (const w of state.workspaces) {
+    if (!w.term) continue;
+    // first sight, or looking at it now: everything so far counts as seen
+    if (side.seen[w.name] === undefined || viewing(w.name)) {
+      if (side.seen[w.name] !== lastTime(w)) { side.seen[w.name] = lastTime(w); changed = true; }
+    }
+  }
+  const names = new Set(state.workspaces.map((w) => w.name));
+  for (const n of Object.keys(side.seen)) if (!names.has(n)) { delete side.seen[n]; changed = true; }
+  if (changed) prefs.write("seen", side.seen);
+}
+
+function matches(w, words) {
+  return words.every((q) => q.startsWith("#")
+    ? (w.tags || []).some((t) => t.startsWith(q.slice(1)))
+    : w.name.includes(q) || (w.dir || "").toLowerCase().includes(q) || (w.tags || []).includes(q));
+}
+
+function wsRow(w, act) {
+  const b = el("button", { className: `ws-item${side.compact ? " compact" : ""}${act ? ` ${act}` : ""}`, type: "button" });
+  b.setAttribute("aria-current", String(state.view === "ws" && w.name === state.selected));
+  const ACT_TITLE = { working: "Claude is working", waiting: "Claude finished or needs you", unread: "New output since you looked" };
+  const mark = el("span", { className: `act ${act}`, title: ACT_TITLE[act] || "" });
+  mark.hidden = !act;
+  b.append(el("span", { className: "n" }, mark, el("span", { className: "label", textContent: w.name })));
+  const dots = el("span", { className: "dots" });
+  const dc = el("span", { className: `dot ${CONTAINER_TONE[w.container] || "none"}`,
+    title: `${w.kind === "microvm" ? "VM" : "Container"}: ${w.container}` });
+  const dl = el("span", { className: `dot ${CLAUDE_TONE[w.claude] || "none"}`, title: `Claude: ${w.claude}` });
+  dots.append(dc, dl);
+  b.append(dots);
+  const sub = w.dir.replace(/^\/home\/[^/]+/, "~") + (w.kind === "microvm" ? " · microVM" : "")
+    + ((w.tags || []).length ? ` · ${w.tags.map((t) => `#${t}`).join(" ")}` : "");
+  b.append(el("span", { className: "sub", textContent: sub }));
+  if (side.compact) b.title = sub;
+  b.addEventListener("click", () => select(w.name));
+  return b;
+}
+
 function renderList() {
   const list = $("#ws-list");
-  list.replaceChildren();
-  if (!state.workspaces.length) {
-    const p = document.createElement("p");
-    p.className = "ws-empty";
-    p.textContent = "No workspaces yet.";
-    list.append(p);
+  const all = state.workspaces;
+  const acts = new Map(all.map((w) => [w.name, termState(w)]));
+  const waiting = all.filter((w) => acts.get(w.name) === "waiting").length;
+  document.title = `${waiting ? `(${waiting}) ` : ""}Agent Sandboxes`;
+  if (!all.length) {
+    list.replaceChildren(el("p", { className: "ws-empty", textContent: "No workspaces yet." }));
     return;
   }
-  for (const w of state.workspaces) {
-    const b = document.createElement("button");
-    b.className = "ws-item";
-    b.type = "button";
-    b.setAttribute("aria-current", String(state.view === "ws" && w.name === state.selected));
-    b.innerHTML = `<span class="n"></span><span class="dots"><span class="dot" title="container"></span><span class="dot" title="Claude"></span></span><span class="sub"></span>`;
-    $(".n", b).textContent = w.name;
-    $(".sub", b).textContent = w.dir.replace(/^\/home\/[^/]+/, "~") + (w.kind === "microvm" ? " · microVM" : "");
-    const [dc, dl] = $$(".dot", b);
-    dc.classList.add(CONTAINER_TONE[w.container] || "none");
-    dc.title = `${w.kind === "microvm" ? "VM" : "Container"}: ${w.container}`;
-    dl.classList.add(CLAUDE_TONE[w.claude] || "none");
-    dl.title = `Claude: ${w.claude}`;
-    b.addEventListener("click", () => select(w.name));
-    list.append(b);
+  const words = side.filter.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = all.filter((w) => matches(w, words));
+  shown.sort(side.sort === "activity"
+    ? (a, b) => lastTime(b) - lastTime(a) || a.name.localeCompare(b.name)
+    : (a, b) => a.name.localeCompare(b.name));
+  // groups: Pinned, then each first tag (A–Z), then the rest; no headings while nothing is grouped
+  const groups = new Map();
+  const add = (key, w) => (groups.get(key) || groups.set(key, []).get(key)).push(w);
+  for (const w of shown) add(side.pinned.has(w.name) ? "\u0000pinned" : (w.tags || [])[0] || "￿other", w);
+  const keys = [...groups.keys()].sort();
+  const flat = keys.length === 1 && keys[0] === "￿other";
+  const out = [];
+  for (const key of keys) {
+    const items = groups.get(key);
+    if (!flat) {
+      const label = key === "\u0000pinned" ? "Pinned" : key === "￿other" ? "Other" : `#${key}`;
+      const open = words.length > 0 || !side.collapsed.has(key);
+      const head = el("button", { className: "ws-group", type: "button" },
+        el("span", { className: "caret", textContent: "▾" }), el("span", { textContent: label }),
+        el("span", { className: "count", textContent: `${items.length}` }));
+      head.setAttribute("aria-expanded", String(open));
+      const wait = items.filter((w) => acts.get(w.name) === "waiting").length;
+      if (!open && wait) head.append(el("span", { className: "waiting-count", textContent: `${wait} waiting` }));
+      head.addEventListener("click", () => {
+        if (side.collapsed.has(key)) side.collapsed.delete(key); else side.collapsed.add(key);
+        prefs.write("collapsed", [...side.collapsed]);
+        renderList();
+      });
+      out.push(head);
+      if (!open) continue;
+    }
+    for (const w of items) out.push(wsRow(w, acts.get(w.name)));
   }
+  if (!shown.length) out.push(el("p", { className: "ws-empty", textContent: "No workspace matches." }));
+  list.replaceChildren(...out);
 }
+
+$("#ws-filter").addEventListener("input", (ev) => { side.filter = ev.target.value; renderList(); });
+$("#ws-filter").addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") { ev.target.value = ""; side.filter = ""; renderList(); ev.target.blur(); }
+  if (ev.key === "Enter") {         // open the first match
+    const first = $("#ws-list .ws-item");
+    if (first) first.click();
+  }
+});
+$("#ws-sort").value = side.sort;
+$("#ws-sort").addEventListener("change", (ev) => { side.sort = ev.target.value; prefs.write("sort", side.sort); renderList(); });
+$("#ws-compact").setAttribute("aria-pressed", String(side.compact));
+$("#ws-compact").addEventListener("click", (ev) => {
+  side.compact = !side.compact;
+  prefs.write("compact", side.compact);
+  ev.currentTarget.setAttribute("aria-pressed", String(side.compact));
+  renderList();
+});
+// "/" focuses the filter, unless you're typing somewhere (the terminals included)
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "/" || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  const a = document.activeElement;
+  if (a && (a.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(a.tagName) || a.closest?.(".xterm"))) return;
+  ev.preventDefault();
+  $("#ws-filter").focus();
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { noteSeen(); renderList(); } });
+
+// ---- the workspace header: pin (this browser) and tags (saved with the workspace)
+
+$("#d-pin").addEventListener("click", () => {
+  const w = current();
+  if (!w) return;
+  if (side.pinned.has(w.name)) side.pinned.delete(w.name); else side.pinned.add(w.name);
+  prefs.write("pinned", [...side.pinned]);
+  renderPin(w);
+  renderList();
+});
+
+function renderPin(w) {
+  const on = side.pinned.has(w.name);
+  $("#d-pin").textContent = on ? "★" : "☆";
+  $("#d-pin").setAttribute("aria-pressed", String(on));
+}
+
+let tagsEditing = null;     // the workspace whose tags are being edited
+function renderTags(w) {
+  const box = $("#d-tags");
+  if (tagsEditing === w.name) return;
+  tagsEditing = null;
+  const tags = w.tags || [];
+  const edit = el("button", { className: "btn ghost", type: "button", textContent: tags.length ? "Edit tags" : "+ Tag",
+    title: "Tags group the sidebar (by the first one) and match #tag in its filter" });
+  edit.addEventListener("click", () => editTags(w));
+  box.replaceChildren(...tags.map((t) => el("span", { className: "tag", textContent: `#${t}` })), edit);
+}
+
+function editTags(w) {
+  tagsEditing = w.name;
+  const known = [...new Set(state.workspaces.flatMap((x) => x.tags || []))].sort();
+  const input = el("input", { value: (w.tags || []).join(", "), placeholder: "client-a, ios, experiments",
+    title: `Comma or space separated; the first one is the sidebar group.${known.length ? ` In use: ${known.join(", ")}` : ""}`,
+    autocomplete: "off", spellcheck: false });
+  input.setAttribute("list", "tag-suggestions");
+  const dl = el("datalist", { id: "tag-suggestions" }, ...known.map((t) => el("option", { value: t })));
+  const save = el("button", { className: "btn", type: "button", textContent: "Save" });
+  const cancel = el("button", { className: "btn ghost", type: "button", textContent: "Cancel" });
+  const done = () => { tagsEditing = null; const cur = current(); if (cur) renderTags(cur); };
+  const submit = async () => {
+    const tags = input.value.split(/[\s,]+/).map((t) => t.replace(/^#/, "").toLowerCase()).filter(Boolean);
+    try {
+      const r = await api("PUT", wsPath(w.name, "/tags"), { tags });
+      const x = state.workspaces.find((y) => y.name === w.name);
+      if (x) x.tags = r.tags;
+      done();
+      renderList();
+    } catch (e) {
+      msg(e.message, true);
+      input.focus();
+    }
+  };
+  save.addEventListener("click", submit);
+  cancel.addEventListener("click", done);
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); submit(); }
+    if (ev.key === "Escape") done();
+  });
+  $("#d-tags").replaceChildren(input, dl, save, cancel);
+  input.focus();
+}
+
+// ---- theme: Auto (the system's), Light or Dark, per browser; theme.js applies it before first paint
+
+function setTheme(t) {
+  try { if (t) localStorage.setItem("aio-theme", t); else localStorage.removeItem("aio-theme"); } catch { /* this page only */ }
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  $$("[data-theme-set]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.themeSet === t)));
+}
+$$("[data-theme-set]").forEach((b) => b.addEventListener("click", () => setTheme(b.dataset.themeSet)));
+setTheme(document.documentElement.dataset.theme || "");
 
 function setPill(el, label, value, tone) {
   el.className = `pill ${tone || ""}`;
@@ -99,6 +299,8 @@ function renderDetail() {
   if (!w) { disconnectTerm(); return; }
 
   $("#d-name").textContent = w.name;
+  renderPin(w);
+  renderTags(w);
   $("#d-dir").textContent = w.dir;
   $$(".d-dir-inline").forEach((el) => (el.textContent = w.dir));
   const vm = w.kind === "microvm";

@@ -7,6 +7,7 @@
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/style.css">
+<script src="/static/theme.js"></script>
 <script src="/static/vendor/xterm.js" defer></script>
 <script src="/static/vendor/addon-fit.js" defer></script>
 <script src="/static/app.js" defer></script>
@@ -19,6 +20,14 @@
       <span>Agent Sandboxes</span>
     </header>
 
+    <div class="ws-tools">
+      <input id="ws-filter" type="search" placeholder="Filter  ( / )" aria-label="Filter workspaces: a name, folder or #tag" title="A name, folder or #tag; / to focus, Esc to clear" autocomplete="off" spellcheck="false">
+      <select id="ws-sort" aria-label="Sort workspaces" title="Sort">
+        <option value="name">A–Z</option>
+        <option value="activity">Recent</option>
+      </select>
+      <button id="ws-compact" class="btn ghost icon" type="button" aria-pressed="false" title="Compact rows">☰</button>
+    </div>
     <nav id="ws-list" class="ws-list" aria-label="Workspaces"></nav>
 
     <button id="new-toggle" class="btn ghost new-toggle" type="button">+ New workspace</button>
@@ -59,6 +68,11 @@
       <button id="settings-btn" class="ws-item pool-item" type="button" aria-current="false">
         <span class="n">Settings</span><span class="sub">Sign-in, monitoring, backups and sandbox notes</span>
       </button>
+      <div class="theme-switch" role="group" aria-label="Theme">
+        <button type="button" data-theme-set="" aria-pressed="true" title="Follow the system">Auto</button>
+        <button type="button" data-theme-set="light" aria-pressed="false">Light</button>
+        <button type="button" data-theme-set="dark" aria-pressed="false">Dark</button>
+      </div>
     </div>
   </aside>
 
@@ -71,8 +85,10 @@
     <section id="detail" class="detail" hidden>
       <header class="detail-head">
         <div class="title">
-          <h1 id="d-name"></h1>
+          <div class="title-row"><h1 id="d-name"></h1>
+            <button id="d-pin" class="btn ghost" type="button" aria-pressed="false" title="Pin to the top of the sidebar (this browser)">☆</button></div>
           <p class="meta"><span id="d-dir"></span> · <span id="d-port-label">sandbox port</span> <span id="d-port"></span></p>
+          <div class="d-tags" id="d-tags"></div>
         </div>
         <div class="status">
           <span class="pill" id="d-container"></span>
