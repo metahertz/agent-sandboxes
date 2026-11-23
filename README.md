@@ -321,6 +321,14 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
   Inside the sandbox, `git` uses the keys via `GIT_SSH_COMMAND`;
   SSH hosts must be on the allowlist (add e.g. `git.example.com` under *Also allow*).
   Network, token and limit changes need a Claude restart; the header says when.
+- **Not just bearer tokens.** A custom token (*Custom API, client ID or other value…*) is
+  *sent as* a header of any name and format (`X-Client-Id: {}`), a query parameter
+  (`?client_id=`), part of the URL path (`/bot{}/`), or HTTP Basic auth (store
+  `client_id:client_secret`; the agent sends any username and the placeholder as the
+  password). It's tracked and ticked per workspace like any token, and the agent still only
+  sees a placeholder. nono swaps it in that one place only. It doesn't swap a request
+  body, a file, or an address opened in a browser, so a value that has to appear there
+  can't be hidden from the agent this way.
 
 ### Apple builds
 

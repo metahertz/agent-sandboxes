@@ -110,6 +110,8 @@ HOST_SESSION = "host"
 UI_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("common.py")]
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+QUERY_PARAM_RE = re.compile(r"^[A-Za-z0-9_.~\[\]-]{1,64}$")
+PATH_PATTERN_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*\{\}[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
 MEM_RE = re.compile(r"^[1-9][0-9]{0,5}[MG]$")
 DISK_RE = re.compile(r"^[1-9][0-9]{0,3}G$")
 VM_DISK_MAX_GB = 4096
@@ -876,7 +878,12 @@ TOKEN_SERVICES = {
                         "allow_hosts": ["*.blobstore.apple.com"]},
 }
 # What a pool token's route may carry over to nono's custom_credentials
-ROUTE_EXTRAS = ("endpoint_rules",)
+ROUTE_EXTRAS = ("endpoint_rules", "inject_mode", "query_param_name", "path_pattern", "path_replacement")
+# Where nono's proxy puts a custom token: not every credential is an
+# Authorization header (client IDs in a query parameter, bot tokens in the
+# path, client_id:secret as Basic auth). There's no body substitution.
+INJECT_MODES = {"header": "a header", "query_param": "a query parameter", "url_path": "the URL path",
+                "basic_auth": "HTTP Basic auth"}
 ASC_CACHE_TTL = 15 * 60                       # asc-token's JWTs last 19 minutes
 ASC_KEY_ID_RE = re.compile(r"^[A-Z0-9]{8,12}$")
 ASC_ISSUER_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -1135,6 +1142,7 @@ async def pool_listing() -> dict:
         tid = p.name.removesuffix(".json")
         if (meta := token_meta(tid)) and (TOKEN_POOL / tid).is_file():
             tokens.append({"id": tid, **{k: meta[k] for k in ("service", "upstream", "env_var", "label")},
+                           "sent_as": sent_as(meta),
                            "workspaces": [n for n, pol in policies.items() if tid in pol["tokens"]]})
     signing = [{**{k: v for k, v in m.items() if k != "profiles"},
                 "profiles": [{k: v for k, v in x.items() if k not in ("entitlements", "certs")} for x in m["profiles"]],
@@ -1145,6 +1153,17 @@ async def pool_listing() -> dict:
                          for k, v in TOKEN_SERVICES.items()},
             "ascPresets": {k: v["label"] for k, v in ASC_PRESETS.items()},
             "netModes": NET_MODES}
+
+
+def sent_as(meta: dict) -> str:
+    mode = meta.get("inject_mode", "header")
+    if mode == "query_param":
+        return f"?{meta['query_param_name']}="
+    if mode == "url_path":
+        return f"path {meta['path_pattern']}"
+    if mode == "basic_auth":
+        return "Basic auth"
+    return f"{meta['inject_header']}: {meta['credential_format']}"
 
 
 async def add_ssh_key(body: dict) -> dict:
@@ -1216,10 +1235,10 @@ def add_token(body: dict) -> dict:
         return {"id": tid, **meta}
     if not secret or len(secret) > 8192 or any(c in secret for c in "\r\n\0"):
         raise ValueError("Paste the token (single line)")
+    c = body.get("custom", {}) or {}
     if service in TOKEN_SERVICES:
         meta = {"service": service, **TOKEN_SERVICES[service]}
     elif service == "custom":
-        c = body.get("custom", {}) or {}
         up = urllib.parse.urlsplit(str(c.get("upstream", "")).strip())
         try:
             if up.scheme not in ("https", "http") or not up.hostname or up.query or up.fragment \
@@ -1229,23 +1248,47 @@ def add_token(body: dict) -> dict:
             up.port
         except ValueError:
             raise ValueError("Upstream: an https:// or http:// URL (host, optional port and path)") from None
-        header = str(c.get("header") or "Authorization").strip()
-        fmt = str(c.get("format") or "Bearer {}").strip()
         env = str(c.get("env_var", "")).strip().upper()
-        if not HEADER_RE.match(header):
-            raise ValueError("Header: letters, digits and dashes")
-        if fmt.count("{}") != 1 or len(fmt) > 100 or any(ch in fmt for ch in "\r\n"):
-            raise ValueError("Format must contain {} exactly once, e.g. 'Bearer {}'")
         if not ENV_RE.match(env) or env in ("PATH", "HOME", "SSH_AUTH_SOCK") or env.startswith("NONO_"):
             raise ValueError("Environment variable: e.g. ACME_API_KEY")
         meta = {"service": "custom", "label": up.hostname,
                 "upstream": urllib.parse.urlunsplit((up.scheme, up.netloc.lower(), up.path.rstrip("/"), "", "")),
-                "inject_header": header, "credential_format": fmt, "env_var": env}
+                "env_var": env, **custom_injection(c, secret)}
     else:
         raise ValueError("Unknown service")
     private_write(TOKEN_POOL / tid, secret)
     private_write(TOKEN_POOL / f"{tid}.json", json.dumps(meta, indent=2) + "\n")
     return {"id": tid, **meta}
+
+
+def custom_injection(c: dict, secret: str) -> dict:
+    """Where nono's proxy swaps the placeholder for the real value."""
+    mode = str(c.get("mode") or "header")
+    if mode not in INJECT_MODES:
+        raise ValueError("Sent as: a header, a query parameter, the URL path or Basic auth")
+    if mode == "header":
+        header = str(c.get("header") or "Authorization").strip()
+        fmt = str(c.get("format") or "Bearer {}").strip()
+        if not HEADER_RE.match(header) or header.lower() in ("host", "content-length", "transfer-encoding",
+                                                             "connection", "proxy-authorization"):
+            raise ValueError("Header: letters, digits and dashes (not Host, Connection, …)")
+        if fmt.count("{}") != 1 or len(fmt) > 100 or any(ch in fmt for ch in "\r\n"):
+            raise ValueError("Format must contain {} exactly once, e.g. 'Bearer {}', or just {}")
+        return {"inject_header": header, "credential_format": fmt}
+    out = {"inject_mode": mode, "inject_header": "Authorization", "credential_format": "{}"}
+    if mode == "query_param":
+        name = str(c.get("param") or "").strip()
+        if not QUERY_PARAM_RE.match(name):
+            raise ValueError("Query parameter: its name, e.g. client_id or key")
+        out["query_param_name"] = name
+    elif mode == "url_path":
+        pat = str(c.get("path") or "").strip()
+        if pat.count("{}") != 1 or len(pat) > 100 or not PATH_PATTERN_RE.match(pat):
+            raise ValueError("Path pattern: starts with / and has {} once where the value goes, e.g. /bot{}/")
+        out.update(path_pattern=pat, path_replacement=pat)
+    elif ":" not in secret:
+        raise ValueError("Basic auth: the value is username:password (e.g. client_id:client_secret)")
+    return out
 
 
 POLICY_KEY = {"ssh": "ssh_keys", "token": "tokens", "signing": "signing"}
@@ -1507,14 +1550,27 @@ def token_lines(pol: dict) -> str:
                        f"{scope} Uploading a build's bytes goes to the pre-signed URLs the API returns "
                        "(*.blobstore.apple.com, allowed), without the Authorization header.")
             continue
-        header = f"{meta['inject_header']}: {meta['credential_format'].replace('{}', '$' + env)}"
         if meta["upstream"].startswith("http://"):
             how = (f"call **`${var}`** plus the path, never `{meta['upstream']}` itself "
-                   "(plain HTTP: the real token is only added on that route)")
+                   "(plain HTTP: the real value is only added on that route)")
         else:
             how = f"call `{meta['upstream']}` or `${var}`, plus the path"
-        out.append(f"- `${env}` ({tid}) for {meta['upstream']}: {how}, with the header `{header}`.")
+        out.append(f"- `${env}` ({tid}) for {meta['upstream']}: {how}, {placement(meta)}.")
     return "\n".join(out) or "- No API tokens are assigned to this workspace."
+
+
+def placement(meta: dict) -> str:
+    """Where the agent puts a token's placeholder for the proxy to swap it."""
+    env = "$" + meta["env_var"]
+    mode = meta.get("inject_mode", "header")
+    if mode == "query_param":
+        return (f"with the query parameter `{meta['query_param_name']}={env}` (the proxy swaps the placeholder "
+                "there only: not in a request body, a file or a browser address)")
+    if mode == "url_path":
+        return f"with `{meta['path_pattern'].replace('{}', env)}` in the path"
+    if mode == "basic_auth":
+        return f"with HTTP Basic auth, any username and the password `{env}` (e.g. `curl -u x:{env}`)"
+    return f"with the header `{meta['inject_header']}: {meta['credential_format'].replace('{}', env)}`"
 
 
 def builds_lines(pol: dict) -> str:
