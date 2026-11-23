@@ -423,6 +423,13 @@
               <p class="hint">Not just bearer tokens: anything the API takes in a header (e.g. <code>X-Client-Id</code> with format <code>{}</code>), a query parameter (<code>?client_id=</code>), the URL path, or Basic auth (store <code>client_id:client_secret</code>). The agent only gets a placeholder, which the proxy swaps there and nowhere else: not in a request body, a file or a browser address.</p>
               <p class="hint">For an <code>http://</code> API, Claude calls <code>$POOL_&lt;NAME&gt;_BASE_URL</code> (e.g. <code>$POOL_GRAFANA_RO_BASE_URL/api/search</code>) instead of the real URL; the token is added on the way and travels unencrypted from this host to the API. HTTPS APIs work at their own URL too.</p>
             </div>
+            <div id="tok-plain" hidden>
+              <p class="hint">A value the agent may see, such as a client ID, an account or project ID, or a public key. It's set as a real environment variable rather than a placeholder, so it works anywhere: request bodies, config files, URLs in a browser. It's still kept here, listed, and given only to the workspaces you tick. Don't use this for secrets.</p>
+              <div class="row">
+                <label>Env var <input name="plain_env" placeholder="GOOGLE_CLIENT_ID" autocomplete="off" spellcheck="false"></label>
+                <label>What it is <input name="plain_note" placeholder="iOS OAuth client ID" maxlength="80"></label>
+              </div>
+            </div>
             <div id="tok-asc" hidden>
               <p class="hint">An App Store Connect <strong>team</strong> API key (App Store Connect → Users and Access → Integrations → App Store Connect API). The <code>.p8</code> stays on this host: the proxy signs a short-lived token with it for each workspace's requests, so the agent only ever sees a placeholder. Give the key the least role that does the job (App Manager for TestFlight).</p>
               <div class="row">

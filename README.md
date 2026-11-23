@@ -329,6 +329,13 @@ runs in a VM of its own, as `dev` with passwordless sudo and Docker, in `/projec
   sees a placeholder. nono swaps it in that one place only. It doesn't swap a request
   body, a file, or an address opened in a browser, so a value that has to appear there
   can't be hidden from the agent this way.
+- **Plain values** (*Plain value, visible to the agent*) are for those, when they aren't
+  secret: a client ID, an account or project ID. It's set as a real environment variable:
+  through nono's `set_vars`, and in the filtered container's and the microVM's env files.
+  It's stored in `secrets/tokens/`, listed and ticked per workspace like a token, and the
+  agent's notes mark it as a real value. Names the sandbox sets itself (`PATH`,
+  `HTTPS_PROXY`, `POOL_*`, `CLAUDE_*`, …) are refused. Values can't contain spaces, quotes,
+  `$`, `#` or `\`, so every env file reads them the same way.
 
 ### Apple builds
 

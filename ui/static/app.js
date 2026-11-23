@@ -1432,12 +1432,14 @@ async function loadPool() {
   renderMatrix($("#m-ssh"), "ssh", poolData.ssh, (k) => `${k.type} ${k.fingerprint} · ${k.comment}`);
   renderMatrix($("#m-signing"), "signing", poolData.signing || [], (s) =>
     `${s.name} · team ${s.team} · ${new Date(s.expires) < new Date() ? "EXPIRED " : "until "}${day(s.expires)}`);
-  renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => `${t.label} (${t.upstream}) → $${t.env_var}${t.sent_as ? ` · ${t.sent_as}` : ""}`
+  renderMatrix($("#m-tokens"), "tokens", poolData.tokens, (t) => t.service === "plain" ? `${t.label} → $${t.env_var} · ${t.sent_as}`
+    : `${t.label} (${t.upstream}) → $${t.env_var}${t.sent_as ? ` · ${t.sent_as}` : ""}`
     + (t.upstream.startsWith("http://") ? ` · call it via $${baseUrlVar(t.id)}` : ""));
   const sel = $("#tok-service");
   if (!sel.options.length) {
     for (const [k, v] of Object.entries(poolData.services)) sel.append(el("option", { value: k, textContent: `${v.label} → $${v.env_var}` }));
     sel.append(el("option", { value: "custom", textContent: "Custom API, client ID or other value…" }));
+    sel.append(el("option", { value: "plain", textContent: "Plain value, visible to the agent (env var)…" }));
     for (const [k, v] of Object.entries(poolData.ascPresets || {})) $("#tok-asc-preset").append(el("option", { value: k, textContent: v }));
     $("#tok-asc-preset").value = "testflight";
   }
@@ -1464,6 +1466,7 @@ const baseUrlVar = (id) => `POOL_${id.replace(/-/g, "_").toUpperCase()}_BASE_URL
 function tokServiceChanged() {
   const v = $("#tok-service").value, asc = v === "appstoreconnect";
   $("#tok-custom").hidden = v !== "custom";
+  $("#tok-plain").hidden = v !== "plain";
   $("#tok-asc").hidden = !asc;
   $("#tok-secret").hidden = asc;
   $("#add-tokens").elements.secret.required = !asc;
@@ -1473,7 +1476,9 @@ function tokModeChanged() {
   const mode = $("#tok-mode").value;
   $$("#tok-custom [data-mode]").forEach((x) => { x.hidden = x.dataset.mode !== mode; });
   const basic = $("#tok-service").value === "custom" && mode === "basic_auth";
-  $("#tok-secret-label").textContent = basic ? "Value (username:password)" : "Token";
+  const plain = $("#tok-service").value === "plain";
+  $("#tok-secret-label").textContent = basic ? "Value (username:password)" : plain ? "Value" : "Token";
+  $("#add-tokens").elements.secret.type = plain ? "text" : "password";
   $("#add-tokens").elements.secret.placeholder = basic ? "client_id:client_secret" : "";
 }
 $("#tok-mode").addEventListener("change", tokModeChanged);
@@ -1522,6 +1527,7 @@ $("#add-tokens").addEventListener("submit", (ev) => {
   const service = f.service.value;
   const asc = service === "appstoreconnect";
   submitAdd(ev.currentTarget, "pool/tokens", { id: f.id.value.trim(), service, secret: asc ? f.asc_p8.value : f.secret.value,
+    plain: service === "plain" ? { env_var: f.plain_env.value.trim(), note: f.plain_note.value.trim() } : undefined,
     asc: asc ? { key_id: f.asc_key_id.value.trim(), issuer_id: f.asc_issuer_id.value.trim(), preset: f.asc_preset.value } : undefined,
     custom: service === "custom" ? { upstream: f.upstream.value.trim(), env_var: f.env_var.value.trim(), mode: f.mode.value,
       header: f.header.value.trim(), format: f.format.value.trim(), param: f.param.value.trim(), path: f.path.value.trim() } : undefined });

@@ -110,6 +110,15 @@ HOST_SESSION = "host"
 UI_SOURCES = [Path(__file__).resolve(), Path(__file__).resolve().with_name("common.py")]
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+# A plain value goes into env files (Docker's, systemd's, /etc/environment)
+# as is, so nothing those would read differently: no quotes, $, \ or spaces
+PLAIN_VALUE_RE = re.compile(r"^[A-Za-z0-9._~:/@+=,%^*!?&|<>()\[\]{}-]{1,2048}$")
+# Variables the sandbox itself relies on; a pool entry mustn't replace them
+RESERVED_ENV = ("PATH", "HOME", "USER", "SHELL", "TERM", "LANG", "PWD", "TMPDIR", "SSH_AUTH_SOCK",
+                "GIT_SSH_COMMAND", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "PROXY_SERVER",
+                "REQUESTS_CA_BUNDLE", "PIP_CERT", "SSL_CERT_FILE", "LD_PRELOAD", "LD_LIBRARY_PATH",
+                "RUN_HOOK_INIT", "NODE_EXTRA_CA_CERTS", "NODE_USE_ENV_PROXY", "NODE_OPTIONS")
+RESERVED_ENV_PREFIXES = ("NONO_", "POOL_", "AIO_", "OTEL_", "CLAUDE_", "ANTHROPIC_", "LD_")
 QUERY_PARAM_RE = re.compile(r"^[A-Za-z0-9_.~\[\]-]{1,64}$")
 PATH_PATTERN_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*\{\}[A-Za-z0-9._~!$&'()*+,;=:@%/-]*$")
 MEM_RE = re.compile(r"^[1-9][0-9]{0,5}[MG]$")
@@ -1156,6 +1165,8 @@ async def pool_listing() -> dict:
 
 
 def sent_as(meta: dict) -> str:
+    if meta["service"] == "plain":
+        return "plain value, visible to the agent"
     mode = meta.get("inject_mode", "header")
     if mode == "query_param":
         return f"?{meta['query_param_name']}="
@@ -1236,6 +1247,18 @@ def add_token(body: dict) -> dict:
     if not secret or len(secret) > 8192 or any(c in secret for c in "\r\n\0"):
         raise ValueError("Paste the token (single line)")
     c = body.get("custom", {}) or {}
+    if service == "plain":
+        # Not secret from the agent: set as the real value (a client ID, an
+        # account or project ID, a public key), but kept, listed and assigned here
+        pl = body.get("plain", {}) or {}
+        env = check_env_name(pl.get("env_var", ""))
+        note = " ".join(str(pl.get("note", "")).split())[:80]
+        if not PLAIN_VALUE_RE.match(secret):
+            raise ValueError("Value: up to 2048 characters, no spaces, quotes, $ or \\")
+        meta = {"service": "plain", "label": note or "Plain value", "upstream": "", "env_var": env}
+        private_write(TOKEN_POOL / tid, secret)
+        private_write(TOKEN_POOL / f"{tid}.json", json.dumps(meta, indent=2) + "\n")
+        return {"id": tid, **meta}
     if service in TOKEN_SERVICES:
         meta = {"service": service, **TOKEN_SERVICES[service]}
     elif service == "custom":
@@ -1248,9 +1271,7 @@ def add_token(body: dict) -> dict:
             up.port
         except ValueError:
             raise ValueError("Upstream: an https:// or http:// URL (host, optional port and path)") from None
-        env = str(c.get("env_var", "")).strip().upper()
-        if not ENV_RE.match(env) or env in ("PATH", "HOME", "SSH_AUTH_SOCK") or env.startswith("NONO_"):
-            raise ValueError("Environment variable: e.g. ACME_API_KEY")
+        env = check_env_name(c.get("env_var", ""))
         meta = {"service": "custom", "label": up.hostname,
                 "upstream": urllib.parse.urlunsplit((up.scheme, up.netloc.lower(), up.path.rstrip("/"), "", "")),
                 "env_var": env, **custom_injection(c, secret)}
@@ -1259,6 +1280,27 @@ def add_token(body: dict) -> dict:
     private_write(TOKEN_POOL / tid, secret)
     private_write(TOKEN_POOL / f"{tid}.json", json.dumps(meta, indent=2) + "\n")
     return {"id": tid, **meta}
+
+
+def check_env_name(v) -> str:
+    env = str(v).strip().upper()
+    if not ENV_RE.match(env):
+        raise ValueError("Environment variable: capitals, digits and _, e.g. ACME_CLIENT_ID")
+    if env in RESERVED_ENV or env.startswith(RESERVED_ENV_PREFIXES):
+        raise ValueError(f"Environment variable: {env} is one the sandbox sets itself; pick another name")
+    return env
+
+
+def plain_value(tid: str) -> str | None:
+    """A plain pool value, read for the env it's set in (None if it's gone or not plain)."""
+    meta = token_meta(tid)
+    if not meta or meta.get("service") != "plain":
+        return None
+    try:
+        v = (TOKEN_POOL / tid).read_text().strip()
+    except OSError:
+        return None
+    return v if PLAIN_VALUE_RE.match(v) else None
 
 
 def custom_injection(c: dict, secret: str) -> dict:
@@ -1420,9 +1462,13 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
         # its own servers (on any address: nono can't limit that), and connecting to them
         net["listen_port"] = ports
         net["open_port"] += ports
-    creds, capture = {}, {}
+    creds, capture, plain = {}, {}, {}
     for tid in pol["tokens"]:
         meta = token_meta(tid)
+        if meta["service"] == "plain":
+            if (v := plain_value(tid)) is not None:
+                plain[meta["env_var"]] = v
+            continue
         route = "pool_" + tid.replace("-", "_")
         creds[route] = {
             "upstream": bridge_upstream(tid, meta["upstream"]), "credential_key": f"file://{TOKEN_POOL / tid}",
@@ -1443,7 +1489,7 @@ def render_profile(ws: dict[str, str], pol: dict) -> dict:
     if creds:
         net["credentials"] = sorted(creds)
         net["custom_credentials"] = creds
-    env = {"SSH_AUTH_SOCK": str(agent_sock(name)),
+    env = {**plain, "SSH_AUTH_SOCK": str(agent_sock(name)),
            "GIT_SSH_COMMAND": f"ssh -F {st / 'ssh_config'}"}
     if telemetry:
         # Claude Code's own metrics and events (tokens, cost, tool decisions;
@@ -1540,6 +1586,11 @@ def token_lines(pol: dict) -> str:
         if not (meta := token_meta(tid)):
             continue
         env, var = meta["env_var"], base_url_var(tid)
+        if meta["service"] == "plain":
+            out.append(f"- `${env}` ({tid}{', ' + meta['label'] if meta['label'] != 'Plain value' else ''}): "
+                       "a plain value, the real thing rather than a placeholder, so it works anywhere (request "
+                       "bodies, config files, URLs). Prefer reading it from the variable to hard-coding it.")
+            continue
         if meta["service"] == "appstoreconnect":
             scope = ("Only these calls are let through: TestFlight builds, build uploads, beta groups, testers "
                      "and beta localizations; anything else gets 403." if meta.get("endpoint_rules")
@@ -1638,14 +1689,16 @@ def session_prompt(ws: dict[str, str], pol: dict) -> str:
               "Programs that ignore the proxy variables can't connect.")
         if not pol["tokens"]:
             return vm + builds_lines(pol)
-        return vm + (" API token variables hold placeholders; the proxy swaps in the real token only on "
+        return vm + (" API token variables hold placeholders (except plain values, marked below); the proxy "
+                     "swaps in the real token only on "
                      "requests that carry the placeholder. Never ask the user for a real token.\n"
                      + token_lines(pol) + builds_lines(pol))
     if not pol["tokens"]:
         return (f"This session runs in the agent-sandboxes workspace {ws['WS_NAME']}, inside a nono sandbox."
                 + builds_lines(pol)) if pol["builds"] else ""
     return (f"This session runs in the agent-sandboxes workspace {ws['WS_NAME']}, inside a nono sandbox. "
-            "API token variables hold placeholders; nono's proxy swaps in the real token only on requests "
+            "API token variables hold placeholders (except plain values, marked below); nono's proxy swaps in "
+            "the real token only on requests "
             "that carry the placeholder, and for plain-HTTP APIs only via the base URL variable. "
             "Never ask the user for a real token.\n" + token_lines(pol) + builds_lines(pol))
 
@@ -3530,7 +3583,10 @@ def container_env_text(ws: dict[str, str], pol: dict, gw: str | None = None,
            "NODE_EXTRA_CA_CERTS": CONTAINER_CA_MOUNT, "REQUESTS_CA_BUNDLE": bundle, "PIP_CERT": bundle,
            "NODE_USE_ENV_PROXY": "1"}      # Node's own fetch honours HTTPS_PROXY (as nono sets for Claude)
     for tid in pol["tokens"]:
-        if meta := token_meta(tid):
+        if (meta := token_meta(tid)) and meta["service"] == "plain":
+            if (v := plain_value(tid)) is not None:
+                env[meta["env_var"]] = v
+        elif meta:
             env[meta["env_var"]] = pw
             env[base_url_var(tid)] = f"http://{gw}:{port}/pool_{tid.replace('-', '_')}"
     return "# Generated by agent-sandboxes (Access tab -> Container network). Don't edit.\n" + \
@@ -3644,7 +3700,10 @@ def vm_proxy_env_text(ws: dict[str, str], pol: dict) -> str:
     if pol["vm_browser"]:     # .mcp.json's aio-sandbox server: the container in the VM
         env.update({"AIO_PORT": str(VM_BROWSER_PORT), "AIO_KEY": ws["WS_KEY"]})
     for tid in pol["tokens"]:
-        if meta := token_meta(tid):
+        if (meta := token_meta(tid)) and meta["service"] == "plain":
+            if (v := plain_value(tid)) is not None:
+                env[meta["env_var"]] = v
+        elif meta:
             env[meta["env_var"]] = pw
             env[base_url_var(tid)] = f"http://{relay}/pool_{tid.replace('-', '_')}"
     if pol["builds"]:
