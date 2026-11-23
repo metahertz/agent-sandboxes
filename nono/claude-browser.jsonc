@@ -22,6 +22,10 @@
   // Default-deny pathname Unix sockets (Docker, tmux, D-Bus/systemd --user
   // would all be ways out of the sandbox). Grant specific ones per workspace.
   "linux": { "af_unix_mediation": "pathname" },
+  // The user and group databases: ssh (and git over ssh) exits with "No user
+  // exists for uid …" without them. nono grants these itself from v0.76
+  // (#1806); listed here for older versions. World-readable, no hashes.
+  "filesystem": { "read_file": ["/etc/passwd", "/etc/group"] },
   "session_hooks": {
     // Runs outside the sandbox before Claude starts; exports AIO_PORT and
     // AIO_KEY for the project in the working directory (see the script).
