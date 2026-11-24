@@ -116,6 +116,10 @@ flowchart LR
 | `monitoring/grafana/build-dashboards.py` → `dashboards/*.json` | Provisioned dashboards (edit the script, re-run) |
 | `monitoring/.env` ✱, `monitoring/data/` ✱, `secrets/grafana-admin-password` ✱ | Monitoring settings, exporter output, Grafana data |
 | `secrets/backup.json` ✱, `secrets/backup-status.json` ✱ | Backup settings (NAS password included) and recent runs |
+| `ui/shares.py`, `ui/static/guest.*` | Sharing a workspace: share links, guest sessions; the guest's page |
+| `bin/share-relay`, `systemd/agent-sandboxes-relay.service` | The sharing relay: setup, the VPS's script, the reverse SSH tunnel (user unit) |
+| `ui/share.env` ✱, `secrets/relay/` ✱ | Relay settings (share hostnames, VPS); the tunnel's key and the VPS's pinned host key |
+| `ui/shares.json` ✱, `ui/shares.log` ✱ | Share links (token hashes, scope, expiry); who joined, left, downloaded, uploaded |
 
 ✱ created at runtime, git-ignored.
 
@@ -647,6 +651,73 @@ laptops without PageUp), not open windows or switch sessions. With the wheel han
 tmux, selecting text in the web terminal takes Shift-drag (Option-drag on a Mac). Use a key per
 workspace, and not one that already logs in to the account unrestricted (sshd would use
 that line first; the UI refuses such keys).
+
+## Sharing a workspace
+
+A workspace's **Share** tab makes a link for one person, somewhere else on the
+internet, to watch Claude work there or to drive it with you:
+
+- **Terminal:** *watch only* (a read-only tmux client that ignores the guest's
+  window size, and the page drops their keystrokes too) or *watch and type*.
+- **Project files** (optional): download, or download and upload, in
+  `/home/gem/workspace` only (symlinks resolved, so nothing outside it).
+- **The sandbox's browser desktop** (optional, only for a guest who types):
+  noVNC and its websocket, on a second hostname, never VS Code or the
+  container's shell.
+
+Links expire after 1 hour to 7 days. *Revoke* or *New link* disconnects the
+guest at once. The sidebar and the workspace header show who is in the terminal.
+A guest who types acts as Claude in that workspace: with its keys, tokens,
+network access and files. `ui/shares.log` records who joined, left,
+downloaded and uploaded.
+
+**How guests reach it: your own VPS as the relay.** Guests never reach this
+host directly, so you need no port forward, static IP or STUN/TURN here, and
+CGNAT doesn't matter:
+
+```
+guest ─https─▶ Caddy on your VPS ─▶ VPS 127.0.0.1:18443 ═ssh -R tunnel from this host═▶ 127.0.0.1:9443 (share listener)
+```
+
+The UI's **share listener** (`127.0.0.1:9443`) is separate from the UI and only
+has guest routes: the guest page, that share's terminal, files and desktop. The
+UI's API, settings, other workspaces and the host shell aren't routed there at
+all, and your sign-in cookie means nothing to it.
+
+Setup, once you have a VPS with a public IP (Debian or Ubuntu) and two DNS names
+pointing at it:
+
+```bash
+bin/share-relay init vps.example.com share.example.com desktop.share.example.com
+#   a tunnel key in secrets/relay/, the VPS's ssh host key (check the fingerprint
+#   it prints, then it's pinned), ui/share.env; prints the VPS script
+# on the VPS, as root: run that script (bin/share-relay vps-script prints it again)
+bin/share-relay start                       # the tunnel: systemd user unit agent-sandboxes-relay
+sudo systemctl restart agent-sandboxes-ui   # the UI starts the share listener
+```
+
+The VPS script:
+- **Creates user `aio-relay`.** It may only open that one reverse forward
+  (`restrict,port-forwarding,permitlisten="127.0.0.1:18443"` and a matching
+  `sshd_config.d` block): no shell, no other forwards.
+- **Installs Caddy** with a site for both names. Caddy gets Let's Encrypt
+  certificates and passes the guest's address on in `X-Forwarded-For`.
+  - It's added as `/etc/caddy/aio-share.caddy` plus an `import` line; your
+    existing Caddyfile is kept.
+
+*Settings → Sharing relay* shows the tunnel's state. *Check from the internet*
+fetches `https://<share-host>/__relay/ping` the way a guest would: DNS, Caddy
+and the tunnel in one go.
+
+Notes:
+- **The VPS sees guest traffic in plain text,** because Caddy ends TLS there.
+  It's your own machine, but treat it as part of the setup.
+- **Bad links are rate-limited per address.** This limiter is separate from the
+  UI's sign-in, so strangers trying links can't lock you out.
+- **Guest sessions live in memory.** After a UI restart, guests open their link
+  again. Links stay valid until they expire or you revoke them.
+- **Without `ui/share.env`, sharing is off:** there's no listener and no tunnel.
+  `bin/share-relay stop` takes the tunnel down.
 
 ## Backup
 
