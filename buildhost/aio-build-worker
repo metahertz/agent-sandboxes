@@ -11,9 +11,12 @@ the job, claim it, send its log and heartbeats, and push its result
      read-only and an output folder shared read-write
   3. tart exec: copy the source in, run the fixed xcodebuild steps for the
      job's action (build, test, run = build + launch in the Simulator +
-     screenshot, archive = an ad-hoc signed .xcarchive), copy the outputs out
+     screenshots, screenshots = the UI tests' screenshot attachments,
+     archive = an ad-hoc signed .xcarchive), copy the outputs out
   4. push summary.json, build.log, test-summary.json and screenshots/ as
-     refs/results/<id>; upload a zipped archive or an .ipa as an artifact
+     refs/results/<id>; upload a zipped archive or an .ipa as an artifact.
+     The output folder is the VM's to write: every file is read from it
+     with O_NOFOLLOW, so a symlink there can't hand over a file of this Mac
   5. stop and delete the VM, remove the checkout
 
 An export job signs an archive job's .xcarchive with an identity from the
@@ -47,7 +50,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "2"
+VERSION = "3"
 CONFIG = Path(os.environ.get("AIO_BUILD_CONFIG", "~/.aio-build/config.json")).expanduser()
 DEFAULTS = {
     "name": "", "host": "", "port": 22,
@@ -67,7 +70,7 @@ MAX_RESULT_LOG = 5 << 20
 # Same rules as aio-buildd's check (it refused anything else at push time;
 # checked again because the commands below are built from these strings)
 SPEC_RULES = {
-    "action": re.compile(r"^(build|test|run|archive|export)$"),
+    "action": re.compile(r"^(build|test|run|screenshots|archive|export)$"),
     "scheme": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,99}$"),
     "project": re.compile(r"^$|^(?![/-])(?!.*(^|/)\.\.(/|$))[A-Za-z0-9 _.+/-]{1,200}$"),
     "destination": re.compile(r"^$|^[A-Za-z0-9 _.,=:()+/-]{1,200}$"),
@@ -84,6 +87,75 @@ OPTIONAL_RULES = {
     "team": re.compile(r"^[A-Z0-9]{10}$"),
 }
 SEAL_KEY = Path("~/.aio-build/seal.pem").expanduser()
+
+# Screenshot plans (run and screenshots jobs), checked the same way by
+# the UI, aio-buildd and the worker, which builds simctl commands from them
+PLAN_KEYS = ("shots", "devices", "appearances", "locales", "status_bar", "grant", "only_testing")
+PLAN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+PLAN_ARG_RE = re.compile(r"^[A-Za-z0-9 _.,=:/+@%()-]{0,200}$")
+PLAN_ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
+PLAN_URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]{0,30}:[A-Za-z0-9._~:/?#@!&()*+,;=%-]{1,300}$")
+PLAN_DEVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ()._-]{0,59}$")
+PLAN_LOCALE_RE = re.compile(r"^[a-z]{2,3}([_-][A-Za-z0-9]{2,8}){0,2}$")
+PLAN_TEST_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,99}(/[A-Za-z_][A-Za-z0-9_]{0,99}){0,2}$")
+MAX_SHOTS = 60          # screenshots per job
+MAX_TEST_RUNS = 16      # device x locale x appearance runs of a screenshots job
+
+
+def check_plan(spec: dict) -> str:
+    """'' if the job's screenshot plan (if any) is acceptable, else why not."""
+    action = spec.get("action")
+    used = [k for k in PLAN_KEYS if k in spec]
+    if used and action not in ("run", "screenshots"):
+        return f"{', '.join(used)}: for run and screenshots jobs"
+
+    def strs(k, rx, most):
+        v = spec.get(k, [])
+        return (isinstance(v, list) and len(v) <= most and len(set(v)) == len(v)
+                and all(isinstance(x, str) and rx.match(x) for x in v))
+    if not strs("devices", PLAN_DEVICE_RE, 4):
+        return "devices: up to 4 Simulator device names, e.g. iPhone 16 Pro Max"
+    if not strs("locales", PLAN_LOCALE_RE, 4):
+        return "locales: up to 4, e.g. en_US, de_DE"
+    if not strs("appearances", re.compile(r"^(light|dark)$"), 2):
+        return "appearances: light and/or dark"
+    if not strs("only_testing", PLAN_TEST_RE, 8):
+        return "only_testing: up to 8 of Target, Target/Class or Target/Class/testMethod"
+    if spec.get("only_testing") and action != "screenshots":
+        return "only_testing: for screenshots jobs"
+    if spec.get("status_bar", "clean") != "clean" or spec.get("grant", "all") != "all":
+        return "status_bar: clean; grant: all"
+    shots = spec.get("shots", [])
+    if not isinstance(shots, list) or len(shots) > 12:
+        return "shots: up to 12"
+    if shots and action != "run":
+        return "shots: for run jobs (a screenshots job's come from its UI tests)"
+    names = set()
+    for s in shots:
+        if not isinstance(s, dict) or set(s) - {"name", "args", "env", "url", "wait"}:
+            return "each shot: name, and optionally args, env, url, wait"
+        if not isinstance(s.get("name"), str) or not PLAN_NAME_RE.match(s["name"]) or s["name"] in names:
+            return "shot names: lowercase letters, digits and dashes, unique"
+        names.add(s["name"])
+        a = s.get("args", [])
+        if not isinstance(a, list) or len(a) > 10 or not all(isinstance(x, str) and PLAN_ARG_RE.match(x) for x in a):
+            return f"shot {s['name']}: args, up to 10 (letters, digits, spaces and _ . , = : / + @ % ( ) -)"
+        e = s.get("env", {})
+        if not isinstance(e, dict) or len(e) > 10 or not all(
+                PLAN_ENV_RE.match(k) and isinstance(v, str) and PLAN_ARG_RE.match(v) for k, v in e.items()):
+            return f"shot {s['name']}: env, up to 10 NAME: value"
+        if "url" in s and not (isinstance(s["url"], str) and PLAN_URL_RE.match(s["url"])):
+            return f"shot {s['name']}: url, a deep link such as myapp://notes/1"
+        w = s.get("wait", 5)
+        if not isinstance(w, int) or isinstance(w, bool) or not 0 <= w <= 60:
+            return f"shot {s['name']}: wait, 0-60 seconds"
+    runs = max(1, len(spec.get("devices", []))) * max(1, len(spec.get("locales", []))) \
+        * max(1, len(spec.get("appearances", [])))
+    if action == "run" and runs * max(1, len(shots)) > MAX_SHOTS:
+        return f"at most {MAX_SHOTS} screenshots per job (devices x locales x appearances x shots)"
+    if action == "screenshots" and runs > MAX_TEST_RUNS:
+        return f"at most {MAX_TEST_RUNS} device x locale x appearance runs per job"
+    return ""
 
 
 def log(msg: str):
@@ -398,40 +470,126 @@ class Worker:
         summary["finished"] = time.time()
         summary["seconds"] = round(summary["finished"] - summary["started"])
         logf.flush()
-        outputs = [f for ext in ("zip", "ipa", "pkg") for f in out.glob(f"*.{ext}")] if out.is_dir() else []
-        for f in sorted(outputs):
-            name = re.sub(r"[^A-Za-z0-9._-]", "_", f.name)[:100]
-            try:
-                with f.open("rb") as fh:
-                    self.ssh("artifact", ws, jid, name, input=fh.read(), timeout=3600)
-                summary.setdefault("artifacts", []).append(name)
-                say(f"== uploaded {name}")
-            except (RuntimeError, OSError, subprocess.SubprocessError) as e:
-                say(f"== couldn't upload {name}: {e}")
-        res = Path(tempfile.mkdtemp(prefix="result-", dir=self.work))
+        out_fd = open_dir(out)
         try:
-            data = full_log.read_bytes()
-            (res / "build.log").write_bytes(data[-MAX_RESULT_LOG:])
-            if out.is_dir():
-                if (out / "test-summary.json").is_file():
-                    shutil.copy(out / "test-summary.json", res / "test-summary.json")
-                shots = [p for p in out.glob("screenshots/*.png")][:20]
-                if shots:
-                    (res / "screenshots").mkdir()
-                    for p in shots:
-                        shutil.copy(p, res / "screenshots" / re.sub(r"[^A-Za-z0-9._-]", "_", p.name))
-            (res / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-            g = ["git", "-C", str(res), "-c", "core.hooksPath=/dev/null", "-c", f"user.name=aio-worker-{self.name}",
-                 "-c", "user.email=worker@agent-sandboxes.invalid"]
-            subprocess.run([*g, "init", "-q"], check=True)
-            subprocess.run([*g, "add", "-A"], check=True)
-            subprocess.run([*g, "commit", "-q", "-m", f"result of build/{jid}: {summary['status']}"], check=True)
-            p = subprocess.run([*g, "push", "-q", self.repo_url(ws), f"HEAD:refs/results/{jid}"],
-                               env=self.git_env, capture_output=True, text=True, timeout=600)
-            if p.returncode != 0:
-                raise RuntimeError(p.stderr.strip()[:500])
+            names = os.listdir(out_fd) if out_fd is not None else []
+            for name in sorted(n for n in names if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(zip|ipa|pkg)", n)):
+                data = read_out(out_fd, name, 4 << 30)
+                if data is None:
+                    continue
+                try:
+                    self.ssh("artifact", ws, jid, name, input=data, timeout=3600)
+                    summary.setdefault("artifacts", []).append(name)
+                    say(f"== uploaded {name}")
+                except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+                    say(f"== couldn't upload {name}: {e}")
+            res = Path(tempfile.mkdtemp(prefix="result-", dir=self.work))
+            try:
+                data = full_log.read_bytes()
+                (res / "build.log").write_bytes(data[-MAX_RESULT_LOG:])
+                if out_fd is not None:
+                    if (ts := read_out(out_fd, "test-summary.json", 5 << 20)) is not None:
+                        (res / "test-summary.json").write_bytes(ts)
+                    if n := copy_screenshots(out_fd, res / "screenshots"):
+                        say(f"== {n} screenshot(s)")
+                self.push_result(ws, jid, res, summary)
+            finally:
+                shutil.rmtree(res, ignore_errors=True)
         finally:
-            shutil.rmtree(res, ignore_errors=True)
+            if out_fd is not None:
+                os.close(out_fd)
+
+    def push_result(self, ws, jid, res: Path, summary: dict):
+        (res / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        g = ["git", "-C", str(res), "-c", "core.hooksPath=/dev/null", "-c", f"user.name=aio-worker-{self.name}",
+             "-c", "user.email=worker@agent-sandboxes.invalid"]
+        subprocess.run([*g, "init", "-q"], check=True)
+        subprocess.run([*g, "add", "-A"], check=True)
+        subprocess.run([*g, "commit", "-q", "-m", f"result of build/{jid}: {summary['status']}"], check=True)
+        p = subprocess.run([*g, "push", "-q", self.repo_url(ws), f"HEAD:refs/results/{jid}"],
+                           env=self.git_env, capture_output=True, text=True, timeout=600)
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.strip()[:500])
+
+
+# ---------------------------------------------------------------- the VM's outputs
+# The out folder is shared read-write into the VM: whatever's there, the job's
+# code may have put there, symlinks included. Opened step by step with
+# O_NOFOLLOW, read with a size limit.
+MAX_SHOT_BYTES = 25 << 20
+MAX_SHOTS_BYTES = 400 << 20
+SHOT_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,150}\.png$")
+
+
+def open_dir(path, dir_fd=None):
+    try:
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return None
+
+
+def read_out(dir_fd: int, name: str, limit: int):
+    """A regular file's bytes, or None (missing, a symlink, not a file, too big)."""
+    import stat
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read(limit + 1)
+        return data if len(data) <= limit else None
+    finally:
+        os.close(fd)
+
+
+def copy_screenshots(out_fd: int, dest: Path) -> int:
+    """screenshots/*.png (up to MAX_SHOTS), their thumbs/ and index.jsonl ->
+    dest/, with index.json listing what each one is."""
+    sfd = open_dir("screenshots", out_fd)
+    if sfd is None:
+        return 0
+    try:
+        files = sorted(n for n in os.listdir(sfd) if SHOT_FILE_RE.match(n))[:MAX_SHOTS]
+        kept, total = [], 0
+        for n in files:
+            data = read_out(sfd, n, MAX_SHOT_BYTES)
+            if data is None or not data.startswith(b"\x89PNG") or total + len(data) > MAX_SHOTS_BYTES:
+                continue
+            total += len(data)
+            dest.mkdir(exist_ok=True)
+            (dest / n).write_bytes(data)
+            kept.append(n)
+        tfd = open_dir("thumbs", sfd)
+        if tfd is not None:
+            try:
+                for n in kept:
+                    data = read_out(tfd, n, 2 << 20)
+                    if data is not None and data.startswith(b"\x89PNG"):
+                        (dest / "thumbs").mkdir(exist_ok=True)
+                        (dest / "thumbs" / n).write_bytes(data)
+            finally:
+                os.close(tfd)
+        index = []
+        raw = read_out(sfd, "index.jsonl", 1 << 20) or b""
+        for line in raw.decode(errors="replace").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and e.get("file") in kept:
+                index.append({k: str(v)[:200] for k, v in e.items()
+                              if k in ("file", "shot", "device", "locale", "appearance", "test")})
+        if kept:
+            listed = {e["file"] for e in index}
+            index += [{"file": n} for n in kept if n not in listed]
+            (dest / "index.json").write_text(json.dumps(index, indent=1) + "\n")
+        return len(kept)
+    finally:
+        os.close(sfd)
 
 
 class JobError(Exception):
@@ -449,6 +607,8 @@ def check(job: dict, spec: dict) -> str:
             return f"bad {k}"
     if spec["action"] == "export" and not (spec.get("from") and spec.get("method")):
         return "an export needs from and method"
+    if why := check_plan(spec):
+        return why
     if spec["workspace"] != job.get("workspace") or spec["commit"] != job.get("commit"):
         return "the spec doesn't match the job"
     return ""
@@ -476,6 +636,8 @@ def job_script(spec: dict, share_root: str) -> str:
         run = f"{args} build"
     elif action == "test":
         run = f"{args} test -resultBundlePath \"$OUT/result.xcresult\""
+    elif action == "screenshots":
+        run = f"{args} build-for-testing"
     else:
         # Ad-hoc signed ("-"), so the binary carries the project's entitlements
         # for export_build / sign_ipa to re-sign with; unsigned if that fails
@@ -484,15 +646,13 @@ def job_script(spec: dict, share_root: str) -> str:
                f"CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES PROVISIONING_PROFILE_SPECIFIER={team}")
         unsigned = (f"{args} archive -archivePath \"$OUT/build.xcarchive\" CODE_SIGNING_ALLOWED=NO "
                     "CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=\"\"")
-    m = re.search(r"(?:^|,)name=([^,]+)", spec.get("destination", ""))
-    device = q(m[1]) if m else "booted"
     lines = [
         "set -uo pipefail",
         f"SHARE={q(share_root)}",
         "OUT=\"$HOME/aio-out\"; rm -rf \"$OUT\" \"$HOME/aio-src\"; mkdir -p \"$OUT/screenshots\"",
         "finish() { rc=$?; [ -f \"$OUT/exit_code\" ] || echo $rc > \"$OUT/exit_code\";",
         "  cp \"$OUT/exit_code\" \"$SHARE/out/\" 2>/dev/null; cp \"$OUT\"/test-summary.json \"$SHARE/out/\" 2>/dev/null;",
-        "  mkdir -p \"$SHARE/out/screenshots\"; cp \"$OUT\"/screenshots/*.png \"$SHARE/out/screenshots/\" 2>/dev/null;",
+        "  cp -R \"$OUT/screenshots\" \"$SHARE/out/\" 2>/dev/null;",
         "  cp \"$OUT\"/*.zip \"$SHARE/out/\" 2>/dev/null; true; }",
         "trap finish EXIT",
         "ditto \"$SHARE/src\" \"$HOME/aio-src\" || exit 70",
@@ -514,21 +674,199 @@ def job_script(spec: dict, share_root: str) -> str:
                   "> \"$OUT/test-summary.json\" 2>/dev/null || rm -f \"$OUT/test-summary.json\""]
     if action == "archive":
         lines += ["[ $rc = 0 ] && (cd \"$OUT\" && ditto -c -k --keepParent build.xcarchive build.xcarchive.zip)"]
-    if action == "run":
-        lines += [
-            "if [ $rc = 0 ]; then",
-            "  APP=$(find \"$HOME/aio-dd/Build/Products\" -maxdepth 2 -name '*.app' -type d | head -1)",
-            "  if [ -z \"$APP\" ]; then echo 'no .app was built'; rc=72; else",
-            "    BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \"$APP/Info.plist\")",
-            f"    xcrun simctl boot {device} 2>/dev/null; xcrun simctl bootstatus {device} -b",
-            f"    xcrun simctl install {device} \"$APP\" && xcrun simctl launch {device} \"$BID\" || rc=73",
-            "    sleep 8",
-            f"    xcrun simctl io {device} screenshot \"$OUT/screenshots/launch.png\" || true",
-            "  fi",
-            "fi",
-        ]
+    if action in ("run", "screenshots"):
+        lines += SIM_FUNCS.splitlines()
+        lines += (run_shots if action == "run" else ui_test_shots)(spec, xb)
+        lines += ["make_thumbs"]
     lines += ["echo $rc > \"$OUT/exit_code\"", "exit $rc"]
     return "\n".join(lines) + "\n"
+
+
+# Shell functions for run and screenshots jobs, in the VM
+SIM_FUNCS = r"""
+sim_udid() {  # the newest available Simulator called $1; made if there's none
+  local u
+  u=$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
+import json, re, sys
+d = json.load(sys.stdin)["devices"]
+for rt in sorted(d, key=lambda r: [int(x) for x in re.findall(r"[0-9]+", r)], reverse=True):
+    for x in d[rt]:
+        if x["name"] == sys.argv[1]:
+            print(x["udid"]); sys.exit()
+' "$1")
+  [ -n "$u" ] || u=$(xcrun simctl create "$1" "$1" 2>/dev/null)
+  echo "$u"
+}
+sim_up() { xcrun simctl boot "$1" 2>/dev/null; xcrun simctl bootstatus "$1" -b >/dev/null; }
+clean_bar() {
+  xcrun simctl status_bar "$1" override --time 9:41 --dataNetwork wifi --wifiMode active --wifiBars 3 \
+    --cellularMode active --cellularBars 4 --batteryState charged --batteryLevel 100 >/dev/null 2>&1 || true
+}
+find_app() {  # the app (not a UI test runner) xcodebuild built
+  APP=$(find "$HOME/aio-dd/Build/Products" -maxdepth 2 -name '*.app' -type d ! -name '*-Runner.app' | head -1)
+  BID=""
+  [ -n "$APP" ] && BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+}
+make_thumbs() {
+  ls "$OUT"/screenshots/*.png >/dev/null 2>&1 || return 0
+  mkdir -p "$OUT/screenshots/thumbs"
+  for f in "$OUT"/screenshots/*.png; do
+    sips -Z 480 "$f" --out "$OUT/screenshots/thumbs/$(basename "$f")" >/dev/null 2>&1
+  done
+  true
+}
+"""
+
+# A screenshots job's UI test attachments (xcresulttool export attachments,
+# Xcode 16+) -> screenshots/<prefix>-<name>.png, listed in index.jsonl
+EXPORT_SHOTS = r"""
+import json, os, re, shutil, subprocess, sys
+src, dst, prefix, meta = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+try:
+    manifest = json.load(open(os.path.join(src, "manifest.json")))
+except Exception:
+    manifest = []
+seen = set(os.listdir(dst))
+for test in manifest if isinstance(manifest, list) else []:
+    for a in test.get("attachments", []):
+        f = str(a.get("exportedFileName", ""))
+        if "/" in f or not re.search(r"[.](png|jpe?g|heic)$", f, re.I):
+            continue
+        name = str(a.get("suggestedHumanReadableName") or f)
+        name = re.sub(r"[.][A-Za-z]+$", "", name)
+        name = re.sub(r"_[0-9]+_[0-9A-Fa-f-]{36}$", "", name)
+        name = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or "shot"
+        out, i = f"{prefix}-{name}.png", 2
+        while out in seen:
+            out, i = f"{prefix}-{name}-{i}.png", i + 1
+        seen.add(out)
+        if f.lower().endswith(".png"):
+            shutil.copy(os.path.join(src, f), os.path.join(dst, out))
+        else:
+            subprocess.run(["sips", "-s", "format", "png", os.path.join(src, f), "--out", os.path.join(dst, out)],
+                           capture_output=True)
+        if os.path.isfile(os.path.join(dst, out)):
+            with open(os.path.join(dst, "index.jsonl"), "a") as fh:
+                fh.write(json.dumps({**meta, "shot": name, "file": out,
+                                     "test": str(test.get("testIdentifier", ""))}) + "\n")
+"""
+
+
+def plan_matrix(spec: dict):
+    """(devices, locales, appearances): '' meaning the Simulator's default."""
+    m = re.search(r"(?:^|,)name=([^,]+)", spec.get("destination", ""))
+    devices = spec.get("devices") or ([m[1]] if m else [])
+    return devices, spec.get("locales") or [""], spec.get("appearances") or [""]
+
+
+def shot_prefix(device: str, locale: str, appearance: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", device.lower()).strip("-")[:40] or "device"
+    return "-".join([slug] + ([locale.lower().replace("_", "-")] if locale else []) + ([appearance] if appearance else []))
+
+
+def device_block(device: str, spec: dict, body: list[str]) -> list[str]:
+    """Boot (or make) the Simulator, with the job's settings, then body."""
+    q = shlex.quote
+    return [
+        f"echo {q('== Simulator ' + device)}",
+        f"U=$(sim_udid {q(device)})",
+        f"if [ -z \"$U\" ]; then echo {q('== no Simulator called ' + device + ', and none could be made')}; rc=74; else",
+        "  sim_up \"$U\"",
+        *(["  clean_bar \"$U\""] if spec.get("status_bar") == "clean" else []),
+        *("  " + x for x in body),
+        "  xcrun simctl shutdown \"$U\" 2>/dev/null",
+        "fi",
+    ]
+
+
+def appearance_line(appearance: str) -> list[str]:
+    return [f"xcrun simctl ui \"$U\" appearance {appearance} || true"] if appearance else []
+
+
+def run_shots(spec: dict, xb: list[str]) -> list[str]:
+    """run: install the app on each device; per appearance, locale and shot,
+    relaunch it (args, env, locale), open the deep link, wait, screenshot."""
+    q = shlex.quote
+    devices, locales, appearances = plan_matrix(spec)
+    shots = spec.get("shots") or [{"name": "launch", "wait": 8}]
+    if not devices:
+        return ["echo '== run: no Simulator named (name= in the destination, or devices)'; rc=75"]
+    out = ["if [ $rc = 0 ]; then", "  find_app",
+           "  if [ -z \"$APP\" ]; then echo 'no .app was built'; rc=72; else"]
+    for device in devices:
+        body = ["xcrun simctl install \"$U\" \"$APP\" || rc=73"]
+        if spec.get("grant") == "all":
+            body.append("xcrun simctl privacy \"$U\" grant all \"$BID\" 2>/dev/null")
+        for appearance in appearances:
+            body += appearance_line(appearance)
+            for locale in locales:
+                loc = ["-AppleLanguages", f"({locale.replace('_', '-')})", "-AppleLocale", locale.replace("-", "_")] \
+                    if locale else []
+                for shot in shots:
+                    name = f"{shot_prefix(device, locale, appearance)}-{shot['name']}.png"
+                    meta = json.dumps({"file": name, "shot": shot["name"], "device": device, "locale": locale,
+                                       "appearance": appearance})
+                    env = [q(f"SIMCTL_CHILD_{k}={v}") for k, v in (shot.get("env") or {}).items()]
+                    args = " ".join(q(a) for a in [*(shot.get("args") or []), *loc])
+                    body += [
+                        "xcrun simctl terminate \"$U\" \"$BID\" >/dev/null 2>&1",
+                        f"echo {q('== shot ' + name)}",
+                        f"env {' '.join(env)} xcrun simctl launch \"$U\" \"$BID\" {args} >/dev/null || rc=73",
+                    ]
+                    if shot.get("url"):
+                        body += [f"sleep 2; xcrun simctl openurl \"$U\" {q(shot['url'])} || "
+                                 f"echo {q('== could not open ' + shot['url'])}"]
+                    body += [f"sleep {int(shot.get('wait', 5))}",
+                             f"xcrun simctl io \"$U\" screenshot \"$OUT/screenshots/{name}\" >/dev/null 2>&1 && "
+                             f"echo {q(meta)} >> \"$OUT/screenshots/index.jsonl\""]
+        out += ["    " + x for x in device_block(device, spec, body)]
+    out += ["  fi", "fi"]
+    return out
+
+
+def ui_test_shots(spec: dict, xb: list[str]) -> list[str]:
+    """screenshots: the built UI tests on each device x locale x appearance;
+    the screenshots they attach (XCTAttachment) become the job's."""
+    q = shlex.quote
+    devices, locales, appearances = plan_matrix(spec)
+    if not devices:
+        return ["echo '== screenshots: no Simulator named (name= in the destination, or devices)'; rc=75"]
+    m = re.search(r"(?:^|,)platform=([^,]+)", spec.get("destination", ""))
+    platform = m[1] if m else "iOS Simulator"
+    base = xb[1:]                       # without "xcodebuild"
+    if "-destination" in base:
+        i = base.index("-destination")
+        del base[i:i + 2]
+    test_args = " ".join("\"$HOME/aio-dd\"" if a == "$HOME/aio-dd" else q(a) for a in base)
+    only = " ".join(q(f"-only-testing:{t}") for t in spec.get("only_testing") or [])
+    out = ["if [ $rc = 0 ]; then", "  find_app", "  trc=0; n=0"]
+    for device in devices:
+        # granted for the installed app; the tests' reinstall keeps it
+        body = ["[ -n \"$BID\" ] && xcrun simctl install \"$U\" \"$APP\" && "
+                "xcrun simctl privacy \"$U\" grant all \"$BID\" 2>/dev/null"] if spec.get("grant") == "all" else []
+        for appearance in appearances:
+            body += appearance_line(appearance)
+            for locale in locales:
+                lang, _, region = locale.replace("-", "_").partition("_")
+                loc = f"-testLanguage {q(lang)}" + (f" -testRegion {q(region)}" if region else "") if locale else ""
+                prefix = shot_prefix(device, locale, appearance)
+                meta = json.dumps({"device": device, "locale": locale, "appearance": appearance})
+                body += [
+                    "n=$((n+1))",
+                    f"echo {q('== UI tests: ' + prefix)}",
+                    f"xcodebuild test-without-building {test_args} -destination \"platform={platform},id=$U\" "
+                    f"{only} {loc} -resultBundlePath \"$OUT/tests-$n.xcresult\"; t=$?; [ $t = 0 ] || trc=$t",
+                    "xcrun xcresulttool export attachments --path \"$OUT/tests-$n.xcresult\" --output-path "
+                    "\"$OUT/att-$n\" >/dev/null 2>&1 || echo '== could not export the screenshots "
+                    "(xcresulttool export attachments: Xcode 16 or later)'",
+                    f"/usr/bin/python3 -c {q(EXPORT_SHOTS)} \"$OUT/att-$n\" \"$OUT/screenshots\" {q(prefix)} {q(meta)}",
+                ]
+        out += ["  " + x for x in device_block(device, spec, body)]
+    out += ["  rc=$trc",
+            "  ls \"$OUT\"/screenshots/*.png >/dev/null 2>&1 || echo '== no screenshots: the UI tests attach "
+            "them with XCTAttachment(screenshot: XCUIApplication().screenshot()), lifetime .keepAlways'",
+            "fi"]
+    return out
 
 
 def export_script(spec: dict, share_root: str) -> str:

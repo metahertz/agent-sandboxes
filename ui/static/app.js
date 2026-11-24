@@ -1093,8 +1093,25 @@ async function showBuild(full) {
     } catch { /* next time */ }
   }
   if (!j.summary || !full) return;
-  $("#b-shots").replaceChildren(...(s.files || []).filter((f) => /^screenshots\/.*\.png$/.test(f)).map((f) =>
-    el("img", { src: `${base}/file?path=${encodeURIComponent(f)}`, alt: f })));
+  const files = s.files || [];
+  const shots = files.filter((f) => /^screenshots\/[^/]+\.png$/.test(f));
+  $("#b-shots").replaceChildren(...shots.map((f) => {
+    const name = f.slice("screenshots/".length), thumb = `screenshots/thumbs/${name}`;
+    const src = (p) => `${base}/file?path=${encodeURIComponent(p)}`;
+    return el("a", { href: src(f), target: "_blank", rel: "noopener", title: name },
+      el("img", { src: src(files.includes(thumb) ? thumb : f), alt: name, loading: "lazy" }),
+      el("span", { className: "muted", textContent: name }));
+  }));
+  $("#b-save").hidden = !shots.length;
+  $("#b-save-btn").onclick = async () => {
+    const btn = $("#b-save-btn");
+    btn.disabled = true;
+    try {
+      const r = await api("POST", wsPath(w.name, `/builds/${j.id}/screenshots`), { folder: $("#b-save input").value.trim() });
+      bMsg(`Saved ${r.paths.length} screenshot(s) into the project: ${r.paths.length > 3 ? r.paths.slice(0, 3).join(", ") + ", …" : r.paths.join(", ")}`);
+    } catch (e) { bMsg(e.message, true); }
+    btn.disabled = false;
+  };
   const arts = j.artifacts || [];
   $("#b-arts").replaceChildren(...(arts.length ? [el("span", { className: "muted", textContent: "Artifacts: " })] : []),
     ...arts.flatMap((a) => {
@@ -1134,11 +1151,24 @@ $("#b-cancel").addEventListener("click", () => buildAction("cancel"));
 $("#b-abandon").addEventListener("click", () => buildAction("abandon"));
 $("#b-close").addEventListener("click", () => { bstate.sel = null; $("#b-detail").hidden = true; loadBuilds(); });
 $("#b-refresh").addEventListener("click", () => loadBuilds(true));
+function bActionChanged() {
+  const a = $("#b-form").elements.action.value;
+  $("#b-shot-opts").hidden = !["run", "screenshots"].includes(a);
+  $$("#b-shot-opts [data-for]").forEach((x) => { x.hidden = x.dataset.for !== a; });
+}
+$("#b-form").elements.action.addEventListener("change", bActionChanged);
+
 $("#b-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const w = current();
   const f = ev.currentTarget.elements;
   const body = Object.fromEntries(["action", "scheme", "project", "destination", "configuration", "ref"].map((k) => [k, f[k].value.trim()]));
+  if (["run", "screenshots"].includes(body.action)) {
+    Object.assign(body, { devices: f.devices.value, locales: f.locales.value, appearance: f.appearance.value,
+      status_bar: f.status_bar.checked, grant_permissions: f.grant_permissions.checked });
+    if (body.action === "run" && f.shots.value.trim()) body.shots = f.shots.value;
+    if (body.action === "screenshots") body.only_testing = f.only_testing.value;
+  }
   bMsg("Sending the commit to the build host…");
   try {
     const j = await api("POST", wsPath(w.name, "/builds"), body);

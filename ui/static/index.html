@@ -327,7 +327,8 @@
               <div class="row">
                 <label>Action <select name="action">
                   <option value="build">build</option><option value="test">test</option>
-                  <option value="run">run (Simulator + screenshot)</option><option value="archive">archive (unsigned)</option></select></label>
+                  <option value="run">run (Simulator + screenshots)</option><option value="screenshots">screenshots (from the UI tests)</option>
+                  <option value="archive">archive (unsigned)</option></select></label>
                 <label>Scheme <input name="scheme" required autocomplete="off" spellcheck="false"></label>
                 <label>Project <input name="project" placeholder="App.xcodeproj (optional)" autocomplete="off" spellcheck="false"></label>
               </div>
@@ -335,6 +336,22 @@
                 <label>Destination <input name="destination" placeholder="platform=iOS Simulator,name=iPhone 16" autocomplete="off" spellcheck="false"></label>
                 <label>Configuration <input name="configuration" placeholder="Debug" autocomplete="off" spellcheck="false"></label>
                 <label>Ref <input name="ref" placeholder="HEAD" autocomplete="off" spellcheck="false"></label>
+              </div>
+              <div id="b-shot-opts" hidden>
+                <div class="row">
+                  <label>Devices <input name="devices" placeholder="iPhone 16 Pro Max, iPad Pro 13-inch (M4)" autocomplete="off" spellcheck="false"></label>
+                  <label>Locales <input name="locales" placeholder="en_US, de_DE" autocomplete="off" spellcheck="false"></label>
+                  <label>Appearance <select name="appearance"><option value="">Simulator default</option>
+                    <option value="light">light</option><option value="dark">dark</option><option value="both">light and dark</option></select></label>
+                </div>
+                <div class="row">
+                  <label class="check"><input type="checkbox" name="status_bar" checked> Clean status bar (9:41, full battery)</label>
+                  <label class="check"><input type="checkbox" name="grant_permissions"> Grant all privacy permissions</label>
+                  <label data-for="screenshots" hidden>UI tests <input name="only_testing" placeholder="AppUITests/ScreenshotTests (default: all)" autocomplete="off" spellcheck="false"></label>
+                </div>
+                <label data-for="run">Shots (JSON; default: one at launch) <textarea name="shots" rows="4" spellcheck="false" placeholder='[{"name": "library", "args": ["-demo-data"], "wait": 4}, {"name": "note", "url": "myapp://notes/1"}]'></textarea></label>
+                <p class="hint" data-for="run">Each shot relaunches the app with its <code>args</code> / <code>env</code>, opens its <code>url</code> (a deep link), waits and takes a screenshot, on every device × locale × appearance. Up to 60 a job.</p>
+                <p class="hint" data-for="screenshots" hidden>Builds and runs the UI tests; every screenshot they attach (<code>XCTAttachment(screenshot: app.screenshot())</code>, <code>.keepAlways</code>) is kept, named after the attachment.</p>
               </div>
               <div class="row"><button class="btn primary" type="submit">Queue build</button>
                 <span class="hint">Builds a commit: uncommitted changes aren't sent.</span></div>
@@ -351,6 +368,10 @@
               </div></div>
             <p class="hint" id="b-d-meta"></p>
             <div class="b-shots" id="b-shots"></div>
+            <div class="row" id="b-save" hidden>
+              <label>Save the screenshots into the project, in <input name="folder" value="docs/screenshots" spellcheck="false"></label>
+              <button class="btn" type="button" id="b-save-btn">Save into project</button>
+            </div>
             <div id="b-arts"></div>
             <form id="b-export" class="b-form" hidden>
               <h3>Sign this archive on a Mac</h3>

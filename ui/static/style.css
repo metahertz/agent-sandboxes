@@ -249,7 +249,11 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 .b-jobs tr[data-id]:hover td { background: var(--bg); }
 .b-jobs tr.sel td { background: var(--bg); }
 .b-shots { display: flex; gap: 10px; flex-wrap: wrap; }
-.b-shots img { max-height: 420px; border: 1px solid var(--line); border-radius: 6px; }
+.b-shots a { display: flex; flex-direction: column; gap: 4px; max-width: 240px; font-size: 11.5px; text-decoration: none; }
+.b-shots img { max-height: 420px; max-width: 240px; object-fit: contain; border: 1px solid var(--line); border-radius: 6px; }
+.b-shots span { overflow-wrap: anywhere; }
+.b-form label.check { flex-direction: row; align-items: center; font-weight: 450; }
+.b-form label.check input { flex: none; }
 .b-log { max-height: 60vh; }
 #bh-key { overflow-wrap: anywhere; }
 .bh-setup { margin: 4px 0 12px; }

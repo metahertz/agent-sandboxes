@@ -363,12 +363,15 @@ without any way to reach the Mac. There are three parts:
   3. Through `tart exec`, run fixed `xcodebuild` steps for the action:
      - *build*;
      - *test* (an `.xcresult` summary);
-     - *run*: build, install and launch in the Simulator, then a screenshot;
+     - *run*: build, install and launch in the Simulator, and take screenshots: one at launch,
+       or a planned set (see *Screenshots* below);
+     - *screenshots*: build the UI tests and run them; the screenshots they attach are kept;
      - *archive*: an ad-hoc signed `.xcarchive` (so the binary carries the project's
        entitlements; unsigned if ad-hoc signing fails), zipped, kept as an artifact;
      - *export*: sign an archive with an identity from Keys & tokens (see *Signing and
        TestFlight* below).
-  4. Push the result.
+  4. Push the result. The output folder is shared read-write into the VM, so the worker
+     reads every file from it without following symlinks.
   5. Delete the VM.
 
   Apple's licence allows two macOS VMs per Mac, so `max_vms` is 1 or 2.
@@ -379,7 +382,9 @@ MCP server, `aio-builds`, with these tools:
 - `apple_build`
 - `build_status`, which can wait for the build to finish
 - `build_log`
-- `build_result`, which returns screenshots as images
+- `build_result`, which lists a build's screenshots and shows small previews of up to six
+- `save_screenshots`, which writes them full size into the project (default
+  `docs/screenshots/`; never through a symlink) for the agent to commit
 - `get_artifact`, which copies a build's artifact into the project, at `.aio-builds/<id>/`
   (git ignores that folder). The folder is the agent's, so the copy never follows a
   symlink in it.
@@ -399,6 +404,21 @@ The agent never holds a git credential or a connection to the build host or the 
 builds commits only: uncommitted changes aren't sent. A repo whose `.git` borrows objects
 from elsewhere (alternates, symlinks) is refused. The *Builds* tab shows the same jobs, with
 live logs, screenshots, artifacts, and a form to queue one yourself.
+
+**Screenshots** (for docs, a README or the App Store), up to 60 a job:
+
+- **A planned `run`.** Each shot relaunches the app with its own launch arguments and
+  environment, optionally opens a deep link, waits and takes a screenshot. The app needs
+  a way to be steered, usually a debug-only launch argument that seeds sample data and
+  opens a named screen.
+- **A `screenshots` job.** For screens reached by tapping: the app's UI tests navigate and
+  attach screenshots (`XCTAttachment(screenshot:)`, lifetime `.keepAlways`). The worker
+  exports them from the test results (`xcresulttool export attachments`, Xcode 16+) and
+  names them after the attachments.
+- **Options for both.** Several Simulator devices (made with `simctl create` if the image
+  lacks them), light and/or dark appearance, locales, a clean status bar (9:41, full
+  battery), and granting the app's privacy permissions first. Files are named
+  `<device>[-<locale>][-<appearance>]-<shot>.png`, with an `index.json` describing each.
 
 **Setting it up** (*Build workers → Apple builds → Set up a build host and Mac workers* has these steps,
 with the commands filled in and downloads of the installers for another build host and for the Mac):

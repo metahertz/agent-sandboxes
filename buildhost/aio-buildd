@@ -72,9 +72,9 @@ KEEP_JOBS = 40                 # per repo, in status
 # ---------------------------------------------------------------- the job spec
 # The tag message. Strings are checked here (and again by the worker, which
 # builds the xcodebuild command from them) so none can carry shell syntax.
-ACTIONS = ("build", "test", "run", "archive", "export")
+ACTIONS = ("build", "test", "run", "screenshots", "archive", "export")
 SPEC_RULES = {
-    "action": re.compile(r"^(build|test|run|archive|export)$"),
+    "action": re.compile(r"^(build|test|run|screenshots|archive|export)$"),
     "scheme": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,99}$"),
     "project": re.compile(r"^$|^(?![/-])(?!.*(^|/)\.\.(/|$))[A-Za-z0-9 _.+/-]{1,200}$"),
     "destination": re.compile(r"^$|^[A-Za-z0-9 _.,=:()+/-]{1,200}$"),
@@ -96,12 +96,81 @@ OPTIONAL_RULES = {
 }
 MAX_SEAL = 2 << 20
 
+# Screenshot plans (run and screenshots jobs), checked the same way by
+# the UI, aio-buildd and the worker, which builds simctl commands from them
+PLAN_KEYS = ("shots", "devices", "appearances", "locales", "status_bar", "grant", "only_testing")
+PLAN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+PLAN_ARG_RE = re.compile(r"^[A-Za-z0-9 _.,=:/+@%()-]{0,200}$")
+PLAN_ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
+PLAN_URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]{0,30}:[A-Za-z0-9._~:/?#@!&()*+,;=%-]{1,300}$")
+PLAN_DEVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ()._-]{0,59}$")
+PLAN_LOCALE_RE = re.compile(r"^[a-z]{2,3}([_-][A-Za-z0-9]{2,8}){0,2}$")
+PLAN_TEST_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,99}(/[A-Za-z_][A-Za-z0-9_]{0,99}){0,2}$")
+MAX_SHOTS = 60          # screenshots per job
+MAX_TEST_RUNS = 16      # device x locale x appearance runs of a screenshots job
+
+
+def check_plan(spec: dict) -> str:
+    """'' if the job's screenshot plan (if any) is acceptable, else why not."""
+    action = spec.get("action")
+    used = [k for k in PLAN_KEYS if k in spec]
+    if used and action not in ("run", "screenshots"):
+        return f"{', '.join(used)}: for run and screenshots jobs"
+
+    def strs(k, rx, most):
+        v = spec.get(k, [])
+        return (isinstance(v, list) and len(v) <= most and len(set(v)) == len(v)
+                and all(isinstance(x, str) and rx.match(x) for x in v))
+    if not strs("devices", PLAN_DEVICE_RE, 4):
+        return "devices: up to 4 Simulator device names, e.g. iPhone 16 Pro Max"
+    if not strs("locales", PLAN_LOCALE_RE, 4):
+        return "locales: up to 4, e.g. en_US, de_DE"
+    if not strs("appearances", re.compile(r"^(light|dark)$"), 2):
+        return "appearances: light and/or dark"
+    if not strs("only_testing", PLAN_TEST_RE, 8):
+        return "only_testing: up to 8 of Target, Target/Class or Target/Class/testMethod"
+    if spec.get("only_testing") and action != "screenshots":
+        return "only_testing: for screenshots jobs"
+    if spec.get("status_bar", "clean") != "clean" or spec.get("grant", "all") != "all":
+        return "status_bar: clean; grant: all"
+    shots = spec.get("shots", [])
+    if not isinstance(shots, list) or len(shots) > 12:
+        return "shots: up to 12"
+    if shots and action != "run":
+        return "shots: for run jobs (a screenshots job's come from its UI tests)"
+    names = set()
+    for s in shots:
+        if not isinstance(s, dict) or set(s) - {"name", "args", "env", "url", "wait"}:
+            return "each shot: name, and optionally args, env, url, wait"
+        if not isinstance(s.get("name"), str) or not PLAN_NAME_RE.match(s["name"]) or s["name"] in names:
+            return "shot names: lowercase letters, digits and dashes, unique"
+        names.add(s["name"])
+        a = s.get("args", [])
+        if not isinstance(a, list) or len(a) > 10 or not all(isinstance(x, str) and PLAN_ARG_RE.match(x) for x in a):
+            return f"shot {s['name']}: args, up to 10 (letters, digits, spaces and _ . , = : / + @ % ( ) -)"
+        e = s.get("env", {})
+        if not isinstance(e, dict) or len(e) > 10 or not all(
+                PLAN_ENV_RE.match(k) and isinstance(v, str) and PLAN_ARG_RE.match(v) for k, v in e.items()):
+            return f"shot {s['name']}: env, up to 10 NAME: value"
+        if "url" in s and not (isinstance(s["url"], str) and PLAN_URL_RE.match(s["url"])):
+            return f"shot {s['name']}: url, a deep link such as myapp://notes/1"
+        w = s.get("wait", 5)
+        if not isinstance(w, int) or isinstance(w, bool) or not 0 <= w <= 60:
+            return f"shot {s['name']}: wait, 0-60 seconds"
+    runs = max(1, len(spec.get("devices", []))) * max(1, len(spec.get("locales", []))) \
+        * max(1, len(spec.get("appearances", [])))
+    if action == "run" and runs * max(1, len(shots)) > MAX_SHOTS:
+        return f"at most {MAX_SHOTS} screenshots per job (devices x locales x appearances x shots)"
+    if action == "screenshots" and runs > MAX_TEST_RUNS:
+        return f"at most {MAX_TEST_RUNS} device x locale x appearance runs per job"
+    return ""
+
 
 def check_spec(spec) -> str:
     """'' if the job spec is acceptable, else why not."""
     if not isinstance(spec, dict) or spec.get("v") != 1:
         return "the tag message must be a JSON object with \"v\": 1"
-    extra = set(spec) - set(SPEC_RULES) - set(OPTIONAL_RULES) - {"v", "timeout_min"}
+    extra = set(spec) - set(SPEC_RULES) - set(OPTIONAL_RULES) - set(PLAN_KEYS) - {"v", "timeout_min"}
     if extra:
         return f"unknown fields: {', '.join(sorted(extra))}"
     for k, rx in SPEC_RULES.items():
@@ -121,9 +190,9 @@ def check_spec(spec) -> str:
     t = spec.get("timeout_min", 60)
     if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= 240:
         return "timeout_min must be 1-240"
-    if spec["action"] in ("test", "run") and not spec.get("destination", "").startswith("platform="):
+    if spec["action"] in ("test", "run", "screenshots") and not spec.get("destination", "").startswith("platform="):
         return f"{spec['action']} needs a destination such as platform=iOS Simulator,name=iPhone 16"
-    return ""
+    return check_plan(spec)
 
 
 # ---------------------------------------------------------------- helpers

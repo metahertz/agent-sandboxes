@@ -53,7 +53,7 @@ HOST_RE = re.compile(r"^([a-z_][a-z0-9_-]{0,31}@)?([A-Za-z0-9][A-Za-z0-9.-]{0,25
 WORKER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}$")
 # The job spec; the build host and the worker check the same rules
 SPEC_RULES = {
-    "action": re.compile(r"^(build|test|run|archive|export)$"),
+    "action": re.compile(r"^(build|test|run|screenshots|archive|export)$"),
     "scheme": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.+-]{0,99}$"),
     "project": re.compile(r"^$|^(?![/-])(?!.*(^|/)\.\.(/|$))[A-Za-z0-9 _.+/-]{1,200}$"),
     "destination": re.compile(r"^$|^[A-Za-z0-9 _.,=:()+/-]{1,200}$"),
@@ -62,6 +62,75 @@ SPEC_RULES = {
 FINAL = {"passed", "failed", "error", "cancelled", "timeout", "abandoned"}
 TEAM_RE = re.compile(r"^[A-Z0-9]{10}$")
 METHODS = ("app-store-connect", "release-testing", "debugging", "enterprise")
+
+# Screenshot plans (run and screenshots jobs), checked the same way by
+# the UI, aio-buildd and the worker, which builds simctl commands from them
+PLAN_KEYS = ("shots", "devices", "appearances", "locales", "status_bar", "grant", "only_testing")
+PLAN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+PLAN_ARG_RE = re.compile(r"^[A-Za-z0-9 _.,=:/+@%()-]{0,200}$")
+PLAN_ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
+PLAN_URL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]{0,30}:[A-Za-z0-9._~:/?#@!&()*+,;=%-]{1,300}$")
+PLAN_DEVICE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ()._-]{0,59}$")
+PLAN_LOCALE_RE = re.compile(r"^[a-z]{2,3}([_-][A-Za-z0-9]{2,8}){0,2}$")
+PLAN_TEST_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,99}(/[A-Za-z_][A-Za-z0-9_]{0,99}){0,2}$")
+MAX_SHOTS = 60          # screenshots per job
+MAX_TEST_RUNS = 16      # device x locale x appearance runs of a screenshots job
+
+
+def check_plan(spec: dict) -> str:
+    """'' if the job's screenshot plan (if any) is acceptable, else why not."""
+    action = spec.get("action")
+    used = [k for k in PLAN_KEYS if k in spec]
+    if used and action not in ("run", "screenshots"):
+        return f"{', '.join(used)}: for run and screenshots jobs"
+
+    def strs(k, rx, most):
+        v = spec.get(k, [])
+        return (isinstance(v, list) and len(v) <= most and len(set(v)) == len(v)
+                and all(isinstance(x, str) and rx.match(x) for x in v))
+    if not strs("devices", PLAN_DEVICE_RE, 4):
+        return "devices: up to 4 Simulator device names, e.g. iPhone 16 Pro Max"
+    if not strs("locales", PLAN_LOCALE_RE, 4):
+        return "locales: up to 4, e.g. en_US, de_DE"
+    if not strs("appearances", re.compile(r"^(light|dark)$"), 2):
+        return "appearances: light and/or dark"
+    if not strs("only_testing", PLAN_TEST_RE, 8):
+        return "only_testing: up to 8 of Target, Target/Class or Target/Class/testMethod"
+    if spec.get("only_testing") and action != "screenshots":
+        return "only_testing: for screenshots jobs"
+    if spec.get("status_bar", "clean") != "clean" or spec.get("grant", "all") != "all":
+        return "status_bar: clean; grant: all"
+    shots = spec.get("shots", [])
+    if not isinstance(shots, list) or len(shots) > 12:
+        return "shots: up to 12"
+    if shots and action != "run":
+        return "shots: for run jobs (a screenshots job's come from its UI tests)"
+    names = set()
+    for s in shots:
+        if not isinstance(s, dict) or set(s) - {"name", "args", "env", "url", "wait"}:
+            return "each shot: name, and optionally args, env, url, wait"
+        if not isinstance(s.get("name"), str) or not PLAN_NAME_RE.match(s["name"]) or s["name"] in names:
+            return "shot names: lowercase letters, digits and dashes, unique"
+        names.add(s["name"])
+        a = s.get("args", [])
+        if not isinstance(a, list) or len(a) > 10 or not all(isinstance(x, str) and PLAN_ARG_RE.match(x) for x in a):
+            return f"shot {s['name']}: args, up to 10 (letters, digits, spaces and _ . , = : / + @ % ( ) -)"
+        e = s.get("env", {})
+        if not isinstance(e, dict) or len(e) > 10 or not all(
+                PLAN_ENV_RE.match(k) and isinstance(v, str) and PLAN_ARG_RE.match(v) for k, v in e.items()):
+            return f"shot {s['name']}: env, up to 10 NAME: value"
+        if "url" in s and not (isinstance(s["url"], str) and PLAN_URL_RE.match(s["url"])):
+            return f"shot {s['name']}: url, a deep link such as myapp://notes/1"
+        w = s.get("wait", 5)
+        if not isinstance(w, int) or isinstance(w, bool) or not 0 <= w <= 60:
+            return f"shot {s['name']}: wait, 0-60 seconds"
+    runs = max(1, len(spec.get("devices", []))) * max(1, len(spec.get("locales", []))) \
+        * max(1, len(spec.get("appearances", [])))
+    if action == "run" and runs * max(1, len(shots)) > MAX_SHOTS:
+        return f"at most {MAX_SHOTS} screenshots per job (devices x locales x appearances x shots)"
+    if action == "screenshots" and runs > MAX_TEST_RUNS:
+        return f"at most {MAX_TEST_RUNS} device x locale x appearance runs per job"
+    return ""
 
 
 class BuildError(Exception):
@@ -324,8 +393,11 @@ def clean_spec(params: dict) -> dict:
         spec[k] = v
     if spec["action"] == "export":
         raise BuildError("an export is export_build's: it signs an archive build")
-    if spec["action"] in ("test", "run") and not spec["destination"].startswith("platform="):
-        raise BuildError(f"{spec['action']} needs a destination, e.g. platform=iOS Simulator,name=iPhone 16")
+    if spec["action"] in ("test", "run", "screenshots") and not spec["destination"].startswith("platform="):
+        raise BuildError(f"{spec['action']} needs a destination, e.g. platform=iOS Simulator,name=iPhone 16 Pro")
+    spec.update(plan_from(params, spec))
+    if why := check_plan(spec):
+        raise BuildError(why)
     team = str(params.get("team") or "").strip()
     if team:
         if spec["action"] != "archive" or not TEAM_RE.match(team):
@@ -340,6 +412,41 @@ def clean_spec(params: dict) -> dict:
         raise BuildError("timeout_min: 1-240")
     spec["timeout_min"] = t
     return spec
+
+
+def plan_from(params: dict, spec: dict) -> dict:
+    """The screenshot plan's fields from the tool's (or the form's) arguments."""
+    def as_list(v):
+        if v is None or v == "" or v == []:
+            return []
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return v if isinstance(v, list) else [v]
+    plan = {}
+    devices = as_list(params.get("devices"))
+    if spec["action"] in ("run", "screenshots") and not devices \
+            and not re.search(r"(?:^|,)name=[^,]+", spec["destination"]):
+        raise BuildError(f"{spec['action']}: name a Simulator device, in the destination (name=…) or devices")
+    appearances = as_list(params.get("appearances") or params.get("appearance"))
+    if appearances == ["both"]:
+        appearances = ["light", "dark"]
+    for k, v in (("devices", devices), ("appearances", appearances), ("locales", as_list(params.get("locales"))),
+                 ("only_testing", as_list(params.get("only_testing")))):
+        if v:
+            plan[k] = v
+    if params.get("status_bar") in (True, "clean", "yes", "true"):
+        plan["status_bar"] = "clean"
+    if params.get("grant_permissions") in (True, "all", "yes", "true") or params.get("grant") == "all":
+        plan["grant"] = "all"
+    shots = params.get("shots")
+    if isinstance(shots, str) and shots.strip():
+        try:
+            shots = json.loads(shots)
+        except ValueError:
+            raise BuildError("shots: a JSON list of {name, args, env, url, wait}") from None
+    if shots:
+        plan["shots"] = shots
+    return plan
 
 
 async def submit(ws: str, ws_dir: str, params: dict, by: str) -> dict:
@@ -619,6 +726,54 @@ async def fetch_artifact(ws: str, ws_dir: str, jid: str, name: str) -> str:
             await proc.wait()
 
 
+def screenshot_names(files: list[str]) -> list[str]:
+    """A result's full-size screenshots (not thumbs/), by file name."""
+    return [f.split("/", 1)[1] for f in files
+            if re.fullmatch(r"screenshots/[a-z0-9][a-z0-9._-]{0,150}\.png", f)]
+
+
+async def screenshot_index(ws: str, jid: str, files: list[str]) -> dict:
+    if "screenshots/index.json" not in files:
+        return {}
+    try:
+        index = json.loads(await job_file(ws, jid, "screenshots/index.json"))
+        return {e["file"]: e for e in index if isinstance(e, dict) and isinstance(e.get("file"), str)}
+    except (ValueError, BuildError, TypeError):
+        return {}
+
+
+def describe_shot(e: dict) -> str:
+    return ", ".join(str(e[k]) for k in ("device", "locale", "appearance", "test") if e.get(k))
+
+
+async def save_screenshots(ws: str, ws_dir: str, jid: str, folder: str, only=None) -> list[str]:
+    """A job's screenshots into <project>/<folder>/ (made as needed; never
+    through a symlink, like the artifacts)."""
+    parts = [x for x in folder.strip().rstrip("/").split("/") if x != "."]
+    if not parts or folder.strip().startswith("/") or "" in parts or len(parts) > 8 or not all(NAME_RE.match(x) and x != OUT_DIR for x in parts):
+        raise BuildError("folder: a path in the project, e.g. docs/screenshots")
+    j = await job(ws, jid)
+    files = (j.get("summary") or {}).get("files", [])
+    names = screenshot_names(files)
+    if only:
+        if not isinstance(only, list):
+            raise BuildError("files: a list of names from build_result")
+        missing = [x for x in only if x not in names]
+        if missing:
+            raise BuildError(f"No screenshot {', '.join(map(str, missing[:5]))} in {jid}")
+        names = [n for n in names if n in only]
+    if not names:
+        raise BuildError(f"{jid} has no screenshots" + ("" if j.get("summary") else " (not finished yet)"))
+    out = []
+    for n in names:
+        data = await job_file(ws, jid, f"screenshots/{n}")
+
+        async def one(d=data):
+            yield d
+        out.append(await write_into_workspace(ws_dir, parts, n, one()))
+    return out
+
+
 def asc_key_for(ws: str) -> dict | None:
     """The first App Store Connect key assigned to the workspace: for an upload."""
     from common import load_policy, token_meta, SECRETS as S
@@ -671,16 +826,23 @@ INSTRUCTIONS = (
     "build_status with wait_seconds until it finishes, then build_log / build_result. Builds are unsigned "
     "(ad-hoc). Signing, with an identity the user assigned to this workspace (you never get its keys): "
     "export_build signs an archive build on the Mac with Xcode, and can upload it to TestFlight; sign_ipa "
-    "re-signs an .ipa or app on the host. get_artifact copies a build's output into the project.")
+    "re-signs an .ipa or app on the host. get_artifact copies a build's output into the project. "
+    "Screenshots (for docs, a README, the App Store): a run job takes a planned set (shots: launch arguments, "
+    "env, a deep link, a wait; on several devices, light/dark, locales, a clean status bar); a screenshots job "
+    "runs the app's UI tests, which navigate by tapping and attach screenshots (XCTAttachment). "
+    "save_screenshots writes a job's screenshots into the project.")
 
 TOOLS = [
     {"name": "apple_build",
      "description": "Queue an Xcode job for a commit of this workspace's repo. action: build, test (runs the "
                     "scheme's tests; needs a simulator destination), run (build, install and launch in the "
-                    "Simulator, then take a screenshot), archive (an unsigned .xcarchive, zipped, kept as an "
-                    "artifact). Returns the job id.",
+                    "Simulator, and take screenshots: one at launch, or the shots you plan), screenshots (build "
+                    "the scheme's UI tests and run them; every screenshot they attach with XCTAttachment, lifetime "
+                    ".keepAlways, is kept, named after the attachment: for screens reached by tapping), archive "
+                    "(an unsigned .xcarchive, zipped, kept as an artifact). Up to 60 screenshots a job. "
+                    "Returns the job id.",
      "inputSchema": {"type": "object", "required": ["action", "scheme"], "properties": {
-         "action": {"type": "string", "enum": ["build", "test", "run", "archive"]},
+         "action": {"type": "string", "enum": ["build", "test", "run", "screenshots", "archive"]},
          "scheme": {"type": "string", "description": "the Xcode scheme"},
          "project": {"type": "string", "description": "path in the repo to the .xcodeproj or .xcworkspace, or "
                                                       "a Swift package's folder; empty: xcodebuild finds it"},
@@ -692,6 +854,34 @@ TOOLS = [
          "repo": {"type": "string", "description": "the repo's folder within the project, if not the top"},
          "team": {"type": "string", "description": "archive only: the Apple team ID (DEVELOPMENT_TEAM), "
                                                    "e.g. that of the signing identity"},
+         "devices": {"type": "array", "items": {"type": "string"}, "maxItems": 4,
+                     "description": "run / screenshots: Simulator device names to take screenshots on, e.g. "
+                                    "['iPhone 16 Pro Max', 'iPad Pro 13-inch (M4)'] (the App Store sizes); "
+                                    "default: the destination's name="},
+         "appearances": {"type": "array", "items": {"type": "string", "enum": ["light", "dark"]},
+                         "description": "run / screenshots: each in light and/or dark mode"},
+         "locales": {"type": "array", "items": {"type": "string"}, "maxItems": 4,
+                     "description": "run / screenshots: e.g. ['en_US', 'de_DE'] (run: -AppleLanguages/-AppleLocale "
+                                    "launch arguments; screenshots: -testLanguage/-testRegion)"},
+         "status_bar": {"type": "boolean", "description": "run / screenshots: a clean status bar (9:41, full "
+                                                          "battery and signal)"},
+         "grant_permissions": {"type": "boolean", "description": "run / screenshots: grant the app every "
+                                                                 "privacy permission first, so no prompt covers it"},
+         "shots": {"type": "array", "maxItems": 12, "description":
+                   "run: the screenshots to take, each a fresh launch of the app (default: one, 'launch', after 8 "
+                   "s). Steer the app to a screen with launch arguments or env (read with ProcessInfo; a debug-only "
+                   "hook that seeds sample data and opens a named screen is the usual way) or a deep link. "
+                   "File names: <device>[-<locale>][-<appearance>]-<name>.png",
+                   "items": {"type": "object", "required": ["name"], "properties": {
+                       "name": {"type": "string", "description": "lowercase letters, digits, dashes"},
+                       "args": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
+                       "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                       "url": {"type": "string", "description": "a deep link opened after launch, e.g. myapp://notes/1"},
+                       "wait": {"type": "integer", "minimum": 0, "maximum": 60, "default": 5,
+                                "description": "seconds before the screenshot"}}}},
+         "only_testing": {"type": "array", "items": {"type": "string"}, "maxItems": 8,
+                          "description": "screenshots: the UI tests to run, e.g. ['AppUITests/ScreenshotTests'] "
+                                         "(default: all of the scheme's tests)"},
          "timeout_min": {"type": "integer", "minimum": 1, "maximum": 240, "default": 60}}}},
     {"name": "export_build",
      "description": "Sign a passed archive build with one of this workspace's Apple signing identities, on a Mac "
@@ -734,9 +924,20 @@ TOOLS = [
          "id": {"type": "string"}, "tail_lines": {"type": "integer", "minimum": 1, "maximum": 3000},
          "offset": {"type": "integer", "minimum": 0}}}},
     {"name": "build_result",
-     "description": "A finished build's summary, its test results (action test) and Simulator screenshots "
-                    "(action run), as images.",
-     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+     "description": "A finished build's summary, its test results (action test), and its screenshots (run, "
+                    "screenshots): the list, with small previews of up to 6 (preview: false for none). "
+                    "save_screenshots writes them, full size, into the project.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {
+         "id": {"type": "string"}, "preview": {"type": "boolean", "default": True}}}},
+    {"name": "save_screenshots",
+     "description": "Write a finished build's screenshots (full-size PNGs) into the project, e.g. for a README "
+                    "or docs, replacing files of the same name. Returns the paths; commit them yourself.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {
+         "id": {"type": "string"},
+         "folder": {"type": "string", "default": "docs/screenshots",
+                    "description": "a folder in the project, relative to its top"},
+         "files": {"type": "array", "items": {"type": "string"},
+                   "description": "only these (names from build_result); default: all"}}}},
     {"name": "get_artifact",
      "description": "Copy a finished build's artifact (e.g. build.xcarchive.zip from an archive build, or the "
                     ".ipa of an export) into this project, at .aio-builds/<id>/<name> (git ignores that folder). "
@@ -820,9 +1021,19 @@ async def tool_call(ws: str, ws_dir: str, name: str, args: dict) -> dict:
             if "test-summary.json" in files:
                 ts = (await job_file(ws, jid, "test-summary.json")).decode(errors="replace")
                 content.append({"type": "text", "text": "Test results:\n" + ts[:50_000]})
-            for f in [f for f in files if f.startswith("screenshots/") and f.endswith(".png")][:4]:
-                data = await job_file(ws, jid, f)
-                content.append({"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"})
+            shots = screenshot_names(files)
+            if shots:
+                index = await screenshot_index(ws, jid, files)
+                content.append({"type": "text", "text": f"Screenshots ({len(shots)}; save_screenshots writes them "
+                                "into the project):\n" + "\n".join(
+                                    f"- {n}" + (f" ({describe_shot(index[n])})" if n in index else "")
+                                    for n in shots)})
+                if args.get("preview", True) is not False:
+                    for n in shots[:6]:
+                        thumb = f"screenshots/thumbs/{n}"
+                        data = await job_file(ws, jid, thumb if thumb in files else f"screenshots/{n}")
+                        content.append({"type": "image", "data": base64.b64encode(data).decode(),
+                                        "mimeType": "image/png"})
             if j.get("artifacts"):
                 content.append({"type": "text", "text": "Artifacts (get_artifact copies one into the project): "
                                 + ", ".join(j["artifacts"])})
@@ -842,6 +1053,11 @@ async def tool_call(ws: str, ws_dir: str, name: str, args: dict) -> dict:
             except applesign.SignError as e:
                 return text(str(e), True)
             return text(f"Signed: {rel} in the project folder." + (f"\n{notes}" if notes else ""))
+        if name == "save_screenshots":
+            jid = str(args.get("id") or "")
+            written = await save_screenshots(ws, ws_dir, jid, str(args.get("folder") or "docs/screenshots"),
+                                             args.get("files"))
+            return text(f"Wrote {len(written)} screenshot(s) into the project:\n" + "\n".join(written))
         if name == "get_artifact":
             jid, art = str(args.get("id") or ""), str(args.get("name") or "")
             rel = await fetch_artifact(ws, ws_dir, jid, art)
