@@ -14,3 +14,6 @@ monitoring/.env
 monitoring/data/
 inbox/
 opt/
+ui/share.env
+ui/shares.json
+ui/shares.log

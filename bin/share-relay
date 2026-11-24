@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# The sharing relay: makes shared workspaces (the web UI's Share tab) reachable
+# from the internet through your own VPS, with no port forward or static IP here.
+#
+#   guest --https--> Caddy on the VPS (Let's Encrypt) --> VPS 127.0.0.1:18443
+#         --reverse SSH tunnel (from this host)--> the UI's share listener, 127.0.0.1:9443
+#
+# Only the share listener is reachable that way: guest pages, never the UI itself.
+#
+#   bin/share-relay init <vps-host> <share-host> [<desktop-host>] [--ssh-port N] [--yes]
+#       a tunnel key, the VPS's host key (pinned, after you confirm it), ui/share.env;
+#       prints the script to run on the VPS. <desktop-host>: a second name for the
+#       sandbox's browser desktop (its own origin); without it, no desktop sharing.
+#   bin/share-relay vps-script     the VPS setup script again (run it there as root)
+#   bin/share-relay start | stop   the tunnel (a systemd user unit)
+#   bin/share-relay status
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ENV_FILE="$ROOT/ui/share.env"
+DIR="$ROOT/secrets/relay"
+KEY="$DIR/id_ed25519"
+KNOWN="$DIR/known_hosts"
+UNIT=agent-sandboxes-relay
+UNIT_FILE=~/.config/systemd/user/$UNIT.service
+RELAY_USER=aio-relay
+RELAY_PORT=18443
+SHARE_PORT=${AIO_SHARE_PORT:-9443}
+
+die() { echo "share-relay: $*" >&2; exit 1; }
+host_ok() { [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]; }
+load_env() {
+  [[ -f $ENV_FILE ]] || die "not set up: bin/share-relay init <vps-host> <share-host> [<desktop-host>]"
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+}
+
+vps_script() {
+  load_env
+  local pub names
+  pub=$(cat "$KEY.pub")
+  names=$SHARE_HOST${SHARE_DESKTOP_HOST:+, $SHARE_DESKTOP_HOST}
+  cat <<EOF
+#!/bin/sh
+# Agent Sandboxes sharing relay: run this on the VPS as root (Debian / Ubuntu).
+# Needs DNS for $names pointing at this VPS, and ports 80 and 443 open.
+set -eu
+
+# 1. A user that may only open the tunnel: no shell, no other forwards
+nologin=/usr/sbin/nologin; [ -x \$nologin ] || nologin=/bin/false
+id $RELAY_USER >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/$RELAY_USER --shell \$nologin $RELAY_USER
+usermod -p '*' $RELAY_USER     # no password, but not "locked": sshd refuses locked accounts without PAM
+install -d -m 700 -o $RELAY_USER -g $RELAY_USER /var/lib/$RELAY_USER/.ssh
+cat > /var/lib/$RELAY_USER/.ssh/authorized_keys <<'KEY'
+restrict,port-forwarding,permitlisten="127.0.0.1:$RELAY_PORT",command="/bin/false" $pub
+KEY
+chown $RELAY_USER:$RELAY_USER /var/lib/$RELAY_USER/.ssh/authorized_keys
+chmod 600 /var/lib/$RELAY_USER/.ssh/authorized_keys
+if [ -d /etc/ssh/sshd_config.d ] && grep -qi '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config; then
+  cat > /etc/ssh/sshd_config.d/$RELAY_USER.conf <<'SSHD'
+Match User $RELAY_USER
+    AllowTcpForwarding remote
+    PermitListen 127.0.0.1:$RELAY_PORT
+    PermitTTY no
+    X11Forwarding no
+    AllowAgentForwarding no
+    PasswordAuthentication no
+SSHD
+  sshd -t && (systemctl reload ssh 2>/dev/null || systemctl reload sshd)
+else
+  echo "note: no sshd_config.d include; the authorized_keys options above still limit $RELAY_USER" >&2
+fi
+grep -q '^AllowUsers' /etc/ssh/sshd_config && echo "note: sshd has AllowUsers: add $RELAY_USER to it" >&2
+
+# 2. Caddy: HTTPS for $names (Let's Encrypt), to the tunnel
+command -v caddy >/dev/null 2>&1 || { apt-get update && apt-get install -y caddy; }
+cat > /etc/caddy/aio-share.caddy <<'CADDY'
+$names {
+	reverse_proxy 127.0.0.1:$RELAY_PORT {
+		header_up X-Forwarded-For {remote_host}
+	}
+}
+CADDY
+grep -q '^import /etc/caddy/aio-share.caddy' /etc/caddy/Caddyfile 2>/dev/null || \\
+  printf '\nimport /etc/caddy/aio-share.caddy\n' >> /etc/caddy/Caddyfile
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+systemctl reload caddy || systemctl restart caddy
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then ufw allow 80/tcp; ufw allow 443/tcp; fi
+echo "Relay ready. On the agent-sandboxes host: bin/share-relay start"
+EOF
+}
+
+case ${1:-} in
+init)
+  shift
+  ssh_port=22 yes=0 args=()
+  while (( $# )); do
+    case $1 in
+      --ssh-port) ssh_port=${2:?}; shift 2 ;;
+      --yes) yes=1; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  (( ${#args[@]} >= 2 && ${#args[@]} <= 3 )) || die "usage: init <vps-host> <share-host> [<desktop-host>] [--ssh-port N] [--yes]"
+  vps=${args[0],,} share=${args[1],,} desktop=${args[2]:-}
+  desktop=${desktop,,}
+  [[ $vps =~ ^[a-z0-9.:-]+$ ]] || die "VPS: a hostname or IP address"
+  host_ok "$share" || die "share host: a DNS name, e.g. share.example.com"
+  [[ -z $desktop ]] || { host_ok "$desktop" && [[ $desktop != "$share" ]]; } || die "desktop host: a second DNS name"
+  [[ $ssh_port =~ ^[0-9]{1,5}$ ]] || die "--ssh-port: a number"
+  install -d -m 700 "$ROOT/secrets" "$DIR"
+  if [[ ! -f $KEY ]]; then
+    ssh-keygen -q -t ed25519 -N "" -C "agent-sandboxes relay $(hostname)" -f "$KEY"
+    echo "New tunnel key: $KEY"
+  fi
+  tmp=$(mktemp)
+  trap 'rm -f -- "$tmp"' EXIT
+  ssh-keyscan -T 10 -p "$ssh_port" -t ed25519 "$vps" 2>/dev/null > "$tmp" || true
+  [[ -s $tmp ]] || die "couldn't fetch $vps's ssh host key (port $ssh_port)"
+  echo "The VPS's ssh host key:"
+  ssh-keygen -lf "$tmp" | sed 's/^/  /'
+  echo "Check it on the VPS (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) or against your own known_hosts."
+  if (( ! yes )); then
+    read -r -p "Is that the VPS's key? [y/N] " ok
+    [[ $ok == [yY]* ]] || die "not pinned; nothing changed"
+  fi
+  install -m 600 "$tmp" "$KNOWN"
+  umask 077
+  cat > "$ENV_FILE" <<EOF
+# The sharing relay (bin/share-relay init). Read by the web UI and the relay unit.
+SHARE_HOST=$share
+SHARE_DESKTOP_HOST=$desktop
+SHARE_PORT=$SHARE_PORT
+RELAY=$RELAY_USER@$vps
+RELAY_SSH_PORT=$ssh_port
+RELAY_PORT=$RELAY_PORT
+EOF
+  echo "Wrote $ENV_FILE"
+  echo
+  echo "Next:"
+  echo "  1. DNS: $share${desktop:+ and $desktop} -> the VPS's address"
+  echo "  2. On the VPS, as root, run the script below (bin/share-relay vps-script prints it again)"
+  echo "  3. Here: bin/share-relay start, then sudo systemctl restart agent-sandboxes-ui"
+  echo
+  vps_script
+  ;;
+vps-script)
+  vps_script
+  ;;
+start)
+  load_env
+  [[ -f $KEY && -f $KNOWN ]] || die "no tunnel key or pinned host key: run init"
+  mkdir -p "$(dirname "$UNIT_FILE")"
+  install -m 644 "$ROOT/systemd/$UNIT.service" "$UNIT_FILE"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$UNIT"
+  systemctl --user restart "$UNIT"
+  if [[ $(loginctl show-user "$USER" -p Linger --value 2>/dev/null) != yes ]]; then
+    echo "note: for the tunnel to start at boot: sudo loginctl enable-linger $USER"
+  fi
+  sleep 3
+  systemctl --user --no-pager status "$UNIT" | head -5 || true
+  ;;
+stop)
+  systemctl --user disable --now "$UNIT" 2>/dev/null || true
+  echo "Tunnel stopped; links stay valid but unreachable until start."
+  ;;
+status)
+  load_env
+  echo "Guests: https://$SHARE_HOST${SHARE_DESKTOP_HOST:+ (desktop: https://$SHARE_DESKTOP_HOST)}"
+  st=$(systemctl --user is-active "$UNIT" 2>/dev/null) || true
+  echo "Tunnel: $RELAY (VPS 127.0.0.1:$RELAY_PORT -> 127.0.0.1:$SHARE_PORT): ${st:-unknown}"
+  if curl -fsS --max-time 10 "http://127.0.0.1:$SHARE_PORT/__relay/ping" -H "Host: $SHARE_HOST" >/dev/null 2>&1; then
+    echo "Share listener: up"
+  else
+    echo "Share listener: not answering (restart the UI after init)"
+  fi
+  ;;
+*)
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+  ;;
+esac

@@ -1,0 +1,25 @@
+# User unit: the sharing relay, a reverse SSH tunnel from this host to your VPS
+# (its 127.0.0.1:RELAY_PORT -> the UI's share listener here), so guests can
+# reach shared workspaces with no port forward or static IP on this side.
+# Set up with bin/share-relay init; installed and started by bin/share-relay start:
+#   ~/.config/systemd/user/agent-sandboxes-relay.service
+[Unit]
+Description=Agent Sandboxes sharing relay (reverse SSH tunnel to your VPS)
+Documentation=file://%h/agent-sandboxes/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/agent-sandboxes/ui/share.env
+# -F none: not the user's ssh config; the VPS's host key is pinned at init.
+# ExitOnForwardFailure: if the VPS port is taken (an old tunnel lingering), exit and retry.
+ExecStart=/usr/bin/ssh -F none -N -T -o BatchMode=yes -o IdentitiesOnly=yes \
+  -i %h/agent-sandboxes/secrets/relay/id_ed25519 \
+  -o UserKnownHostsFile=%h/agent-sandboxes/secrets/relay/known_hosts -o StrictHostKeyChecking=yes \
+  -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -p ${RELAY_SSH_PORT} -R 127.0.0.1:${RELAY_PORT}:127.0.0.1:${SHARE_PORT} ${RELAY}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

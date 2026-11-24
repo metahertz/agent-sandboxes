@@ -62,6 +62,7 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
 import auth  # noqa: E402
 import builds  # noqa: E402
 import applesign  # noqa: E402
+import shares  # noqa: E402
 
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
 CLAUDE_IN = ROOT / "bin" / "claude-in"
@@ -302,11 +303,13 @@ async def send_json(w, obj, status: int = 200):
 
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                 sandbox: str | None = None):
+                 sandbox: str | None = None, share: bool = False):
     try:
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 30)
         req = Request(head[:-4])
-        if sandbox is not None:            # connection arrived on a sandbox port
+        if share:                          # the share listener: guest routes only, never the UI
+            await handle_share(req, reader, writer)
+        elif sandbox is not None:            # connection arrived on a sandbox port
             if req.hostname in UI_HOSTNAMES and load_ws(sandbox):
                 await handle_proxy(req, sandbox, reader, writer)
             else:
@@ -399,12 +402,12 @@ async def auth_public(req: Request, reader, w):
     return await respond(w, 404, "Not found\n")
 
 
-def same_origin(req: Request) -> bool:
+def same_origin(req: Request, scheme: str | None = None) -> bool:
     """Requests from pages on other origins (incl. sandbox subdomains,
     which are *same-site* with localhost) must never reach the API."""
     sfs = req.headers.get("sec-fetch-site")
     origin = req.headers.get("origin")
-    if origin is not None and origin != f"{SCHEME}://{req.host}":
+    if origin is not None and origin != f"{scheme or SCHEME}://{req.host}":
         return False
     if sfs is not None:
         return sfs == "same-origin"
@@ -519,6 +522,8 @@ async def api(req: Request, w):
         return await pool_api(req, parts[1:], w)
     if parts and parts[0] == "builds":
         return await builds_api(req, parts[1:], w)
+    if parts and parts[0] == "shares":
+        return await shares_api(req, parts[1:], w)
 
     if len(parts) < 2 or parts[0] != "workspaces":
         return await respond(w, 404, "Not found\n")
@@ -529,6 +534,8 @@ async def api(req: Request, w):
 
     if action[:1] == ["builds"]:
         return await builds_ws_api(ws, req, action[1:], w)
+    if action == ["shares"]:
+        return await shares_api(req, [], w, ws)
     if is_microvm(ws) and (resp := await vm_api(ws, action, m, w)) is not None:
         return resp
 
@@ -540,6 +547,7 @@ async def api(req: Request, w):
         (WS_ROOT / f"{name}.env").unlink()
         kill_agent(name)
         remove_access(lambda scope, _: scope == name)
+        shares.revoke_workspace(name)
         builds.remove_workspace(name)
         for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_override_path(name),
                   container_limits_path(name),
@@ -611,6 +619,7 @@ async def vm_api(ws: dict[str, str], action: list[str], m: str, w):
         (WS_ROOT / f"{name}.env").unlink()
         kill_agent(name)
         remove_access(lambda scope, _: scope == name)
+        shares.revoke_workspace(name)
         builds.remove_workspace(name)
         for p in (policy_path(name), profile_path(name), aux_profile_path(name), container_profile_path(name),
                   *(CONTAINER_PROXY_SECRETS / f"{name}{x}" for x in ("", ".ca.crt", ".ca.key"))):
@@ -669,6 +678,7 @@ async def status_all() -> list[dict]:
         c = changed.get(n, 0)
         t.update(activity=c, idle=max(0, now - c) if c else None)
     vms = await vm_states()
+    guests = shares.connected_by_workspace()
     out = []
     for ws in all_ws():
         n = ws.get("WS_NAME", "")
@@ -682,7 +692,7 @@ async def status_all() -> list[dict]:
                     "kind": "microvm" if vm else "sandbox", "browser": not vm or pol["vm_browser"],
                     "container": state, "containerDetail": detail,
                     "claude": claude.get(n, "stopped"),
-                    "term": seen.get(n), "tags": pol["tags"],
+                    "term": seen.get(n), "tags": pol["tags"], "guests": guests.get(n, []),
                     "sshKeys": len(pol["ssh_keys"]), "tokens": len(pol["tokens"]),
                     "network": pol["network"]["mode"], "builds": pol["builds"],
                     "policyPending": not vm and claude.get(n) == "running" and policy_pending(ws)})
@@ -2450,6 +2460,10 @@ async def settings_api(req: Request, parts: list[str], w):
                                200 if rc == 0 else 500)
     if parts == ["claude-md"]:
         return await claude_md_api(req, w)
+    if parts == ["sharing"] and m == "GET":
+        return await send_json(w, await sharing_status())
+    if parts == ["sharing", "check"] and m == "POST":
+        return await send_json(w, await sharing_check())
     if parts[:1] == ["backup"]:
         return await backup_api(req, parts[1:], w)
     if parts == ["monitoring", "password"] and m == "GET":
@@ -3064,8 +3078,9 @@ def term_size(req: Request) -> tuple[int, int]:
     return num("cols", 120, 20, 500), num("rows", 40, 5, 200)
 
 
-async def attach_pty(req: Request, reader, w, argv: list[str]):
-    """Run a tmux client (argv) on a pty and relay it over the WebSocket."""
+async def attach_pty(req: Request, reader, w, argv: list[str], readonly: bool = False):
+    """Run a tmux client (argv) on a pty and relay it over the WebSocket.
+    readonly: drop the browser's keystrokes too (the tmux client is -r)."""
     cols, rows = term_size(req)
     master, slave = os.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -3116,7 +3131,7 @@ async def attach_pty(req: Request, reader, w, argv: list[str]):
                 msg = json.loads(data)
             except json.JSONDecodeError:
                 continue
-            if msg.get("t") == "i":
+            if msg.get("t") == "i" and not readonly:
                 view = memoryview(str(msg.get("d", "")).encode())
                 while view:
                     try:
@@ -3286,9 +3301,12 @@ SANDBOX_DOWN_VM = b"""The browser container in this workspace's VM isn't answeri
 """
 
 
-async def handle_proxy(req: Request, name: str, reader, w):
+async def handle_proxy(req: Request, name: str, reader, w, prefix: str | None = None,
+                       scheme: str | None = None):
+    """prefix / scheme: a guest's desktop (the share listener), else the UI's own."""
     ws = load_ws(name)
-    prefix = sandbox_prefix(name)
+    guest = prefix is not None
+    prefix = prefix or sandbox_prefix(name)
     raw_path = req.target.split("?", 1)[0]
     if not (raw_path == prefix or raw_path.startswith(prefix + "/")) \
             or not hmac.compare_digest(raw_path[:len(prefix)], prefix):
@@ -3296,7 +3314,7 @@ async def handle_proxy(req: Request, name: str, reader, w):
     # Pages in the sandbox are agent-controlled; never let another origin
     # (e.g. a different workspace's sandbox) drive this one.
     origin = req.headers.get("origin")
-    if origin is not None and origin != f"{SCHEME}://{req.host}":
+    if origin is not None and origin != f"{scheme or SCHEME}://{req.host}":
         return await respond(w, 403, "Cross-origin request refused\n")
 
     target = req.target[len(prefix):] or "/"
@@ -3308,7 +3326,7 @@ async def handle_proxy(req: Request, name: str, reader, w):
     headers = [(k, v) for k, v in req.raw_headers if k.lower() not in drop]
     # Cookies aren't port-scoped: on <ip>:91xx the browser also sends the UI's
     # session cookie. Never hand that to an (agent-controlled) container.
-    cookies = "; ".join(f"{k}={v}" for k, v in req.cookies().items() if k != "asui")
+    cookies = "; ".join(f"{k}={v}" for k, v in req.cookies().items() if k not in ("asui", shares.COOKIE))
     if cookies:
         headers.append(("Cookie", cookies))
     headers.append(("X-AIO-API-Key", ws["WS_KEY"]))
@@ -3353,7 +3371,7 @@ async def handle_proxy(req: Request, name: str, reader, w):
                     loc = prefix + loc
                 line = f"Location: {loc}"
             out.append(line)
-        out.append(f"Content-Security-Policy: frame-ancestors 'self' {ui_ancestors()}")
+        out.append("Content-Security-Policy: frame-ancestors " + ("'none'" if guest else f"'self' {ui_ancestors()}"))
         out.append("Referrer-Policy: no-referrer")   # keep the capability path from leaking
         w.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
         await w.drain()
@@ -3363,6 +3381,259 @@ async def handle_proxy(req: Request, name: str, reader, w):
     finally:
         c2u.cancel()
         up_w.close()
+
+
+# --------------------------------------------------------------- sharing (guests, on the share listener)
+#
+# The share listener (127.0.0.1:SHARE_PORT, plain HTTP: Caddy on the VPS holds
+# TLS) serves guests only: their page, their workspace's terminal, its project
+# files and the sandbox's browser desktop, as their share allows. Nothing of
+# the UI itself (API, settings, other workspaces, the host shell) is routed here.
+
+SHARE_STATIC = {"/static/guest.js", "/static/guest.css", "/static/theme.js", "/static/vendor/xterm.js",
+                "/static/vendor/xterm.css", "/static/vendor/addon-fit.js"}
+SHARE_RELAY_TOOL = ROOT / "bin" / "share-relay"
+share_servers: list[asyncio.Server] = []
+
+
+def share_client_ip(req: Request, w) -> str:
+    """The guest's address: Caddy's X-Forwarded-For when it came through the tunnel."""
+    peer = peer_ip(w)
+    fwd = req.headers.get("x-forwarded-for", "").split(",")[-1].strip()
+    return fwd if peer in ("127.0.0.1", "::1") and re.fullmatch(r"[0-9a-fA-F.:]{2,45}", fwd) else peer
+
+
+def share_csp(cfg: dict) -> str:
+    ws_origin = cfg["origin"].replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+    return ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            f"connect-src 'self' {ws_origin}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+
+
+def share_desktop_url(cfg: dict, s: dict, ws: dict | None) -> str:
+    if not (s["desktop"] and cfg["desktop_host"] and ws) or (is_microvm(ws) and not vm_browser(ws)):
+        return ""
+    prefix = shares.desktop_prefix(s)
+    return (f"{cfg['desktop_origin']}{prefix}/vnc/index.html?autoconnect=true&resize=scale&reconnect=true&path="
+            + urllib.parse.quote(prefix[1:] + "/websockify", safe=""))
+
+
+SHARE_ENDED = b"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
+<title>Share ended</title><body style="font:15px system-ui;max-width:34em;margin:4em auto;padding:0 16px">
+<h1 style="font-size:20px">This link doesn't work</h1>
+<p>It has expired, been revoked or replaced by a new one. Ask whoever shared it for a new link.</p>"""
+
+
+async def handle_share(req: Request, reader, w):
+    cfg = shares.config()
+    if not cfg["enabled"]:
+        return await respond(w, 421, "Sharing is off\n")
+    if cfg["desktop_host"] and req.hostname == cfg["desktop_host"]:
+        return await share_desktop(req, cfg, reader, w)
+    if req.hostname != cfg["host"]:
+        return await respond(w, 421, "Unknown host\n")
+    path, m = req.path, req.method
+    if path == "/__relay/ping" and m == "GET":          # Settings' end-to-end check
+        n = req.query.get("n", "")
+        return await respond(w, 200, f"aio-share {n}\n" if re.fullmatch(r"[a-f0-9]{1,64}", n) else "aio-share\n")
+    if path.startswith("/s/") and m == "GET":
+        ip = share_client_ip(req, w)
+        if shares.limited(ip):
+            return await respond(w, 429, "Too many bad links from your address: wait a few minutes\n")
+        s = shares.by_token(path[3:])
+        if not s or not load_ws(s["workspace"]):
+            shares.bad_link(ip)
+            shares.log(f"bad or ended link from {ip}")
+            return await respond(w, 404, SHARE_ENDED, "text/html; charset=utf-8")
+        cookie = shares.new_guest(s, ip)
+        return await respond(w, 303, headers={
+            "Location": "/", "Set-Cookie": shares.cookie_header(cookie, cfg["scheme"] == "https",
+                                                                 s["expires"] - shares.now())})
+    if m == "GET" and (path in ("/", "/index.html") or path in SHARE_STATIC):
+        rel = "guest.html" if path in ("/", "/index.html") else path.removeprefix("/static/")
+        f = STATIC / rel
+        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype.endswith("javascript"):
+            ctype += "; charset=utf-8"
+        return await respond(w, 200, f.read_bytes(), ctype,
+                             {"Content-Security-Policy": share_csp(cfg), "X-Frame-Options": "DENY"})
+
+    s = shares.guest(req.cookies().get(shares.COOKIE, ""))
+    if not s:
+        if path.startswith("/api/"):
+            return await send_json(w, {"error": "This share has ended", "ended": True}, 401)
+        return await respond(w, 401, SHARE_ENDED, "text/html; charset=utf-8")
+    if path == "/ws/term":
+        if req.headers.get("upgrade", "").lower() != "websocket" or not same_origin(req, cfg["scheme"]):
+            return await respond(w, 403, "Forbidden\n")
+        return await share_terminal(req, s, reader, w)
+    if path.startswith("/api/"):
+        if not same_origin(req, cfg["scheme"]):
+            return await respond(w, 403, "Cross-origin request refused\n")
+        if m != "GET" and req.headers.get("x-requested-with") != "sbui":
+            return await respond(w, 403, "Missing X-Requested-With\n")
+        return await share_api(req, s, cfg, reader, w)
+    await respond(w, 404, "Not found\n")
+
+
+async def share_terminal(req: Request, s: dict, reader, w):
+    name = s["workspace"]
+    if not load_ws(name):
+        return await respond(w, 404, "No such workspace\n")
+    ws_accept(req, w)
+    await w.drain()
+    session = f"=cl-{name}"           # exactly this session, never a prefix match
+    if (await run(*TMUX, "has-session", "-t", session))[0] != 0:
+        w.write(ws_frame(0x2, b"\r\n\x1b[33mClaude isn't running in this workspace right now.\x1b[0m\r\n"))
+        w.write(ws_frame(0x8, struct.pack("!H", 1000)))
+        await w.drain()
+        return
+    view = s["terminal"] != "drive"
+    argv = [*TMUX, "attach-session", "-t", session, *(["-f", "read-only,ignore-size"] if view else [])]
+    shares.log(f"{s['id']} {s['label']} {'watching' if view else 'driving'} {name}'s terminal")
+    try:
+        with shares.tracked(s["id"], w, terminal=True):
+            await attach_pty(req, reader, w, argv, readonly=view)
+    finally:
+        shares.log(f"{s['id']} {s['label']} left {name}'s terminal")
+
+
+async def guest_path(ws: dict, raw: str) -> str | None:
+    """A path in the project (in the sandbox container), symlinks resolved:
+    guests see the project folder only."""
+    p = clean_container_path(raw)
+    root = CONTAINER_WORKSPACE
+    if not p or not (p == root or p.startswith(root + "/")):
+        return None
+    rc, out, _ = await run(*sandbox_exec(ws, "realpath", "-e", "--", p), timeout=30)
+    real = out.strip()
+    return real if rc == 0 and (real == root or real.startswith(root + "/")) else None
+
+
+async def share_api(req: Request, s: dict, cfg: dict, reader, w):
+    parts = [p for p in req.path.split("/") if p][1:]
+    m = req.method
+    ws = load_ws(s["workspace"])
+    if not ws:
+        return await send_json(w, {"error": "The workspace is gone"}, 404)
+    if parts == ["me"] and m == "GET":
+        return await send_json(w, {"workspace": s["workspace"], "label": s["label"], "terminal": s["terminal"],
+                                   "files": s["files"], "expires": s["expires"], "now": shares.now(),
+                                   "root": CONTAINER_WORKSPACE, "desktop": share_desktop_url(cfg, s, ws)})
+    if parts not in (["files"], ["download"], ["upload"]):
+        return await send_json(w, {"error": "Not found"}, 404)
+    if s["files"] == "none" or (parts == ["upload"] and s["files"] != "upload"):
+        return await send_json(w, {"error": "This share doesn't include that"}, 403)
+    if is_microvm(ws) and not vm_browser(ws):
+        return await send_json(w, {"error": "This workspace has no browser container, so no file access"}, 404)
+    path = await guest_path(ws, req.query.get("path") or CONTAINER_WORKSPACE)
+    if not path:
+        return await send_json(w, {"error": f"Only files in the project ({CONTAINER_WORKSPACE}) are shared"}, 403)
+    req.query["path"] = path
+    if parts == ["files"] and m == "GET":
+        return await list_files(ws, req, w)
+    if parts == ["download"] and m == "GET":
+        shares.log(f"{s['id']} {s['label']} downloaded {path}")
+        return await download(ws, req, w)
+    if parts == ["upload"] and m == "PUT":
+        shares.log(f"{s['id']} {s['label']} uploading {req.query.get('name', '')!r} into {path}")
+        return await upload(s["workspace"], req, reader, w)
+    return await send_json(w, {"error": "Not found"}, 404)
+
+
+async def share_desktop(req: Request, cfg: dict, reader, w):
+    """The sandbox's browser desktop (noVNC and its websockify), on its own
+    origin: its pages are agent-controlled, so never the guest page's."""
+    raw = req.target.split("?", 1)[0]
+    mt = re.fullmatch(r"/__g/([a-f0-9]{40})(/[A-Za-z0-9._~/-]*)?", raw)
+    s = shares.by_cap(mt[1]) if mt else None
+    if not s:
+        return await respond(w, 404, SHARE_ENDED, "text/html; charset=utf-8")
+    rest = mt[2] or "/"
+    if "/." in rest or "//" in rest or not (rest.startswith("/vnc/") or rest == "/websockify"):
+        return await respond(w, 403, "Only the sandbox's browser desktop is shared\n")
+    ws = load_ws(s["workspace"])
+    if not ws or (is_microvm(ws) and not vm_browser(ws)):
+        return await respond(w, 404, "This workspace has no browser container\n")
+    with shares.tracked(s["id"], w):
+        await handle_proxy(req, s["workspace"], reader, w, prefix=shares.desktop_prefix(s), scheme=cfg["scheme"])
+
+
+async def shares_api(req: Request, parts: list[str], w, ws: dict | None = None):
+    """Admin: a workspace's shares (GET / POST), and revoke / new link."""
+    m, cfg = req.method, shares.config()
+    if ws is not None:
+        if m == "GET":
+            return await send_json(w, {"shares": shares.listing(ws["WS_NAME"]), "enabled": cfg["enabled"],
+                                       "origin": cfg["origin"] if cfg["enabled"] else "",
+                                       "desktop": bool(cfg["desktop_host"]) and (not is_microvm(ws) or vm_browser(ws))})
+        if m == "POST":
+            if not cfg["enabled"] or not share_servers:
+                return await send_json(w, {"error": "Sharing isn't set up: see Settings, Sharing relay"}, 409)
+            try:
+                s, token = shares.create(ws["WS_NAME"], json.loads(req.body or b"{}"))
+            except (ValueError, json.JSONDecodeError) as e:
+                return await send_json(w, {"error": str(e)}, 400)
+            return await send_json(w, {"share": shares.public(s), "link": f"{cfg['origin']}/s/{token}"}, 201)
+        return await respond(w, 404, "Not found\n")
+    if len(parts) == 1 and shares.ID_RE.match(parts[0]) and m == "DELETE":
+        if not shares.revoke(parts[0]):
+            return await send_json(w, {"error": "No such share"}, 404)
+        return await send_json(w, {"ok": True})
+    if len(parts) == 2 and shares.ID_RE.match(parts[0]) and parts[1] == "link" and m == "POST":
+        r = shares.rotate(parts[0])
+        if not r:
+            return await send_json(w, {"error": "That share has ended"}, 404)
+        return await send_json(w, {"share": shares.public(r[0]), "link": f"{cfg['origin']}/s/{r[1]}"})
+    return await respond(w, 404, "Not found\n")
+
+
+async def sharing_status() -> dict:
+    cfg = shares.config()
+    tunnel = "not set up"
+    if cfg["relay"]:
+        tunnel = (await run("systemctl", "--user", "is-active", "agent-sandboxes-relay",
+                            timeout=10))[1].strip() or "unknown"
+    setup = ""
+    if cfg["relay"] and SHARE_RELAY_TOOL.is_file():
+        rc, out, _ = await run(str(SHARE_RELAY_TOOL), "vps-script", timeout=10)
+        setup = out if rc == 0 else ""
+    return {"enabled": cfg["enabled"], "origin": cfg["origin"] if cfg["enabled"] else "",
+            "desktop": cfg["desktop_origin"], "port": cfg["port"], "listening": bool(share_servers),
+            "relay": cfg["relay"], "tunnel": tunnel, "vpsScript": setup,
+            "active": sum(1 for x in shares.listing() if x["active"])}
+
+
+async def sharing_check() -> dict:
+    """GET <share origin>/__relay/ping through the VPS: DNS, Caddy and the tunnel."""
+    cfg = shares.config()
+    if not cfg["enabled"]:
+        return {"ok": False, "error": "Sharing isn't set up (bin/share-relay init)"}
+    nonce = secrets.token_hex(8)
+    url = f"{cfg['origin']}/__relay/ping?n={nonce}"
+
+    def fetch():
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(urllib.request.Request(url, headers={"User-Agent": "agent-sandboxes"}), timeout=15) as r:
+            return r.read(200).decode(errors="replace")
+    try:
+        body = await asyncio.to_thread(fetch)
+    except Exception as e:
+        return {"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}
+    ok = body.strip() == f"aio-share {nonce}"
+    return {"ok": ok, "url": url, "error": "" if ok else f"Something else answered: {body[:80]!r}"}
+
+
+async def open_share_listener():
+    cfg = shares.config()
+    if not cfg["enabled"]:
+        return
+    try:
+        share_servers.append(await asyncio.start_server(lambda r, w: handle(r, w, share=True), "127.0.0.1",
+                                                        cfg["port"], limit=MAX_HEAD))
+        print(f"Sharing: guests at {cfg['origin']} (listening on 127.0.0.1:{cfg['port']})", flush=True)
+    except OSError as e:
+        print(f"Sharing: can't listen on 127.0.0.1:{cfg['port']}: {e.strerror}", flush=True)
 
 
 # --------------------------------------------------------------- main
@@ -4001,12 +4272,13 @@ async def main():
     except OSError as e:          # the UI runs on without the agents' build tools
         print(f"Apple builds: no MCP socket at {builds.MCP_SOCK}: {e}", flush=True)
         mcp_server = None
+    await open_share_listener()
     builds.monitor.start()
     drop_ambient_caps()
     for addr in BIND:
         print(f"Agent Sandboxes UI on {SCHEME}://{addr}:{LISTEN_PORT}/", flush=True)
-    await asyncio.gather(renew_daily(), backup_scheduler(), proxyd_startup(),
-                         *(s.serve_forever() for s in servers + ([mcp_server] if mcp_server else [])))
+    await asyncio.gather(renew_daily(), backup_scheduler(), proxyd_startup(), shares.expiry_watch(),
+                         *(s.serve_forever() for s in servers + share_servers + ([mcp_server] if mcp_server else [])))
 
 
 def cli_prepare(name: str, aux: bool = False):

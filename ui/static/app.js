@@ -18,6 +18,7 @@ const state = {
   filesPath: {},          // per-workspace current folder in the Files tab
   frameFor: {},           // tab -> workspace its sandbox iframe is showing
 };
+const shareSeen = { guests: "" };   // the Share tab reloads when its workspace's guests change
 
 // ------------------------------------------------------------------ API
 
@@ -120,6 +121,10 @@ function wsRow(w, act) {
   const mark = el("span", { className: `act ${act}`, title: ACT_TITLE[act] || "" });
   mark.hidden = !act;
   b.append(el("span", { className: "n" }, mark, el("span", { className: "label", textContent: w.name })));
+  if ((w.guests || []).length) {
+    b.querySelector(".n").append(el("span", { className: "guests", textContent: `👥${w.guests.length}`,
+      title: `Guests in the terminal: ${w.guests.join(", ")}` }));
+  }
   const dots = el("span", { className: "dots" });
   const dc = el("span", { className: `dot ${CONTAINER_TONE[w.container] || "none"}`,
     title: `${w.kind === "microvm" ? "VM" : "Container"}: ${w.container}` });
@@ -317,6 +322,11 @@ function renderDetail() {
   if (!w.builds && state.tab === "builds") selectTab("claude");
   setPill($("#d-claude"), "Claude", w.claude, CLAUDE_TONE[w.claude]);
   $("#d-pending").hidden = !w.policyPending;
+  const guests = w.guests || [];
+  $("#d-guests").hidden = !guests.length;
+  $("#d-guests").textContent = guests.length === 1 ? `guest: ${guests[0]}` : `${guests.length} guests`;
+  $("#d-guests").title = guests.length ? `In the terminal now: ${guests.join(", ")}` : "";
+  if (state.tab === "share" && guests.join() !== shareSeen.guests) loadShares();
 
   const up = w.container === "running";
   for (const b of $$('[data-act="container/start"]')) b.disabled = up;
@@ -495,6 +505,7 @@ function selectTab(tab) {
   if (tab === "files") loadFiles();
   if (tab === "logs") loadLogs();
   if (tab === "access") loadAccess();
+  if (tab === "share") loadShares();
   if (tab === "builds") loadBuilds(true);
 }
 $$(".tabs [role=tab]").forEach((b) => b.addEventListener("click", () => selectTab(b.dataset.tab)));
@@ -1877,6 +1888,7 @@ async function loadSettings() {
     const st = await api("GET", "settings/monitoring");
     loadClaudeMd();
     loadBackup(true);
+    loadSharing();
     renderMonStatus(st);
     fillMonForm(st);
     $("#ca-card").hidden = !st.caFingerprint;
@@ -2170,3 +2182,117 @@ if (state.view in PAGE_LOAD) PAGE_LOAD[state.view]();
 refresh();
 setInterval(refresh, 4000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+
+// ------------------------------------------------------------------ sharing
+
+const fmtLeft = (t) => {
+  const s = t - Date.now() / 1000;
+  return s <= 0 ? "ended" : s > 86400 ? `${Math.floor(s / 86400)} d left` : s > 3600 ? `${Math.floor(s / 3600)} h left` : `${Math.ceil(s / 60)} min left`;
+};
+
+function shMsg(text, bad = false) {
+  $("#sh-msg").textContent = text;
+  $("#sh-msg").classList.toggle("err", bad);
+}
+
+function showLink(r) {
+  $("#sh-link").hidden = false;
+  $("#sh-link-who").textContent = r.share.label;
+  $("#sh-link-url").value = r.link;
+  $("#sh-link-url").select();
+}
+
+async function loadShares() {
+  const w = current();
+  if (!w) return;
+  shareSeen.guests = (w.guests || []).join();
+  try {
+    const r = await api("GET", wsPath(w.name, "/shares"));
+    if (current()?.name !== w.name) return;
+    $("#sh-off").hidden = r.enabled;
+    $("#sh-form button[type=submit]").disabled = !r.enabled;
+    $("#sh-desktop-wrap").hidden = !r.desktop;
+    $("#sh-list").replaceChildren(...r.shares.map((x) => {
+      const scope = [x.terminal === "drive" ? "types" : "watches", x.files !== "none" ? `files: ${x.files}` : "", x.desktop ? "desktop" : ""].filter(Boolean).join(" · ");
+      const status = x.revoked ? "revoked" : x.active ? fmtLeft(x.expires) : "expired";
+      const info = el("div", {}, el("strong", { textContent: x.label }), " ",
+        el("span", { className: "muted", textContent: `${scope} · ${status}${x.connected ? ` · connected now (${x.connected})` : ""}` }));
+      const row = el("div", { className: `keyrow${x.active ? "" : " ended"}` }, info);
+      if (x.active) {
+        const btns = el("div", { className: "row" });
+        const again = el("button", { className: "btn", type: "button", textContent: "New link" });
+        again.title = "Replace the link (the old one stops working, and the guest is disconnected)";
+        again.addEventListener("click", async () => {
+          try { showLink(await api("POST", `shares/${x.id}/link`)); loadShares(); } catch (e) { shMsg(e.message, true); }
+        });
+        const rev = el("button", { className: "btn danger ghost", type: "button", textContent: "Revoke" });
+        rev.addEventListener("click", async () => {
+          try { await api("DELETE", `shares/${x.id}`); shMsg(`Revoked ${x.label}'s link.`); loadShares(); refresh(); } catch (e) { shMsg(e.message, true); }
+        });
+        btns.append(again, rev);
+        row.append(btns);
+      }
+      return row;
+    }));
+    if (!r.shares.length) $("#sh-list").append(el("p", { className: "muted", textContent: "No links yet." }));
+  } catch (e) { shMsg(e.message, true); }
+}
+
+function shFormChanged() {
+  const f = $("#sh-form");
+  const drive = f.terminal.value === "drive";
+  f.desktop.disabled = !drive;
+  if (!drive) f.desktop.checked = false;
+  $("#sh-drive-warn").hidden = !drive;
+}
+$("#sh-form").terminal.addEventListener("change", shFormChanged);
+
+$("#sh-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const w = current();
+  const f = ev.target;
+  if (!w) return;
+  try {
+    const r = await api("POST", wsPath(w.name, "/shares"), { label: f.label.value.trim(), terminal: f.terminal.value,
+      files: f.files.value, desktop: f.desktop.checked, expires: f.expires.value });
+    showLink(r);
+    shMsg("");
+    f.label.value = "";
+    loadShares();
+  } catch (e) { shMsg(e.message, true); }
+});
+
+$("#sh-copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("#sh-link-url").value); shMsg("Link copied."); }
+  catch { $("#sh-link-url").select(); shMsg("Select the link and copy it."); }
+});
+
+async function loadSharing() {
+  try {
+    const r = await api("GET", "settings/sharing");
+    const st = $("#sr-state");
+    const up = r.listening && (r.tunnel === "active" || !r.relay);
+    st.textContent = !r.enabled ? "not set up" : !r.listening ? "restart the UI" : r.relay ? `tunnel ${r.tunnel}` : "local only";
+    st.className = `pill ${!r.enabled ? "" : up ? "ok" : "warn"}`;
+    $("#sr-summary").textContent = r.enabled
+      ? `Guests open ${r.origin}${r.desktop ? ` (browser desktop: ${r.desktop})` : ""}, relayed by ${r.relay || "nothing yet"} to 127.0.0.1:${r.port} here. ${r.active} active link(s).`
+      : "";
+    $("#sr-steps").hidden = r.enabled && r.listening && r.tunnel === "active";
+    $("#sr-script-wrap").hidden = !r.vpsScript;
+    $("#sr-script").textContent = r.vpsScript || "";
+    $("#sr-check").disabled = !r.enabled;
+  } catch (e) {
+    $("#sr-msg").textContent = e.message;
+  }
+}
+
+$("#sr-check").addEventListener("click", async () => {
+  const m = $("#sr-msg");
+  m.textContent = "Checking…";
+  m.classList.remove("err");
+  try {
+    const r = await api("POST", "settings/sharing/check");
+    m.textContent = r.ok ? `Works: ${r.url} reached this host through the relay.` : `${r.url || ""} ${r.error}`;
+    m.classList.toggle("err", !r.ok);
+  } catch (e) { m.textContent = e.message; m.classList.add("err"); }
+});

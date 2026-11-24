@@ -99,6 +99,15 @@ if [[ -f $exporter ]]; then
   fi
 fi
 
+# The sharing relay's tunnel (a user unit, installed by bin/share-relay start)
+relay=~/.config/systemd/user/agent-sandboxes-relay.service
+if [[ -f $relay ]] && ! cmp -s systemd/agent-sandboxes-relay.service "$relay"; then
+  say "Installing the sharing relay's user unit"
+  install -m 644 systemd/agent-sandboxes-relay.service "$relay"
+  systemctl --user daemon-reload
+  systemctl --user is-active -q agent-sandboxes-relay && systemctl --user restart agent-sandboxes-relay
+fi
+
 # Things that take long or need a decision: say so, don't do them
 image=$(sed -n 's/^\s*image:\s*\(\S\+\).*/\1/p' compose.workspace.yaml | head -1)
 if changed compose.workspace.yaml && ! docker image inspect "$image" >/dev/null 2>&1; then

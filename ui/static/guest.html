@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared workspace</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/guest.css">
+<script src="/static/vendor/xterm.js" defer></script>
+<script src="/static/vendor/addon-fit.js" defer></script>
+<script src="/static/guest.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <strong id="g-ws">Shared workspace</strong>
+  <span class="pill" id="g-mode"></span>
+  <span class="muted" id="g-left"></span>
+  <span class="spacer"></span>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="term" aria-selected="true">Terminal</button>
+    <button role="tab" data-tab="files" hidden>Files</button>
+    <a class="tab-link" id="g-desktop" target="_blank" rel="noopener noreferrer" hidden>Browser desktop ↗</a>
+  </nav>
+</header>
+<main>
+  <section data-panel="term" class="panel">
+    <div id="term" class="term"></div>
+  </section>
+  <section data-panel="files" class="panel files" hidden>
+    <form id="f-form" class="row">
+      <button class="btn" type="button" id="f-up" title="Parent folder">↑</button>
+      <input id="f-path" spellcheck="false" autocomplete="off" aria-label="Folder">
+      <button class="btn" type="submit">Go</button>
+      <label class="btn" id="f-upload" hidden>Upload… <input type="file" id="f-file" multiple hidden></label>
+    </form>
+    <p class="msg" id="f-msg" role="status"></p>
+    <table><tbody id="f-list"></tbody></table>
+  </section>
+  <section class="ended" id="g-ended" hidden>
+    <h1>This share has ended</h1>
+    <p>It expired, was revoked, or the link was replaced. If you still have a current link, open it again.</p>
+  </section>
+</main>
+</body>
+</html>

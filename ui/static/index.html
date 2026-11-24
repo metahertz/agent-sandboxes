@@ -93,6 +93,7 @@
         <div class="status">
           <span class="pill" id="d-container"></span>
           <span class="pill" id="d-claude"></span>
+          <span class="pill ok" id="d-guests" hidden></span>
           <span class="pill warn" id="d-pending" hidden title="Access settings changed since Claude started">restart Claude to apply access changes</span>
         </div>
       </header>
@@ -128,6 +129,7 @@
         <button role="tab" data-tab="vscode">VS Code</button>
         <button role="tab" data-tab="shell">Terminal</button>
         <button role="tab" data-tab="access">Access</button>
+        <button role="tab" data-tab="share">Share</button>
         <button role="tab" data-tab="files">Files</button>
         <button role="tab" data-tab="logs">Logs</button>
         <button role="tab" data-tab="builds" id="builds-tab" hidden>Builds</button>
@@ -277,6 +279,34 @@
             <p class="form-msg" id="acc-msg" role="status"></p>
           </div>
         </form>
+      </div>
+
+      <div class="panel" data-panel="share" hidden>
+        <div class="access">
+          <section class="card">
+            <h2>Share this workspace</h2>
+            <p class="hint">A link for one person to watch (or drive) Claude here, from anywhere, through your sharing relay. They get only this workspace's terminal, plus the project files and the browser desktop if you tick them: nothing else of this UI. Links expire; revoke one any time and its guest is disconnected at once.</p>
+            <p class="hint warn-text" id="sh-off" hidden>Sharing isn't set up yet: see Settings → Sharing relay.</p>
+            <form id="sh-form" class="add-form" autocomplete="off">
+              <div class="row">
+                <label>Guest's name <input name="label" maxlength="60" placeholder="e.g. Sam" required></label>
+                <label>Terminal <select name="terminal"><option value="view">watch only</option><option value="drive">watch and type</option></select></label>
+                <label>Project files <select name="files"><option value="none">no</option><option value="download">download</option><option value="upload">download and upload</option></select></label>
+                <label>Expires after <select name="expires"><option value="1h">1 hour</option><option value="8h" selected>8 hours</option><option value="24h">24 hours</option><option value="7d">7 days</option></select></label>
+              </div>
+              <label class="check" id="sh-desktop-wrap"><input type="checkbox" name="desktop" disabled> <span>The sandbox's browser desktop too <span class="muted">(interactive: only for a guest who types)</span></span></label>
+              <p class="hint warn-text" id="sh-drive-warn" hidden>A guest who types acts as Claude in this workspace: with its keys and tokens, its network access and its files.</p>
+              <div class="row"><button class="btn primary" type="submit">Create link</button></div>
+              <p class="form-msg" id="sh-msg" role="status"></p>
+            </form>
+            <div class="sh-link" id="sh-link" hidden>
+              <p class="hint">Send this link to <strong id="sh-link-who"></strong>. It's shown only now: if you lose it, make a new link.</p>
+              <div class="row"><input id="sh-link-url" readonly spellcheck="false"><button class="btn" type="button" id="sh-copy">Copy</button></div>
+            </div>
+            <h3>Links</h3>
+            <div class="keylist" id="sh-list"></div>
+          </section>
+        </div>
       </div>
 
       <div class="panel" data-panel="files" hidden>
@@ -631,6 +661,21 @@
             <button class="btn ghost" type="button" id="auth-logout-others">Sign out other sessions</button>
           </div>
           <p class="form-msg" id="auth-msg" role="status"></p>
+        </section>
+      </div>
+      <div class="settings-form">
+        <section class="card" id="sharing-card">
+          <div class="card-head"><h2>Sharing relay</h2><span class="pill" id="sr-state">…</span></div>
+          <p class="hint">Guests reach shared workspaces through your own VPS (a public IP): this host keeps a reverse SSH tunnel to it, and Caddy there serves your share hostnames with Let's Encrypt certificates. No port forward or static IP is needed here. Only the guest pages go through it, never this UI.</p>
+          <p class="hint" id="sr-summary"></p>
+          <ol class="steps" id="sr-steps">
+            <li>On this host: <code>bin/share-relay init you@vps.example.com share.example.com desktop.share.example.com</code> (DNS for both names pointing at the VPS).</li>
+            <li>Run the script it prints on the VPS, with sudo (it's shown below too, once set up).</li>
+            <li><code>bin/share-relay start</code>, then restart the UI: <code>sudo systemctl restart agent-sandboxes-ui</code>.</li>
+          </ol>
+          <details id="sr-script-wrap" hidden><summary>VPS setup script</summary><pre class="snippet" id="sr-script"></pre></details>
+          <div class="row"><button class="btn" type="button" id="sr-check">Check from the internet</button>
+            <p class="form-msg" id="sr-msg" role="status"></p></div>
         </section>
       </div>
       <form id="mon-form" class="settings-form">
