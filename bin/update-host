@@ -3,7 +3,8 @@
 # only), then reinstall and restart only what changed. Run it from the web UI's
 # Host page (its Update button types it) or any shell on the host.
 #
-#   update-host            pull, then apply what the pull changed
+#   update-host            pull, then apply what the pull changed (everything,
+#                          if the running UI is older than the code on disk)
 #   update-host --all      apply everything, changed or not (after a manual pull)
 #
 # The web UI restarts last; the Host page's shell lives in its own tmux server
@@ -27,9 +28,24 @@ old=$(git rev-parse HEAD)
 say "git pull --ff-only ($(git rev-parse --abbrev-ref HEAD) at $(git rev-parse --short HEAD))"
 git pull --ff-only
 new=$(git rev-parse HEAD)
+# True if the running web UI started before its code last changed on disk
+# (a git pull by hand, then update-host: the pull here then finds nothing new)
+ui_stale() {
+  systemctl is-active -q agent-sandboxes-ui 2>/dev/null || return 1
+  local since newest
+  since=$(date -d "$(systemctl show agent-sandboxes-ui -p ActiveEnterTimestamp --value)" +%s 2>/dev/null) || return 1
+  newest=$(git ls-files -z ui bin/sandbox-ui | xargs -0 stat -c %Y 2>/dev/null | sort -n | tail -1)
+  [[ -n $newest ]] && (( newest > since ))
+}
+
 if [[ $old == "$new" && $all == 0 ]]; then
-  say "Already up to date. (update-host --all applies everything anyway.)"
-  exit 0
+  if ui_stale; then
+    say "Already up to date, but the web UI is running older code (pulled by hand?): applying everything"
+    all=1
+  else
+    say "Already up to date. (update-host --all applies everything anyway.)"
+    exit 0
+  fi
 fi
 [[ $old != "$new" ]] && git --no-pager log --oneline "$old..$new"
 
