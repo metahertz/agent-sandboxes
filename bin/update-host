@@ -99,13 +99,14 @@ if [[ -f $exporter ]]; then
   fi
 fi
 
-# The sharing relay's tunnel (a user unit, installed by bin/share-relay start)
+# The sharing relay's tunnel: the UI runs it now (Settings, Sharing relay);
+# retire the old user unit so the two don't race for the VPS's port.
 relay=~/.config/systemd/user/agent-sandboxes-relay.service
-if [[ -f $relay ]] && ! cmp -s systemd/agent-sandboxes-relay.service "$relay"; then
-  say "Installing the sharing relay's user unit"
-  install -m 644 systemd/agent-sandboxes-relay.service "$relay"
-  systemctl --user daemon-reload
-  systemctl --user is-active -q agent-sandboxes-relay && systemctl --user restart agent-sandboxes-relay
+if [[ -f $relay ]]; then
+  say "Retiring the sharing relay's user unit (the UI runs the tunnel now)"
+  systemctl --user disable --now agent-sandboxes-relay 2>/dev/null || true
+  rm -f "$relay"
+  systemctl --user daemon-reload || true
 fi
 
 # Things that take long or need a decision: say so, don't do them

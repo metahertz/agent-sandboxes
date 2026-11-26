@@ -117,7 +117,7 @@ flowchart LR
 | `monitoring/.env` ✱, `monitoring/data/` ✱, `secrets/grafana-admin-password` ✱ | Monitoring settings, exporter output, Grafana data |
 | `secrets/backup.json` ✱, `secrets/backup-status.json` ✱ | Backup settings (NAS password included) and recent runs |
 | `ui/shares.py`, `ui/static/guest.*` | Sharing a workspace: share links, guest sessions; the guest's page |
-| `bin/share-relay`, `systemd/agent-sandboxes-relay.service` | The sharing relay: setup, the VPS's script, the reverse SSH tunnel (user unit) |
+| `ui/relay.py` | The sharing relay: its settings, the VPS's script, the reverse SSH tunnel (run by the UI) |
 | `ui/share.env` ✱, `secrets/relay/` ✱ | Relay settings (share hostnames, VPS); the tunnel's key and the VPS's pinned host key |
 | `ui/shares.json` ✱, `ui/shares.log` ✱ | Share links (token hashes, scope, expiry); who joined, left, downloaded, uploaded |
 
@@ -684,17 +684,23 @@ has guest routes: the guest page, that share's terminal, files and desktop. The
 UI's API, settings, other workspaces and the host shell aren't routed there at
 all, and your sign-in cookie means nothing to it.
 
-Setup, once you have a VPS with a public IP (Debian or Ubuntu) and two DNS names
-pointing at it:
+Setup, all in *Settings → Sharing relay*, once you have a VPS with a public IP
+(Debian or Ubuntu) and two DNS names pointing at it:
 
-```bash
-bin/share-relay init vps.example.com share.example.com desktop.share.example.com
-#   a tunnel key in secrets/relay/, the VPS's ssh host key (check the fingerprint
-#   it prints, then it's pinned), ui/share.env; prints the VPS script
-# on the VPS, as root: run that script (bin/share-relay vps-script prints it again)
-bin/share-relay start                       # the tunnel: systemd user unit agent-sandboxes-relay
-sudo systemctl restart agent-sandboxes-ui   # the UI starts the share listener
-```
+1. **Fill in** the share name, the desktop name (optional), and the VPS's
+   hostname or IP and SSH port, then save.
+2. **Confirm the VPS's SSH host key.** The page shows its fingerprint; compare
+   it with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the VPS. Once
+   confirmed it's pinned, and the tunnel only ever talks to that key. Saving
+   also makes the tunnel's key (`secrets/relay/`) and starts the share listener.
+3. **Run the VPS setup script** that appears on the card, on the VPS as root.
+   Run it again if you change the names.
+4. **Check from the internet.**
+
+The UI runs the tunnel itself (`ssh -N -R …`, restarted when it drops), so it's
+up whenever the UI is. The card shows its state and the last error, and has
+*Stop tunnel*, *Re-check host key* (after reinstalling the VPS) and *Turn off
+sharing*.
 
 The VPS script:
 - **Creates user `aio-relay`.** It may only open that one reverse forward
@@ -705,8 +711,7 @@ The VPS script:
   - It's added as `/etc/caddy/aio-share.caddy` plus an `import` line; your
     existing Caddyfile is kept.
 
-*Settings → Sharing relay* shows the tunnel's state. *Check from the internet*
-fetches `https://<share-host>/__relay/ping` the way a guest would: DNS, Caddy
+*Check from the internet* fetches `https://<share-host>/__relay/ping` the way a guest would: DNS, Caddy
 and the tunnel in one go.
 
 Notes:
@@ -716,8 +721,9 @@ Notes:
   UI's sign-in, so strangers trying links can't lock you out.
 - **Guest sessions live in memory.** After a UI restart, guests open their link
   again. Links stay valid until they expire or you revoke them.
-- **Without `ui/share.env`, sharing is off:** there's no listener and no tunnel.
-  `bin/share-relay stop` takes the tunnel down.
+- **Until it's set up, sharing is off:** there's no listener and no tunnel.
+  *Turn off sharing* removes the settings and the pinned host key but keeps the
+  tunnel's key, so the VPS needs no change if you set it up again.
 
 ## Backup
 

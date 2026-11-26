@@ -663,21 +663,47 @@
           <p class="form-msg" id="auth-msg" role="status"></p>
         </section>
       </div>
-      <div class="settings-form">
+      <form id="sr-form" class="settings-form" autocomplete="off">
         <section class="card" id="sharing-card">
           <div class="card-head"><h2>Sharing relay</h2><span class="pill" id="sr-state">…</span></div>
-          <p class="hint">Guests reach shared workspaces through your own VPS (a public IP): this host keeps a reverse SSH tunnel to it, and Caddy there serves your share hostnames with Let's Encrypt certificates. No port forward or static IP is needed here. Only the guest pages go through it, never this UI.</p>
-          <p class="hint" id="sr-summary"></p>
+          <p class="hint">Guests reach shared workspaces through your own VPS (any small server with a public IP). This host keeps a reverse SSH tunnel to it, so no port forward or static IP is needed here, and Caddy on the VPS serves your share names with Let's Encrypt certificates. Only guest pages go through it, never this UI.</p>
           <ol class="steps" id="sr-steps">
-            <li>On this host: <code>bin/share-relay init you@vps.example.com share.example.com desktop.share.example.com</code> (DNS for both names pointing at the VPS).</li>
-            <li>Run the script it prints on the VPS, with sudo (it's shown below too, once set up).</li>
-            <li><code>bin/share-relay start</code>, then restart the UI: <code>sudo systemctl restart agent-sandboxes-ui</code>.</li>
+            <li>Point DNS for both names below at the VPS (A records, or a CNAME / wildcard to it).</li>
+            <li>Fill in the names and the VPS, and save. You confirm the VPS's SSH host key once.</li>
+            <li>Run the <b>VPS setup script</b> that appears below on the VPS, as root.</li>
+            <li>Click <b>Check from the internet</b>.</li>
           </ol>
-          <details id="sr-script-wrap" hidden><summary>VPS setup script</summary><pre class="snippet" id="sr-script"></pre></details>
-          <div class="row"><button class="btn" type="button" id="sr-check">Check from the internet</button>
-            <p class="form-msg" id="sr-msg" role="status"></p></div>
+          <div class="two">
+            <label><span>Share name <span class="muted">(the guests' links)</span></span>
+              <input name="shareHost" placeholder="share.example.com" required></label>
+            <label><span>Desktop name <span class="muted">(optional: the browser desktop, its own origin)</span></span>
+              <input name="desktopHost" placeholder="desktop.share.example.com"></label>
+          </div>
+          <div class="two">
+            <label><span>VPS <span class="muted">(hostname or IP you ssh to)</span></span>
+              <input name="vps" placeholder="vps.example.com" required></label>
+            <label>SSH port <input name="sshPort" type="number" min="1" max="65535" value="22" required></label>
+          </div>
+          <div id="sr-confirm" class="callout" hidden>
+            <p>The VPS's SSH host key (<code id="sr-confirm-host"></code>) is <code id="sr-confirm-fp"></code>.
+              Check it on the VPS with <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> before trusting it: the tunnel will only ever talk to this key.</p>
+            <div class="row"><button class="btn primary" type="button" id="sr-confirm-yes">It matches: save</button>
+              <button class="btn ghost" type="button" id="sr-confirm-no">Cancel</button></div>
+          </div>
+          <p class="hint" id="sr-summary"></p>
+          <details id="sr-script-wrap" hidden><summary>VPS setup script <span class="muted">(run it on the VPS as root; again after changing the names)</span></summary>
+            <pre class="snippet" id="sr-script"></pre>
+            <div class="row"><button class="btn" type="button" id="sr-copy">Copy script</button></div></details>
+          <div class="row">
+            <button class="btn primary" type="submit" id="sr-save">Save</button>
+            <button class="btn" type="button" id="sr-tunnel" hidden>Stop tunnel</button>
+            <button class="btn" type="button" id="sr-check" disabled>Check from the internet</button>
+            <button class="btn ghost" type="button" id="sr-repin" hidden>Re-check host key</button>
+            <button class="btn ghost" type="button" id="sr-off" hidden>Turn off sharing</button>
+          </div>
+          <p class="form-msg" id="sr-msg" role="status"></p>
         </section>
-      </div>
+      </form>
       <form id="mon-form" class="settings-form">
         <section class="card" id="ca-card" hidden>
           <div class="card-head"><h2>HTTPS certificate</h2>

@@ -309,3 +309,9 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 .warn-text { color: var(--warn); }
 .keyrow.ended { opacity: .6; }
 .ws-item .guests { font-size: 11px; color: var(--ok); margin-left: 4px; }
+
+/* Settings, Sharing relay: confirming the VPS's host key */
+.callout { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--warn); border-radius: 6px; font-size: 13px; }
+.callout p { margin: 0 0 8px; }
+.callout code { word-break: break-all; }
+#sr-summary:not(:empty) { margin-top: 12px; }

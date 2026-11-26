@@ -4,8 +4,9 @@ A share gives one guest (by link) one workspace's Claude terminal, to watch
 or to drive, and optionally its project files and the sandbox's browser
 desktop, until it expires or is revoked. Guests reach the UI's separate
 share listener (127.0.0.1:SHARE_PORT), which only ever serves guest routes;
-bin/share-relay keeps it reachable from the internet through a reverse SSH
-tunnel to your own VPS (Caddy there holds the public name and certificate).
+the relay (ui/relay.py, set up in Settings) keeps it reachable from the
+internet through a reverse SSH tunnel to your own VPS (Caddy there holds
+the public names and certificates).
 
 Only a hash of each link's token is stored. Guest sessions (the asg cookie)
 live in memory: after a UI restart the guest opens the link again.
@@ -59,7 +60,7 @@ def log(line: str):
 
 def config() -> dict:
     """SHARE_HOST / SHARE_DESKTOP_HOST: the public names (on the VPS);
-    SHARE_PORT: the local listener; RELAY: user@vps (bin/share-relay)."""
+    SHARE_PORT: the local listener; RELAY: user@vps (ui/relay.py)."""
     env = {}
     try:
         for line in SHARE_ENV.read_text().splitlines():

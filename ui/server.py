@@ -62,6 +62,7 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
 import auth  # noqa: E402
 import builds  # noqa: E402
 import applesign  # noqa: E402
+import relay  # noqa: E402
 import shares  # noqa: E402
 
 COMPOSE_FILE = ROOT / "compose.workspace.yaml"
@@ -2460,10 +2461,8 @@ async def settings_api(req: Request, parts: list[str], w):
                                200 if rc == 0 else 500)
     if parts == ["claude-md"]:
         return await claude_md_api(req, w)
-    if parts == ["sharing"] and m == "GET":
-        return await send_json(w, await sharing_status())
-    if parts == ["sharing", "check"] and m == "POST":
-        return await send_json(w, await sharing_check())
+    if parts[:1] == ["sharing"]:
+        return await sharing_api(req, parts[1:], w)
     if parts[:1] == ["backup"]:
         return await backup_api(req, parts[1:], w)
     if parts == ["monitoring", "password"] and m == "GET":
@@ -3392,8 +3391,8 @@ async def handle_proxy(req: Request, name: str, reader, w, prefix: str | None = 
 
 SHARE_STATIC = {"/static/guest.js", "/static/guest.css", "/static/theme.js", "/static/vendor/xterm.js",
                 "/static/vendor/xterm.css", "/static/vendor/addon-fit.js"}
-SHARE_RELAY_TOOL = ROOT / "bin" / "share-relay"
 share_servers: list[asyncio.Server] = []
+sharing_lock = asyncio.Lock()
 
 
 def share_client_ip(req: Request, w) -> str:
@@ -3588,26 +3587,62 @@ async def shares_api(req: Request, parts: list[str], w, ws: dict | None = None):
 
 
 async def sharing_status() -> dict:
-    cfg = shares.config()
-    tunnel = "not set up"
-    if cfg["relay"]:
-        tunnel = (await run("systemctl", "--user", "is-active", "agent-sandboxes-relay",
-                            timeout=10))[1].strip() or "unknown"
-    setup = ""
-    if cfg["relay"] and SHARE_RELAY_TOOL.is_file():
-        rc, out, _ = await run(str(SHARE_RELAY_TOOL), "vps-script", timeout=10)
-        setup = out if rc == 0 else ""
+    cfg, env = shares.config(), relay.settings()
     return {"enabled": cfg["enabled"], "origin": cfg["origin"] if cfg["enabled"] else "",
             "desktop": cfg["desktop_origin"], "port": cfg["port"], "listening": bool(share_servers),
-            "relay": cfg["relay"], "tunnel": tunnel, "vpsScript": setup,
+            "settings": env, "hostKey": await relay.pinned(), "publicKey": relay.public_key(),
+            "tunnel": relay.tunnel.status(), "vpsScript": relay.vps_script(),
             "active": sum(1 for x in shares.listing() if x["active"])}
+
+
+async def sharing_api(req: Request, parts: list[str], w):
+    """Settings, Sharing relay: save (pinning the VPS's host key once you
+    confirm its fingerprint), the tunnel on / off, the end-to-end check, off."""
+    m = req.method
+    if parts == [] and m == "GET":
+        return await send_json(w, await sharing_status())
+    if parts == ["check"] and m == "POST":
+        return await send_json(w, await sharing_check())
+    if sharing_lock.locked():
+        return await send_json(w, {"error": "The relay is already being changed"}, 409)
+    async with sharing_lock:
+        if parts == [] and m == "PUT":
+            try:
+                body = json.loads(req.body or b"{}")
+                cfg = relay.clean(body)
+                host = relay.known_host(cfg["vps"], cfg["sshPort"])
+                pin = await relay.pinned()
+                if body.get("repin") or pin.get("host") != host:
+                    line, fp = await relay.scan(cfg["vps"], cfg["sshPort"])
+                    if body.get("fingerprint") != fp:
+                        return await send_json(w, {"confirm": {"host": host, "fingerprint": fp}})
+                    relay.pin(line)
+                    shares.log(f"relay: pinned {host}'s host key {fp}")
+                await relay.ensure_key()
+                was = relay.settings()
+                relay.write_env(cfg, was["tunnel"] or not was["vps"])
+            except (ValueError, json.JSONDecodeError, RuntimeError, OSError, TimeoutError) as e:
+                return await send_json(w, {"error": str(e)}, 400)
+        elif parts == ["tunnel"] and m == "POST":
+            if not relay.tunnel.ready():
+                return await send_json(w, {"error": "Save the relay's settings first"}, 409)
+            relay.set_tunnel(bool(json.loads(req.body or b"{}").get("on")))
+        elif parts == [] and m == "DELETE":
+            await relay.tunnel.stop()
+            relay.forget()
+            shares.log("relay: turned off (settings removed)")
+        else:
+            return await respond(w, 404, "Not found\n")
+        await reopen_share_listener()
+        await relay.tunnel.apply()
+    return await send_json(w, await sharing_status())
 
 
 async def sharing_check() -> dict:
     """GET <share origin>/__relay/ping through the VPS: DNS, Caddy and the tunnel."""
     cfg = shares.config()
     if not cfg["enabled"]:
-        return {"ok": False, "error": "Sharing isn't set up (bin/share-relay init)"}
+        return {"ok": False, "error": "Sharing isn't set up yet"}
     nonce = secrets.token_hex(8)
     url = f"{cfg['origin']}/__relay/ping?n={nonce}"
 
@@ -3624,16 +3659,28 @@ async def sharing_check() -> dict:
     return {"ok": ok, "url": url, "error": "" if ok else f"Something else answered: {body[:80]!r}"}
 
 
-async def open_share_listener():
+async def reopen_share_listener():
+    """The share listener, when sharing is set up (and only then); its port can change."""
     cfg = shares.config()
-    if not cfg["enabled"]:
+    want = cfg["port"] if cfg["enabled"] else None
+    have = share_servers[0].sockets[0].getsockname()[1] if share_servers else None
+    if want == have:
+        return
+    while share_servers:
+        srv = share_servers.pop()
+        srv.close()
+        for sid in {x["id"] for x in shares.listing()}:
+            shares.end_guests(sid)
+        await srv.wait_closed()
+        print("Sharing: listener closed", flush=True)
+    if want is None:
         return
     try:
         share_servers.append(await asyncio.start_server(lambda r, w: handle(r, w, share=True), "127.0.0.1",
-                                                        cfg["port"], limit=MAX_HEAD))
-        print(f"Sharing: guests at {cfg['origin']} (listening on 127.0.0.1:{cfg['port']})", flush=True)
+                                                        want, limit=MAX_HEAD))
+        print(f"Sharing: guests at {cfg['origin']} (listening on 127.0.0.1:{want})", flush=True)
     except OSError as e:
-        print(f"Sharing: can't listen on 127.0.0.1:{cfg['port']}: {e.strerror}", flush=True)
+        print(f"Sharing: can't listen on 127.0.0.1:{want}: {e.strerror}", flush=True)
 
 
 # --------------------------------------------------------------- main
@@ -4272,13 +4319,14 @@ async def main():
     except OSError as e:          # the UI runs on without the agents' build tools
         print(f"Apple builds: no MCP socket at {builds.MCP_SOCK}: {e}", flush=True)
         mcp_server = None
-    await open_share_listener()
+    await reopen_share_listener()
+    await relay.tunnel.apply()
     builds.monitor.start()
     drop_ambient_caps()
     for addr in BIND:
         print(f"Agent Sandboxes UI on {SCHEME}://{addr}:{LISTEN_PORT}/", flush=True)
     await asyncio.gather(renew_daily(), backup_scheduler(), proxyd_startup(), shares.expiry_watch(),
-                         *(s.serve_forever() for s in servers + share_servers + ([mcp_server] if mcp_server else [])))
+                         *(s.serve_forever() for s in servers + ([mcp_server] if mcp_server else [])))
 
 
 def cli_prepare(name: str, aux: bool = False):

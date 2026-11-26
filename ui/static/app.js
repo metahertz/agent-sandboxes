@@ -2267,32 +2267,104 @@ $("#sh-copy").addEventListener("click", async () => {
   catch { $("#sh-link-url").select(); shMsg("Select the link and copy it."); }
 });
 
-async function loadSharing() {
-  try {
-    const r = await api("GET", "settings/sharing");
-    const st = $("#sr-state");
-    const up = r.listening && (r.tunnel === "active" || !r.relay);
-    st.textContent = !r.enabled ? "not set up" : !r.listening ? "restart the UI" : r.relay ? `tunnel ${r.tunnel}` : "local only";
-    st.className = `pill ${!r.enabled ? "" : up ? "ok" : "warn"}`;
-    $("#sr-summary").textContent = r.enabled
-      ? `Guests open ${r.origin}${r.desktop ? ` (browser desktop: ${r.desktop})` : ""}, relayed by ${r.relay || "nothing yet"} to 127.0.0.1:${r.port} here. ${r.active} active link(s).`
-      : "";
-    $("#sr-steps").hidden = r.enabled && r.listening && r.tunnel === "active";
-    $("#sr-script-wrap").hidden = !r.vpsScript;
-    $("#sr-script").textContent = r.vpsScript || "";
-    $("#sr-check").disabled = !r.enabled;
-  } catch (e) {
-    $("#sr-msg").textContent = e.message;
-  }
+let srPending = null;      // the form waiting for its host key to be confirmed
+let srTimer = 0;
+
+function srMsg(text, bad = false) {
+  $("#sr-msg").textContent = text;
+  $("#sr-msg").classList.toggle("err", bad);
 }
 
+async function loadSharing(fill = true) {
+  clearTimeout(srTimer);
+  try {
+    const r = await api("GET", "settings/sharing");
+    const f = $("#sr-form"), set = r.settings, t = r.tunnel;
+    if (fill && !srPending) {
+      f.shareHost.value = set.shareHost; f.desktopHost.value = set.desktopHost;
+      f.vps.value = set.vps; f.sshPort.value = set.sshPort;
+    }
+    const st = $("#sr-state");
+    st.textContent = !r.enabled ? "not set up" : !r.listening ? "listener down" : !set.tunnel ? "tunnel stopped" : `tunnel ${t.state}`;
+    st.className = `pill ${!r.enabled ? "" : r.listening && t.state === "up" ? "ok" : t.state === "connecting" ? "" : "warn"}`;
+    const parts = [];
+    if (r.enabled) parts.push(`Guests open ${r.origin}${r.desktop ? ` (browser desktop: ${r.desktop})` : ""}. ${r.active} active link(s).`);
+    if (r.hostKey.fingerprint) parts.push(`VPS host key ${r.hostKey.fingerprint} (pinned).`);
+    if (set.tunnel && t.state === "down") parts.push(`Tunnel down, retrying: ${t.error}`);
+    if (t.state === "up") parts.push(`Tunnel up since ${new Date(t.since * 1000).toLocaleTimeString()}.`);
+    $("#sr-summary").textContent = parts.join(" ");
+    $("#sr-steps").hidden = r.enabled && t.state === "up";
+    $("#sr-script-wrap").hidden = !r.vpsScript;
+    $("#sr-script").textContent = r.vpsScript || "";
+    if (r.vpsScript && t.state !== "up") $("#sr-script-wrap").open = true;
+    $("#sr-check").disabled = !r.enabled;
+    $("#sr-tunnel").hidden = $("#sr-repin").hidden = $("#sr-off").hidden = !r.enabled;
+    $("#sr-tunnel").textContent = set.tunnel ? "Stop tunnel" : "Start tunnel";
+    $("#sr-tunnel").dataset.on = set.tunnel ? "" : "1";
+    $("#sr-save").textContent = r.enabled ? "Save" : "Save & set up";
+    if (!$("#settings").hidden && t.state === "connecting") srTimer = setTimeout(() => loadSharing(false), 4000);
+  } catch (e) { srMsg(e.message, true); }
+}
+
+async function srSave(extra = {}) {
+  const f = $("#sr-form");
+  const body = { shareHost: f.shareHost.value.trim(), desktopHost: f.desktopHost.value.trim(),
+                 vps: f.vps.value.trim(), sshPort: Number(f.sshPort.value), ...extra };
+  srMsg(extra.fingerprint ? "Saving…" : "Fetching the VPS's host key…");
+  $("#sr-save").disabled = true;
+  try {
+    const res = await fetch("/api/settings/sharing", { method: "PUT", body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json", "X-Requested-With": "sbui" } });
+    const data = await res.json();
+    if (res.ok && data.confirm) {
+      srPending = body;
+      $("#sr-confirm-host").textContent = data.confirm.host;
+      $("#sr-confirm-fp").textContent = data.confirm.fingerprint;
+      $("#sr-confirm").hidden = false;
+      $("#sr-confirm-yes").dataset.fp = data.confirm.fingerprint;
+      srMsg("Confirm the VPS's host key to save.");
+      return;
+    }
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    srPending = null;
+    $("#sr-confirm").hidden = true;
+    srMsg("Saved. Run the VPS setup script on the VPS if you haven't (or the names changed), then check from the internet.");
+    loadSharing();
+  } catch (e) { srMsg(e.message, true); }
+  finally { $("#sr-save").disabled = false; }
+}
+
+$("#sr-form").addEventListener("submit", (ev) => { ev.preventDefault(); srSave(); });
+$("#sr-repin").addEventListener("click", () => srSave({ repin: true }));
+$("#sr-confirm-yes").addEventListener("click", () => {
+  const { repin, ...form } = srPending || {};
+  if (srPending) srSave({ ...form, repin, fingerprint: $("#sr-confirm-yes").dataset.fp });
+});
+$("#sr-confirm-no").addEventListener("click", () => {
+  srPending = null;
+  $("#sr-confirm").hidden = true;
+  srMsg("Not saved: the host key wasn't confirmed.");
+});
+$("#sr-tunnel").addEventListener("click", async () => {
+  try {
+    await api("POST", "settings/sharing/tunnel", { on: !!$("#sr-tunnel").dataset.on });
+    srMsg("");
+    loadSharing(false);
+  } catch (e) { srMsg(e.message, true); }
+});
+$("#sr-off").addEventListener("click", async () => {
+  if (!confirm("Turn off sharing? The tunnel stops and the relay settings are removed here. Share links stay, but nobody can reach them until it's set up again. (The VPS is left as it is.)")) return;
+  try { await api("DELETE", "settings/sharing"); srMsg("Sharing is off."); loadSharing(); }
+  catch (e) { srMsg(e.message, true); }
+});
+$("#sr-copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("#sr-script").textContent); srMsg("Script copied."); }
+  catch { srMsg("Select the script and copy it."); }
+});
 $("#sr-check").addEventListener("click", async () => {
-  const m = $("#sr-msg");
-  m.textContent = "Checking…";
-  m.classList.remove("err");
+  srMsg("Checking…");
   try {
     const r = await api("POST", "settings/sharing/check");
-    m.textContent = r.ok ? `Works: ${r.url} reached this host through the relay.` : `${r.url || ""} ${r.error}`;
-    m.classList.toggle("err", !r.ok);
-  } catch (e) { m.textContent = e.message; m.classList.add("err"); }
+    srMsg(r.ok ? `Works: ${r.url} reached this host through the relay.` : `${r.url || ""} ${r.error}`, !r.ok);
+  } catch (e) { srMsg(e.message, true); }
 });
