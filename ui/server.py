@@ -3591,6 +3591,7 @@ async def sharing_status() -> dict:
     return {"enabled": cfg["enabled"], "origin": cfg["origin"] if cfg["enabled"] else "",
             "desktop": cfg["desktop_origin"], "port": cfg["port"], "listening": bool(share_servers),
             "settings": env, "hostKey": await relay.pinned(), "publicKey": relay.public_key(),
+            "tunnelKey": await relay.key_fingerprint(),
             "tunnel": relay.tunnel.status(), "vpsScript": relay.vps_script(),
             "active": sum(1 for x in shares.listing() if x["active"])}
 

@@ -2290,7 +2290,12 @@ async function loadSharing(fill = true) {
     const parts = [];
     if (r.enabled) parts.push(`Guests open ${r.origin}${r.desktop ? ` (browser desktop: ${r.desktop})` : ""}. ${r.active} active link(s).`);
     if (r.hostKey.fingerprint) parts.push(`VPS host key ${r.hostKey.fingerprint} (pinned).`);
-    if (set.tunnel && t.state === "down") parts.push(`Tunnel down, retrying: ${t.error}`);
+    if (r.tunnelKey) parts.push(`Tunnel key ${r.tunnelKey}.`);
+    if (set.tunnel && t.state === "down") {
+      parts.push(`Tunnel down, retrying: ${t.error}`);
+      if (/Permission denied/.test(t.error)) parts.push("The VPS refused this host's tunnel key: run the VPS setup script below on it again. It ends by checking sshd's settings for the relay user and printing the key it installed, which should match the tunnel key above.");
+      else if (/Host key verification failed/.test(t.error)) parts.push("The VPS's SSH host key changed (reinstalled?): Re-check host key.");
+    }
     if (t.state === "up") parts.push(`Tunnel up since ${new Date(t.since * 1000).toLocaleTimeString()}.`);
     $("#sr-summary").textContent = parts.join(" ");
     $("#sr-steps").hidden = r.enabled && t.state === "up";

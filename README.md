@@ -705,7 +705,19 @@ sharing*.
 The VPS script:
 - **Creates user `aio-relay`.** It may only open that one reverse forward
   (`restrict,port-forwarding,permitlisten="127.0.0.1:18443"` and a matching
-  `sshd_config.d` block): no shell, no other forwards.
+  `Match User aio-relay` block): no shell, no other forwards.
+- **Works on a server with its own sshd setup.**
+  - The tunnel's key goes in `/etc/ssh/aio-relay.authorized_keys`, owned by
+    root, which sshd uses for `aio-relay` only. A custom `AuthorizedKeysFile`,
+    home directories or StrictModes don't get in the way.
+  - `aio-relay` is added to `AllowUsers` if there is one.
+  - The `Match` block goes in `sshd_config.d`, or at the end of `sshd_config`
+    if there's no include.
+  - sshd's config is copied to `/root/sshd-before-aio-relay.*` first. If the
+    result fails `sshd -t`, all of it is put back and nothing is reloaded.
+  - It ends by checking what sshd will really do for `aio-relay`, and prints
+    the installed key's fingerprint to compare with *Tunnel key* in Settings.
+  - It's safe to run again, e.g. after changing the names.
 - **Installs Caddy** with a site for both names. Caddy gets Let's Encrypt
   certificates and passes the guest's address on in `X-Forwarded-For`.
   - It's added as `/etc/caddy/aio-share.caddy` plus an `import` line; your

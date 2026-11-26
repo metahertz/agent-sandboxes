@@ -102,6 +102,14 @@ def public_key() -> str:
         return ""
 
 
+async def key_fingerprint() -> str:
+    pub = public_key()
+    try:
+        return await fingerprint(pub) if pub else ""
+    except (RuntimeError, TimeoutError):
+        return ""
+
+
 async def scan(vps: str, port: int) -> tuple[str, str]:
     """The VPS's ed25519 host key: (known_hosts line, its SHA256 fingerprint)."""
     rc, out, _ = await _run("ssh-keyscan", "-T", "10", "-p", str(port), "-t", "ed25519", vps, timeout=20)
@@ -176,12 +184,87 @@ CADDY
 """
 
 
+def vps_user_part(u: str, p: int, pub: str) -> str:
+    """Step 1 of the VPS script. It also works on a server with its own sshd
+    setup: the key sits in a root-owned file that sshd uses for this user
+    alone (whatever its AuthorizedKeysFile, home directories or StrictModes),
+    AllowUsers gets the user, a config that fails `sshd -t` is taken back
+    out, and it ends by checking what sshd will really do for the user."""
+    keys = f"/etc/ssh/{u}.authorized_keys"
+    return f"""# 1. A user that may only open the tunnel: no shell, no other forwards.
+#    Its key is in {keys} (root's), which sshd uses for {u} alone.
+nologin=/usr/sbin/nologin; [ -x $nologin ] || nologin=/bin/false
+id {u} >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/{u} --shell $nologin {u}
+usermod -p '*' {u}     # no password, but not "locked": sshd refuses locked accounts without PAM
+cat > {keys} <<'KEY'
+restrict,port-forwarding,permitlisten="127.0.0.1:{p}",command="/bin/false" {pub}
+KEY
+chown root:root {keys}
+chmod 644 {keys}
+block='Match User {u}
+    AuthorizedKeysFile {keys}
+    PubkeyAuthentication yes
+    AllowTcpForwarding remote
+    PermitListen 127.0.0.1:{p}
+    PermitTTY no
+    X11Forwarding no
+    AllowAgentForwarding no
+    PasswordAuthentication no'
+cfg=/etc/ssh/sshd_config
+# a copy of sshd's config first: if the result fails `sshd -t`, all of it goes back
+before=$(mktemp -d /root/sshd-before-{u}.XXXXXX)
+cp -a $cfg $before/
+[ -d /etc/ssh/sshd_config.d ] && cp -a /etc/ssh/sshd_config.d $before/
+undo() {{
+  cp -a $before/sshd_config $cfg
+  if [ -d $before/sshd_config.d ]; then rm -rf /etc/ssh/sshd_config.d && cp -a $before/sshd_config.d /etc/ssh/; fi
+}}
+if [ -d /etc/ssh/sshd_config.d ] && grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d' $cfg; then
+  printf '%s\\n' "$block" > /etc/ssh/sshd_config.d/{u}.conf
+else
+  # no sshd_config.d: the block at the end of sshd_config (where Match blocks belong), between markers
+  sed -i '/^# >>> {u}/,/^# <<< {u}/d' $cfg
+  printf '\\n# >>> {u} (agent-sandboxes sharing relay)\\n%s\\n# <<< {u}\\n' "$block" >> $cfg
+fi
+for f in $cfg /etc/ssh/sshd_config.d/*.conf; do
+  [ -f "$f" ] || continue
+  if grep -qiE '^[[:space:]]*AllowUsers[[:space:]]' "$f" && ! grep -qiE '^[[:space:]]*AllowUsers[[:space:]].*[[:space:]]{u}([[:space:]]|$)' "$f"; then
+    sed -i -E 's/^([[:space:]]*[Aa][Ll][Ll][Oo][Ww][Uu][Ss][Ee][Rr][Ss][[:space:]].*)$/\\1 {u}/' "$f"
+    echo "Added {u} to AllowUsers in $f"
+  fi
+done
+if ! sshd -t; then
+  undo
+  echo "sshd rejected the new config: all of it put back as it was ($before), nothing reloaded" >&2
+  exit 1
+fi
+echo "sshd's config before this script: $before"
+systemctl reload ssh 2>/dev/null || systemctl reload sshd
+rm -f /var/lib/{u}/.ssh/authorized_keys     # from an older version of this script; {keys} is the one now
+
+# What sshd will really do for {u}
+eff=$(sshd -T -C user={u},host=relay-check,addr=127.0.0.1 2>&1) || true
+problem() {{ echo "PROBLEM: $*" >&2; problems=1; }}
+problems=0
+echo "$eff" | grep -qx "authorizedkeysfile {keys}" ||
+  problem "sshd doesn't read {keys} for {u} (an earlier Match block in its config sets AuthorizedKeysFile?)"
+echo "$eff" | grep -qx "pubkeyauthentication yes" || problem "sshd has key logins off for {u}"
+echo "$eff" | grep -qE "^allowtcpforwarding (yes|all|remote)$" || problem "sshd doesn't allow {u} remote forwarding"
+if echo "$eff" | grep -q "^allowusers " && ! echo "$eff" | grep -qx "allowusers {u}"; then problem "AllowUsers leaves out {u}"; fi
+echo "$eff" | grep -q "^allowgroups " && problem "sshd has AllowGroups: add {u} to one of those groups"
+echo "$eff" | grep -qE "^deny(users|groups) " && echo "note: sshd has DenyUsers / DenyGroups: make sure {u} isn't in them" >&2
+echo "Tunnel key installed for {u}: $(ssh-keygen -lf {keys} | cut -d' ' -f2) (Settings shows the one it uses)"
+[ $problems = 0 ] || exit 1
+"""
+
+
 def vps_script() -> str:
     cfg, pub = settings(), public_key()
     if not cfg["shareHost"] or not pub:
         return ""
     names = cfg["shareHost"] + (f", {cfg['desktopHost']}" if cfg["desktopHost"] else "")
     u, p = RELAY_USER, shares.RELAY_PORT
+    user_part = vps_user_part(u, p, pub)
     caddy = caddy_cloudflare(names, p) if cfg["cloudflare"] else f"""# 2. Caddy: HTTPS for {names} (Let's Encrypt), to the tunnel
 command -v caddy >/dev/null 2>&1 || {{ apt-get update && apt-get install -y caddy; }}
 cat > /etc/caddy/aio-share.caddy <<'CADDY'
@@ -197,32 +280,7 @@ CADDY
 # Needs DNS for {names} pointing at this VPS, and ports 80 and 443 open.
 set -eu
 
-# 1. A user that may only open the tunnel: no shell, no other forwards
-nologin=/usr/sbin/nologin; [ -x $nologin ] || nologin=/bin/false
-id {u} >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/{u} --shell $nologin {u}
-usermod -p '*' {u}     # no password, but not "locked": sshd refuses locked accounts without PAM
-install -d -m 700 -o {u} -g {u} /var/lib/{u}/.ssh
-cat > /var/lib/{u}/.ssh/authorized_keys <<'KEY'
-restrict,port-forwarding,permitlisten="127.0.0.1:{p}",command="/bin/false" {pub}
-KEY
-chown {u}:{u} /var/lib/{u}/.ssh/authorized_keys
-chmod 600 /var/lib/{u}/.ssh/authorized_keys
-if [ -d /etc/ssh/sshd_config.d ] && grep -qi '^Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config; then
-  cat > /etc/ssh/sshd_config.d/{u}.conf <<'SSHD'
-Match User {u}
-    AllowTcpForwarding remote
-    PermitListen 127.0.0.1:{p}
-    PermitTTY no
-    X11Forwarding no
-    AllowAgentForwarding no
-    PasswordAuthentication no
-SSHD
-  sshd -t && (systemctl reload ssh 2>/dev/null || systemctl reload sshd)
-else
-  echo "note: no sshd_config.d include; the authorized_keys options above still limit {u}" >&2
-fi
-grep -q '^AllowUsers' /etc/ssh/sshd_config && echo "note: sshd has AllowUsers: add {u} to it" >&2
-
+{user_part}
 {caddy}grep -q '^import /etc/caddy/aio-share.caddy' /etc/caddy/Caddyfile 2>/dev/null || \\
   printf '\\nimport /etc/caddy/aio-share.caddy\\n' >> /etc/caddy/Caddyfile
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
