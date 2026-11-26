@@ -684,6 +684,7 @@
               <input name="vps" placeholder="vps.example.com" required></label>
             <label>SSH port <input name="sshPort" type="number" min="1" max="65535" value="22" required></label>
           </div>
+          <label class="check" style="margin-top:12px"><input type="checkbox" name="cloudflare"> <span>Behind Cloudflare's proxy (orange cloud) <span class="muted">— set Cloudflare's SSL/TLS mode to <b>Full (strict)</b> for both names, not Flexible. The VPS then only accepts Cloudflare's edge, and guests' addresses come from CF-Connecting-IP. Re-run the VPS script after changing this.</span></span></label>
           <div id="sr-confirm" class="callout" hidden>
             <p>The VPS's SSH host key (<code id="sr-confirm-host"></code>) is <code id="sr-confirm-fp"></code>.
               Check it on the VPS with <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> before trusting it: the tunnel will only ever talk to this key.</p>

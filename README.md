@@ -714,6 +714,21 @@ The VPS script:
 *Check from the internet* fetches `https://<share-host>/__relay/ping` the way a guest would: DNS, Caddy
 and the tunnel in one go.
 
+**Behind Cloudflare's proxy** (orange cloud), tick *Behind Cloudflare's proxy*
+and re-run the VPS script:
+- **Set Cloudflare's SSL/TLS mode to Full (strict)** for both names, zone-wide or
+  with a Configuration Rule for just them. *Flexible* makes Cloudflare reach the
+  VPS over plain HTTP, and Caddy's redirect to HTTPS then loops (HTTP 308).
+- **Caddy only accepts Cloudflare's edge.** The script fetches Cloudflare's
+  address ranges and drops other clients, so the guest's address can be taken
+  from `CF-Connecting-IP` for the bad-link limiter. Both names must be proxied.
+  Re-run the script if Cloudflare's ranges change.
+- **Certificates:** Caddy still gets Let's Encrypt certificates over HTTP
+  through Cloudflare. If `journalctl -u caddy` shows that failing, turn off
+  *Always Use HTTPS* until it has them.
+- **The check explains common failures:** the redirect loop, 52x errors from
+  Cloudflare, and a tunnel that's down.
+
 Notes:
 - **The VPS sees guest traffic in plain text,** because Caddy ends TLS there.
   It's your own machine, but treat it as part of the setup.

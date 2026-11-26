@@ -2282,7 +2282,7 @@ async function loadSharing(fill = true) {
     const f = $("#sr-form"), set = r.settings, t = r.tunnel;
     if (fill && !srPending) {
       f.shareHost.value = set.shareHost; f.desktopHost.value = set.desktopHost;
-      f.vps.value = set.vps; f.sshPort.value = set.sshPort;
+      f.vps.value = set.vps; f.sshPort.value = set.sshPort; f.cloudflare.checked = set.cloudflare;
     }
     const st = $("#sr-state");
     st.textContent = !r.enabled ? "not set up" : !r.listening ? "listener down" : !set.tunnel ? "tunnel stopped" : `tunnel ${t.state}`;
@@ -2309,7 +2309,8 @@ async function loadSharing(fill = true) {
 async function srSave(extra = {}) {
   const f = $("#sr-form");
   const body = { shareHost: f.shareHost.value.trim(), desktopHost: f.desktopHost.value.trim(),
-                 vps: f.vps.value.trim(), sshPort: Number(f.sshPort.value), ...extra };
+                 vps: f.vps.value.trim(), sshPort: Number(f.sshPort.value),
+                 cloudflare: f.cloudflare.checked, ...extra };
   srMsg(extra.fingerprint ? "Saving…" : "Fetching the VPS's host key…");
   $("#sr-save").disabled = true;
   try {

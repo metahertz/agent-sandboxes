@@ -34,7 +34,7 @@ def settings() -> dict:
     port = env.get("RELAY_SSH_PORT", "")
     return {"shareHost": env.get("SHARE_HOST", ""), "desktopHost": env.get("SHARE_DESKTOP_HOST", ""),
             "vps": env.get("RELAY", "").partition("@")[2], "sshPort": int(port) if port.isdigit() else 22,
-            "tunnel": env.get("RELAY_ENABLED", "1") != "0"}
+            "tunnel": env.get("RELAY_ENABLED", "1") != "0", "cloudflare": env.get("SHARE_CLOUDFLARE") == "1"}
 
 
 def clean(body: dict) -> dict:
@@ -50,7 +50,8 @@ def clean(body: dict) -> dict:
         raise ValueError("VPS: its hostname or IP address (what you ssh to)")
     if not port.isdigit() or not 0 < int(port) < 65536:
         raise ValueError("SSH port: a number")
-    return {"shareHost": share, "desktopHost": desktop, "vps": vps, "sshPort": int(port)}
+    return {"shareHost": share, "desktopHost": desktop, "vps": vps, "sshPort": int(port),
+            "cloudflare": bool(body.get("cloudflare"))}
 
 
 def write_env(cfg: dict, tunnel: bool):
@@ -59,7 +60,8 @@ def write_env(cfg: dict, tunnel: bool):
     text = ("# The sharing relay: written by Settings, Sharing relay.\n"
             f"SHARE_HOST={cfg['shareHost']}\nSHARE_DESKTOP_HOST={cfg['desktopHost']}\nSHARE_PORT={port}\n"
             f"RELAY={RELAY_USER}@{cfg['vps']}\nRELAY_SSH_PORT={cfg['sshPort']}\n"
-            f"RELAY_PORT={shares.RELAY_PORT}\nRELAY_ENABLED={1 if tunnel else 0}\n")
+            f"RELAY_PORT={shares.RELAY_PORT}\nRELAY_ENABLED={1 if tunnel else 0}\n"
+            f"SHARE_CLOUDFLARE={1 if cfg.get('cloudflare') else 0}\n")
     tmp = shares.SHARE_ENV.with_name(f".{shares.SHARE_ENV.name}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -150,12 +152,46 @@ def forget():
             pass
 
 
+def caddy_cloudflare(names: str, p: int) -> str:
+    """Behind Cloudflare's proxy: only its edge may reach the site (so the
+    guest's CF-Connecting-IP can be trusted), with Let's Encrypt certificates
+    for Cloudflare's SSL/TLS mode Full (strict)."""
+    return f"""# 2. Caddy: HTTPS for {names} (Let's Encrypt), behind Cloudflare's proxy, to the tunnel.
+#    Only Cloudflare's edge may connect, so its CF-Connecting-IP (the guest) can be trusted.
+#    Cloudflare: SSL/TLS mode "Full (strict)" for these names, not "Flexible" (that loops on redirects).
+command -v caddy >/dev/null 2>&1 || {{ apt-get update && apt-get install -y caddy; }}
+command -v curl >/dev/null 2>&1 || {{ apt-get update && apt-get install -y curl; }}
+cf=$(curl -fsS https://www.cloudflare.com/ips-v4; echo; curl -fsS https://www.cloudflare.com/ips-v6)
+cf=$(echo $cf)
+case $cf in *.*/*:*/*) ;; *) echo "couldn't fetch Cloudflare's address ranges" >&2; exit 1 ;; esac
+cat > /etc/caddy/aio-share.caddy <<CADDY
+{names} {{
+	@notcloudflare not remote_ip $cf
+	abort @notcloudflare
+	reverse_proxy 127.0.0.1:{p} {{
+		header_up X-Forwarded-For {{http.request.header.CF-Connecting-IP}}
+	}}
+}}
+CADDY
+"""
+
+
 def vps_script() -> str:
     cfg, pub = settings(), public_key()
     if not cfg["shareHost"] or not pub:
         return ""
     names = cfg["shareHost"] + (f", {cfg['desktopHost']}" if cfg["desktopHost"] else "")
     u, p = RELAY_USER, shares.RELAY_PORT
+    caddy = caddy_cloudflare(names, p) if cfg["cloudflare"] else f"""# 2. Caddy: HTTPS for {names} (Let's Encrypt), to the tunnel
+command -v caddy >/dev/null 2>&1 || {{ apt-get update && apt-get install -y caddy; }}
+cat > /etc/caddy/aio-share.caddy <<'CADDY'
+{names} {{
+	reverse_proxy 127.0.0.1:{p} {{
+		header_up X-Forwarded-For {{remote_host}}
+	}}
+}}
+CADDY
+"""
     return f"""#!/bin/sh
 # Agent Sandboxes sharing relay: run this on the VPS as root (Debian / Ubuntu).
 # Needs DNS for {names} pointing at this VPS, and ports 80 and 443 open.
@@ -187,16 +223,7 @@ else
 fi
 grep -q '^AllowUsers' /etc/ssh/sshd_config && echo "note: sshd has AllowUsers: add {u} to it" >&2
 
-# 2. Caddy: HTTPS for {names} (Let's Encrypt), to the tunnel
-command -v caddy >/dev/null 2>&1 || {{ apt-get update && apt-get install -y caddy; }}
-cat > /etc/caddy/aio-share.caddy <<'CADDY'
-{names} {{
-	reverse_proxy 127.0.0.1:{p} {{
-		header_up X-Forwarded-For {{remote_host}}
-	}}
-}}
-CADDY
-grep -q '^import /etc/caddy/aio-share.caddy' /etc/caddy/Caddyfile 2>/dev/null || \\
+{caddy}grep -q '^import /etc/caddy/aio-share.caddy' /etc/caddy/Caddyfile 2>/dev/null || \\
   printf '\\nimport /etc/caddy/aio-share.caddy\\n' >> /etc/caddy/Caddyfile
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 systemctl reload caddy || systemctl restart caddy

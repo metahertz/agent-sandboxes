@@ -3647,16 +3647,50 @@ async def sharing_check() -> dict:
     url = f"{cfg['origin']}/__relay/ping?n={nonce}"
 
     def fetch():
+        import urllib.error
         import urllib.request
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(urllib.request.Request(url, headers={"User-Agent": "agent-sandboxes"}), timeout=15) as r:
-            return r.read(200).decode(errors="replace")
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+        try:
+            with opener.open(urllib.request.Request(url, headers={"User-Agent": "agent-sandboxes"}), timeout=15) as r:
+                return r.status, dict(r.headers), r.read(200).decode(errors="replace")
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read(200).decode(errors="replace")
     try:
-        body = await asyncio.to_thread(fetch)
+        status, headers, body = await asyncio.to_thread(fetch)
     except Exception as e:
-        return {"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}
-    ok = body.strip() == f"aio-share {nonce}"
-    return {"ok": ok, "url": url, "error": "" if ok else f"Something else answered: {body[:80]!r}"}
+        return {"ok": False, "url": url, "error": f"{type(e).__name__}: {getattr(e, 'reason', e)}"}
+    ok = status == 200 and body.strip() == f"aio-share {nonce}"
+    return {"ok": ok, "url": url, "error": "" if ok else check_advice(status, headers, body, url)}
+
+
+def check_advice(status: int, headers: dict, body: str, url: str) -> str:
+    """What a failed relay check most likely means, Cloudflare in front or not."""
+    h = {k.lower(): v for k, v in headers.items()}
+    cf = h.get("server", "").lower() == "cloudflare" or "cf-ray" in h
+    loc = h.get("location", "")
+    if status in (301, 302, 307, 308) and loc.split("?")[0] == url.split("?")[0]:
+        return (f"HTTP {status}: redirected to itself. " + (
+            "Cloudflare's SSL/TLS mode is Flexible, so it reaches the VPS over plain HTTP and Caddy sends it back "
+            "to HTTPS, in a loop. Set SSL/TLS to Full (strict) for these names (zone-wide, or a Configuration "
+            "Rule for just them)." if cf else "Something in front of Caddy reaches it over plain HTTP."))
+    if status in (301, 302, 307, 308):
+        return f"HTTP {status}: redirected to {loc[:120]}"
+    if cf and status == 526:
+        return ("Cloudflare 526: the VPS's certificate isn't valid yet. Caddy may still be getting it from "
+                "Let's Encrypt: see journalctl -u caddy on the VPS.")
+    if cf and status == 525:
+        return "Cloudflare 525: no TLS handshake with the VPS. Is Caddy running, with a site for this name?"
+    if cf and status in (521, 522, 523):
+        return f"Cloudflare {status}: it can't reach the VPS on 443 (Caddy down, a firewall, or the DNS record's IP)."
+    if status == 502:
+        return "HTTP 502: Caddy is up but the tunnel isn't (see the tunnel state above)."
+    if status == 200:
+        return f"Something else answered: {body[:80]!r}"
+    return f"HTTP {status}{' from Cloudflare' if cf else ''}: {body[:80]!r}"
 
 
 async def reopen_share_listener():
