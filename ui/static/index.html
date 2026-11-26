@@ -677,14 +677,14 @@
             <label><span>Share name <span class="muted">(the guests' links)</span></span>
               <input name="shareHost" placeholder="share.example.com" required></label>
             <label><span>Desktop name <span class="muted">(optional: the browser desktop, its own origin)</span></span>
-              <input name="desktopHost" placeholder="desktop.share.example.com"></label>
+              <input name="desktopHost" placeholder="share-desktop.example.com"></label>
           </div>
           <div class="two">
             <label><span>VPS <span class="muted">(hostname or IP you ssh to)</span></span>
               <input name="vps" placeholder="vps.example.com" required></label>
             <label>SSH port <input name="sshPort" type="number" min="1" max="65535" value="22" required></label>
           </div>
-          <label class="check" style="margin-top:12px"><input type="checkbox" name="cloudflare"> <span>Behind Cloudflare's proxy (orange cloud) <span class="muted">— set Cloudflare's SSL/TLS mode to <b>Full (strict)</b> for both names, not Flexible. The VPS then only accepts Cloudflare's edge, and guests' addresses come from CF-Connecting-IP. Re-run the VPS script after changing this.</span></span></label>
+          <label class="check" style="margin-top:12px"><input type="checkbox" name="cloudflare"> <span>Behind Cloudflare's proxy (orange cloud) <span class="muted">— set Cloudflare's SSL/TLS mode to <b>Full (strict)</b> for both names, not Flexible, and keep both names one level below your domain (<code>share-desktop.example.com</code>, not <code>desktop.share.example.com</code>): Cloudflare's free certificate doesn't cover deeper names. The VPS then only accepts Cloudflare's edge, and guests' addresses come from CF-Connecting-IP. Re-run the VPS script after changing this.</span></span></label>
           <div id="sr-confirm" class="callout" hidden>
             <p>The VPS's SSH host key (<code id="sr-confirm-host"></code>) is <code id="sr-confirm-fp"></code>.
               Check it on the VPS with <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> before trusting it: the tunnel will only ever talk to this key.</p>

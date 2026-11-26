@@ -45,7 +45,7 @@ def clean(body: dict) -> dict:
     if not shares.HOST_RE.match(share):
         raise ValueError("Share name: a DNS name pointing at the VPS, e.g. share.example.com")
     if desktop and (not shares.HOST_RE.match(desktop) or desktop == share):
-        raise ValueError("Desktop name: a second DNS name, e.g. desktop.share.example.com (or leave it empty)")
+        raise ValueError("Desktop name: a second DNS name, e.g. share-desktop.example.com (or leave it empty)")
     if not VPS_RE.match(vps):
         raise ValueError("VPS: its hostname or IP address (what you ssh to)")
     if not port.isdigit() or not 0 < int(port) < 65536:

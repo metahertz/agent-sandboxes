@@ -711,14 +711,19 @@ The VPS script:
   - It's added as `/etc/caddy/aio-share.caddy` plus an `import` line; your
     existing Caddyfile is kept.
 
-*Check from the internet* fetches `https://<share-host>/__relay/ping` the way a guest would: DNS, Caddy
-and the tunnel in one go.
+*Check from the internet* fetches `/__relay/ping` on both names the way a guest
+would: DNS, the certificate, Caddy and the tunnel in one go.
 
 **Behind Cloudflare's proxy** (orange cloud), tick *Behind Cloudflare's proxy*
 and re-run the VPS script:
 - **Set Cloudflare's SSL/TLS mode to Full (strict)** for both names, zone-wide or
   with a Configuration Rule for just them. *Flexible* makes Cloudflare reach the
   VPS over plain HTTP, and Caddy's redirect to HTTPS then loops (HTTP 308).
+- **Keep both names one level below your domain:** `share.example.com` and
+  `share-desktop.example.com`, not `desktop.share.example.com`. Cloudflare's
+  free certificate covers `*.example.com` only, so a deeper name fails the TLS
+  handshake before reaching the VPS (Firefox: `SSL_ERROR_NO_CYPHER_OVERLAP`).
+  Advanced Certificate Manager (paid) covers deeper names.
 - **Caddy only accepts Cloudflare's edge.** The script fetches Cloudflare's
   address ranges and drops other clients, so the guest's address can be taken
   from `CF-Connecting-IP` for the bad-link limiter. Both names must be proxied.

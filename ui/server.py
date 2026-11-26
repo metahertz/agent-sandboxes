@@ -3426,14 +3426,14 @@ async def handle_share(req: Request, reader, w):
     cfg = shares.config()
     if not cfg["enabled"]:
         return await respond(w, 421, "Sharing is off\n")
+    if req.path == "/__relay/ping" and req.method == "GET" and req.hostname in (cfg["host"], cfg["desktop_host"]):
+        n = req.query.get("n", "")                  # Settings' end-to-end check, of both names
+        return await respond(w, 200, f"aio-share {n}\n" if re.fullmatch(r"[a-f0-9]{1,64}", n) else "aio-share\n")
     if cfg["desktop_host"] and req.hostname == cfg["desktop_host"]:
         return await share_desktop(req, cfg, reader, w)
     if req.hostname != cfg["host"]:
         return await respond(w, 421, "Unknown host\n")
     path, m = req.path, req.method
-    if path == "/__relay/ping" and m == "GET":          # Settings' end-to-end check
-        n = req.query.get("n", "")
-        return await respond(w, 200, f"aio-share {n}\n" if re.fullmatch(r"[a-f0-9]{1,64}", n) else "aio-share\n")
     if path.startswith("/s/") and m == "GET":
         ip = share_client_ip(req, w)
         if shares.limited(ip):
@@ -3639,12 +3639,23 @@ async def sharing_api(req: Request, parts: list[str], w):
 
 
 async def sharing_check() -> dict:
-    """GET <share origin>/__relay/ping through the VPS: DNS, Caddy and the tunnel."""
+    """GET <origin>/__relay/ping through the VPS, for the share name and the
+    desktop's: DNS, the TLS certificate (Cloudflare's or Caddy's), Caddy and the tunnel."""
     cfg = shares.config()
     if not cfg["enabled"]:
         return {"ok": False, "error": "Sharing isn't set up yet"}
+    cloudflare = relay.settings()["cloudflare"]
+    results = [await probe(cfg["origin"], cloudflare)]
+    if cfg["desktop_origin"]:
+        results.append(await probe(cfg["desktop_origin"], cloudflare))
+    bad = [r for r in results if not r["ok"]]
+    return {"ok": not bad, "url": " and ".join(r["url"].split("/__")[0] for r in results),
+            "error": " ".join(f"{r['url'].split('/__')[0]}: {r['error']}" for r in bad)}
+
+
+async def probe(origin: str, cloudflare: bool) -> dict:
     nonce = secrets.token_hex(8)
-    url = f"{cfg['origin']}/__relay/ping?n={nonce}"
+    url = f"{origin}/__relay/ping?n={nonce}"
 
     def fetch():
         import urllib.error
@@ -3662,7 +3673,17 @@ async def sharing_check() -> dict:
     try:
         status, headers, body = await asyncio.to_thread(fetch)
     except Exception as e:
-        return {"ok": False, "url": url, "error": f"{type(e).__name__}: {getattr(e, 'reason', e)}"}
+        reason = getattr(e, "reason", e)
+        err = f"{type(e).__name__}: {reason}"
+        if "SSL" in err or "handshake" in err.lower():
+            host = origin.split("://", 1)[1].split(":")[0]
+            if cloudflare and host.count(".") >= 3:
+                err += (f". Cloudflare's free certificate covers your domain and one level below it "
+                        f"(*.example.com), not {host}: use a name one level down, e.g. "
+                        f"{host.replace('.', '-', 1)}, or Cloudflare's Advanced Certificate Manager.")
+            else:
+                err += ". The TLS handshake failed: the certificate for this name isn't ready (Caddy's log on the VPS)."
+        return {"ok": False, "url": url, "error": err}
     ok = status == 200 and body.strip() == f"aio-share {nonce}"
     return {"ok": ok, "url": url, "error": "" if ok else check_advice(status, headers, body, url)}
 

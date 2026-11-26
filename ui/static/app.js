@@ -2366,6 +2366,6 @@ $("#sr-check").addEventListener("click", async () => {
   srMsg("Checking…");
   try {
     const r = await api("POST", "settings/sharing/check");
-    srMsg(r.ok ? `Works: ${r.url} reached this host through the relay.` : `${r.url || ""} ${r.error}`, !r.ok);
+    srMsg(r.ok ? `Works: ${r.url} reached this host through the relay.` : r.error, !r.ok);
   } catch (e) { srMsg(e.message, true); }
 });
