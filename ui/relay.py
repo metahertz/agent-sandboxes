@@ -265,13 +265,11 @@ def vps_script() -> str:
     names = cfg["shareHost"] + (f", {cfg['desktopHost']}" if cfg["desktopHost"] else "")
     u, p = RELAY_USER, shares.RELAY_PORT
     user_part = vps_user_part(u, p, pub)
-    caddy = caddy_cloudflare(names, p) if cfg["cloudflare"] else f"""# 2. Caddy: HTTPS for {names} (Let's Encrypt), to the tunnel
+    caddy = caddy_cloudflare(names, p) if cfg["cloudflare"] else f"""# 2. Caddy: HTTPS for {names} (Let's Encrypt), to the tunnel (it sets X-Forwarded-For itself)
 command -v caddy >/dev/null 2>&1 || {{ apt-get update && apt-get install -y caddy; }}
 cat > /etc/caddy/aio-share.caddy <<'CADDY'
 {names} {{
-	reverse_proxy 127.0.0.1:{p} {{
-		header_up X-Forwarded-For {{remote_host}}
-	}}
+	reverse_proxy 127.0.0.1:{p}
 }}
 CADDY
 """

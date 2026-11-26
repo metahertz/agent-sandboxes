@@ -719,7 +719,7 @@ The VPS script:
     the installed key's fingerprint to compare with *Tunnel key* in Settings.
   - It's safe to run again, e.g. after changing the names.
 - **Installs Caddy** with a site for both names. Caddy gets Let's Encrypt
-  certificates and passes the guest's address on in `X-Forwarded-For`.
+  certificates and passes the guest's address on in `X-Forwarded-For` (its default).
   - It's added as `/etc/caddy/aio-share.caddy` plus an `import` line; your
     existing Caddyfile is kept.
 
