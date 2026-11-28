@@ -111,7 +111,22 @@
           <button class="btn" data-act="claude/stop">Stop</button>
         </div>
         <div class="group end">
+          <button class="btn ghost" id="archive-btn" title="Stop everything it runs and keep its files">Archive…</button>
           <button class="btn danger ghost" id="remove-btn">Remove…</button>
+        </div>
+      </div>
+      <div class="confirm soft" id="archive-confirm" hidden>
+        <p>Archive <strong id="ar-name"></strong>? Stops Claude and the <span id="ar-what">container</span>, so it uses no memory or CPU, and revokes its share links. Its files stay on disk and in the backups: <code id="ar-dir"></code>. Unarchive it any time.</p>
+        <div class="row">
+          <button class="btn primary" id="ar-yes">Archive workspace</button>
+          <button class="btn ghost" id="ar-no">Cancel</button>
+        </div>
+      </div>
+      <div class="archived-note" id="archived-note" hidden>
+        <p><strong>Archived</strong> <span id="an-when"></span>. Nothing of it runs. Its project folder <code id="an-dir"></code> is kept and backed up<span id="an-vm"></span>.</p>
+        <div class="row">
+          <button class="btn primary" id="unarchive-btn">Unarchive</button>
+          <button class="btn danger ghost" id="an-remove">Remove…</button>
         </div>
       </div>
       <div class="confirm" id="remove-confirm" hidden>

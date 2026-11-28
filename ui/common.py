@@ -13,6 +13,7 @@ import json
 import os
 import re
 import signal
+import time
 from pathlib import Path
 
 ROOT = Path(os.environ.get("AIO_ROOT", Path.home() / "agent-sandboxes"))
@@ -177,6 +178,26 @@ def container_filtered(name: str) -> bool:
 
 def is_microvm(ws: dict[str, str] | None) -> bool:
     return bool(ws) and ws.get("WS_KIND") == "microvm"
+
+
+def is_archived(ws: dict[str, str] | None) -> bool:
+    """Archived (WS_ARCHIVED=<when> in its .env): nothing of it runs, its files stay."""
+    return bool(ws) and bool(ws.get("WS_ARCHIVED"))
+
+
+def set_archived(name: str, on: bool):
+    """Add or drop the WS_ARCHIVED line of <name>.env, in place (same owner and mode)."""
+    path = WS_ROOT / f"{name}.env"
+    lines = [ln for ln in path.read_text().splitlines() if not ln.startswith("WS_ARCHIVED=")]
+    if on:
+        lines.append(f"WS_ARCHIVED={int(time.time())}")
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    st = path.stat()
+    os.chown(tmp, -1, st.st_gid)
+    os.replace(tmp, path)
 
 
 def vm_cid(ws: dict[str, str]) -> int:

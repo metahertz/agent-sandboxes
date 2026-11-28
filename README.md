@@ -196,6 +196,21 @@ Screenshots are from a demo setup (made-up workspaces, keys and tokens).
   when every byte has arrived, so a cancelled or broken upload leaves nothing behind.
   Names already in the folder are asked about first. Up to 20 GB per file
   (`AIO_UPLOAD_MAX_GB`).
+- **Archive…** (next to *Remove…*): parks a workspace you aren't using so it costs
+  nothing but disk.
+  - **What it stops:** Claude and the workspace's ssh-agent, the container (`docker
+    compose stop`) or the VM, its sandbox port, and its proxies in the proxy service.
+    Its share links are revoked.
+  - **What it keeps:** the project folder (still in the backups, which take every
+    workspace's folder), the stopped container (browser profile included) or the VM's
+    disk, and its Access settings, keys and tokens.
+  - **How it's marked:** with a `WS_ARCHIVED=<time>` line in `workspaces/<name>.env`.
+    Nothing of it starts again on a reboot or a UI restart.
+  - **In the UI:** archived workspaces sit in a folded *Archived* group at the foot of
+    the sidebar. Their page has only *Unarchive* and *Remove…*, and the API refuses to
+    start them.
+  - **Unarchive:** makes it startable again, but leaves it stopped. Start the container
+    or VM, then Claude, as usual.
 
 ![A workspace's Browser tab: the sandbox's Chromium over VNC](docs/screenshots/workspace-browser.png)
 

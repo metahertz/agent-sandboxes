@@ -506,7 +506,8 @@ async def collect(audit: Audit, du: dict[str, int]) -> str:
         lim = pol["limits"]
         m.add("aio_workspace_info", "gauge", "Workspace (always 1) with its settings as labels.", 1,
               workspace=n, dir=ws.get("WS_DIR", ""), port=ws.get("WS_PORT", ""),
-              network=pol["network"]["mode"], kind=s.get("kind", "sandbox"))
+              network=pol["network"]["mode"], kind=s.get("kind", "sandbox"),
+              archived="1" if s.get("archived") else "0")
         vm = s.get("kind") == "microvm"
         m.add("aio_workspace_container_up", "gauge", "AIO Sandbox container (or microVM) is running.",
               int(s.get("container") == "running"), workspace=n)

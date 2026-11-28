@@ -56,9 +56,9 @@ from common import (CONTAINER_PROXY_PORT, CONTAINER_PROXY_SECRETS, DEFAULT_POLIC
                     SANDBOX_PORTS, SECRETS, SSH_POOL, TOKEN_POOL, VM_BROWSER_PORT, VM_PROXY_OFFSET,
                     VM_RELAY_PORT, VM_ROOT,
                     WS_ROOT, all_ws, container_ca_paths, container_filtered, container_net,
-                    container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
-                    load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version, read_env,
-                    token_meta, vm_browser, vm_cid)
+                    container_password_path, container_profile_path, die_with_parent, egress_port, is_archived,
+                    is_microvm, load_policy, load_ws, parse_net_entry, policy_path, proxyd_source_version, read_env,
+                    set_archived, token_meta, vm_browser, vm_cid)
 import auth  # noqa: E402
 import builds  # noqa: E402
 import applesign  # noqa: E402
@@ -311,13 +311,14 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
         if share:                          # the share listener: guest routes only, never the UI
             await handle_share(req, reader, writer)
         elif sandbox is not None:            # connection arrived on a sandbox port
-            if req.hostname in UI_HOSTNAMES and load_ws(sandbox):
+            if req.hostname in UI_HOSTNAMES and (ws := load_ws(sandbox)) and not is_archived(ws):
                 await handle_proxy(req, sandbox, reader, writer)
             else:
                 await respond(writer, 421, "Unknown host\n")
         elif req.hostname in UI_HOSTNAMES:
             await handle_ui(req, reader, writer)
-        elif (m := re.fullmatch(r"([a-z0-9-]+)\.localhost", req.hostname)) and load_ws(m[1]):
+        elif (m := re.fullmatch(r"([a-z0-9-]+)\.localhost", req.hostname)) and (ws := load_ws(m[1])) \
+                and not is_archived(ws):
             await handle_proxy(req, m[1], reader, writer)
         else:
             await respond(writer, 421, "Unknown host\n")
@@ -533,6 +534,10 @@ async def api(req: Request, w):
         return await send_json(w, {"error": "No such workspace"}, 404)
     name, action = ws["WS_NAME"], parts[2:]
 
+    if action in (["archive"], ["unarchive"]) and m == "POST":
+        return await archive_api(ws, action == ["archive"], w)
+    if is_archived(ws) and m != "GET" and not (action == [] and m == "DELETE") and action != ["tags"]:
+        return await send_json(w, {"error": f"'{name}' is archived: unarchive it first"}, 409)
     if action[:1] == ["builds"]:
         return await builds_ws_api(ws, req, action[1:], w)
     if action == ["shares"]:
@@ -607,6 +612,37 @@ async def api(req: Request, w):
         return await download(ws, req, w)
 
     await respond(w, 404, "Not found\n")
+
+
+async def archive_api(ws: dict[str, str], on: bool, w):
+    """Archive: stop everything the workspace runs (Claude, its ssh-agent, the
+    container or VM, its listener and proxies) and keep every file: the project
+    folder (still backed up), the stopped container or the VM's disk, its access
+    settings. Its share links are revoked. Unarchive makes it startable again."""
+    name = ws["WS_NAME"]
+    if on == is_archived(ws):
+        return await send_json(w, {"ok": True, "archived": on})
+    if on:
+        await run(*TMUX, "kill-session", "-t", f"cl-{name}")
+        if is_microvm(ws):
+            rc, out, err = await run(str(MICROVM), "stop", name, timeout=90)
+        else:
+            rc, out, err = await run(*compose(ws, "stop"))
+        if rc != 0:
+            return await send_json(w, {"error": f"Stopping it failed: {(err or out).strip()[-500:]}"}, 500)
+        kill_agent(name)
+        revoked = shares.revoke_workspace(name)
+        set_archived(name, True)
+        close_sandbox_listener(name)
+        notes = await sync_proxies()
+        print(f"archived workspace {name}", flush=True)
+        return await send_json(w, {"ok": True, "archived": True, "revoked": revoked, "notes": notes})
+    set_archived(name, False)
+    ws = load_ws(name)
+    notes = [e] if (e := await open_sandbox_listener(ws)) else []
+    notes += await sync_proxies(name)
+    print(f"unarchived workspace {name}", flush=True)
+    return await send_json(w, {"ok": True, "archived": False, "notes": notes})
 
 
 async def vm_api(ws: dict[str, str], action: list[str], m: str, w):
@@ -691,6 +727,7 @@ async def status_all() -> list[dict]:
         pol = load_policy(n)
         out.append({"name": n, "dir": ws.get("WS_DIR"), "port": ws.get("WS_PORT"),
                     "kind": "microvm" if vm else "sandbox", "browser": not vm or pol["vm_browser"],
+                    "archived": int(ws.get("WS_ARCHIVED") or 0) or None,
                     "container": state, "containerDetail": detail,
                     "claude": claude.get(n, "stopped"),
                     "term": seen.get(n), "tags": pol["tags"], "guests": guests.get(n, []),
@@ -1418,6 +1455,9 @@ async def start_agent(name: str):
 async def sync_agent(name: str):
     """Make the workspace agent hold exactly its assigned keys. Takes
     effect immediately, including for a Claude that's already running."""
+    if is_archived(load_ws(name)):
+        kill_agent(name)              # it starts again with Claude, after unarchiving
+        return
     want = {}
     for kid in load_policy(name)["ssh_keys"]:
         pub = (SSH_POOL / f"{kid}.pub").read_text().split()
@@ -4369,7 +4409,8 @@ async def main():
                for addr in BIND]
     for ws in all_ws():
         write_container_files(ws)        # the container proxies' profiles, for the proxy service
-        await open_sandbox_listener(ws)
+        if not is_archived(ws):
+            await open_sandbox_listener(ws)
     try:
         mcp_server = await builds.serve_mcp(load_ws, lambda n: load_policy(n)["builds"])
     except OSError as e:          # the UI runs on without the agents' build tools

@@ -39,8 +39,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (CONTAINER_PROXY_PORT, HTTP_BRIDGE, MAX_HEAD, NAME_RE, NONO_LOGS, PROXYD_SOCK, RUNTIME,  # noqa: E402
                     VM_BROWSER_PORT, VM_RELAY_PORT, all_ws, container_ca_paths, container_filtered, container_net,
-                    container_password_path, container_profile_path, die_with_parent, egress_port, is_microvm,
-                    load_policy, load_ws, parse_net_entry, proxyd_source_version, token_meta, unsafe_ip,
+                    container_password_path, container_profile_path, die_with_parent, egress_port, is_archived,
+                    is_microvm, load_policy, load_ws, parse_net_entry, proxyd_source_version, token_meta, unsafe_ip,
                     vm_browser, vm_cid, vm_proxy_port, wants_ws_proxy)
 import builds  # noqa: E402
 
@@ -476,7 +476,8 @@ vm_relay: asyncio.Server | None = None
 
 async def handle_vm(reader, writer):
     cid = (writer.get_extra_info("peername") or (None,))[0]
-    ws = next((w for w in all_ws() if is_microvm(w) and w.get("WS_PORT", "").isdigit() and vm_cid(w) == cid), None)
+    ws = next((w for w in all_ws() if is_microvm(w) and not is_archived(w) and w.get("WS_PORT", "").isdigit()
+               and vm_cid(w) == cid), None)
     if not ws:
         print(f"vm-relay: refused a connection from vsock CID {cid} (no microVM workspace has it)", flush=True)
         writer.close()
@@ -547,6 +548,8 @@ async def sync(restart: list[str] = ()) -> dict[str, list[str]]:
             name = ws.get("WS_NAME", "")
             if not (NAME_RE.match(name) and ws.get("WS_PORT", "").isdigit()):
                 continue           # e.g. being written
+            if is_archived(ws):
+                continue           # archived: none of its proxies run (stopped below)
             seen.add(name)
             if name not in egress_listeners:
                 await open_egress_filter(ws)

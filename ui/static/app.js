@@ -115,7 +115,7 @@ function matches(w, words) {
 }
 
 function wsRow(w, act) {
-  const b = el("button", { className: `ws-item${side.compact ? " compact" : ""}${act ? ` ${act}` : ""}`, type: "button" });
+  const b = el("button", { className: `ws-item${side.compact ? " compact" : ""}${act ? ` ${act}` : ""}${w.archived ? " archived" : ""}`, type: "button" });
   b.setAttribute("aria-current", String(state.view === "ws" && w.name === state.selected));
   const ACT_TITLE = { working: "Claude is working", waiting: "Claude finished or needs you", unread: "New output since you looked" };
   const mark = el("span", { className: `act ${act}`, title: ACT_TITLE[act] || "" });
@@ -130,6 +130,7 @@ function wsRow(w, act) {
     title: `${w.kind === "microvm" ? "VM" : "Container"}: ${w.container}` });
   const dl = el("span", { className: `dot ${CLAUDE_TONE[w.claude] || "none"}`, title: `Claude: ${w.claude}` });
   dots.append(dc, dl);
+  dots.hidden = !!w.archived;
   b.append(dots);
   const sub = w.dir.replace(/^\/home\/[^/]+/, "~") + (w.kind === "microvm" ? " · microVM" : "")
     + ((w.tags || []).length ? ` · ${w.tags.map((t) => `#${t}`).join(" ")}` : "");
@@ -138,6 +139,8 @@ function wsRow(w, act) {
   b.addEventListener("click", () => select(w.name));
   return b;
 }
+
+const ARCHIVED = "￿￿archived";    // sorts after "￿other"
 
 function renderList() {
   const list = $("#ws-list");
@@ -157,15 +160,18 @@ function renderList() {
   // groups: Pinned, then each first tag (A–Z), then the rest; no headings while nothing is grouped
   const groups = new Map();
   const add = (key, w) => (groups.get(key) || groups.set(key, []).get(key)).push(w);
-  for (const w of shown) add(side.pinned.has(w.name) ? "\u0000pinned" : (w.tags || [])[0] || "￿other", w);
+  // archived ones last, folded away unless opened (for that group, being in side.collapsed means open)
+  for (const w of shown) {
+    add(w.archived ? ARCHIVED : side.pinned.has(w.name) ? "\u0000pinned" : (w.tags || [])[0] || "￿other", w);
+  }
   const keys = [...groups.keys()].sort();
   const flat = keys.length === 1 && keys[0] === "￿other";
   const out = [];
   for (const key of keys) {
     const items = groups.get(key);
     if (!flat) {
-      const label = key === "\u0000pinned" ? "Pinned" : key === "￿other" ? "Other" : `#${key}`;
-      const open = words.length > 0 || !side.collapsed.has(key);
+      const label = key === "\u0000pinned" ? "Pinned" : key === "￿other" ? "Other" : key === ARCHIVED ? "Archived" : `#${key}`;
+      const open = words.length > 0 || side.collapsed.has(key) === (key === ARCHIVED);
       const head = el("button", { className: "ws-group", type: "button" },
         el("span", { className: "caret", textContent: "▾" }), el("span", { textContent: label }),
         el("span", { className: "count", textContent: `${items.length}` }));
@@ -322,6 +328,7 @@ function renderDetail() {
   if (!w.builds && state.tab === "builds") selectTab("claude");
   setPill($("#d-claude"), "Claude", w.claude, CLAUDE_TONE[w.claude]);
   $("#d-pending").hidden = !w.policyPending;
+  if (renderArchived(w, vm)) return;
   const guests = w.guests || [];
   $("#d-guests").hidden = !guests.length;
   $("#d-guests").textContent = guests.length === 1 ? `guest: ${guests[0]}` : `${guests.length} guests`;
@@ -353,6 +360,23 @@ function renderDetail() {
     if ((!up || !views) && state.frameFor[tab]) clearFrame(tab);
   }
   if (up && views && FRAMES[state.tab] && state.frameFor[state.tab] !== w.name) loadFrame(state.tab, w);
+}
+
+// An archived workspace: just the note (Unarchive, Remove); nothing to attach to
+function renderArchived(w, vm) {
+  const on = !!w.archived;
+  $("#detail").classList.toggle("archived", on);
+  $("#archived-note").hidden = !on;
+  $("#d-claude").hidden = on;
+  if (!on) return false;
+  setPill($("#d-container"), "archived", new Date(w.archived * 1000).toLocaleDateString(), "");
+  $("#an-when").textContent = `since ${new Date(w.archived * 1000).toLocaleString()}`;
+  $("#an-dir").textContent = w.dir;
+  $("#an-vm").textContent = vm ? "; the VM's disk is kept too (not in the backups)" : "; the stopped container is kept too";
+  $("#archive-confirm").hidden = true;
+  disconnectTerm();
+  Object.keys(FRAMES).forEach(clearFrame);
+  return true;
 }
 
 function select(name) {
@@ -423,13 +447,44 @@ document.addEventListener("click", async (ev) => {
 
 $("#remove-btn").addEventListener("click", () => {
   const w = current();
+  $("#archive-confirm").hidden = true;
   $("#rm-name").textContent = w.name;
   $("#rm-dir").textContent = w.dir;
   $("#rm-what").textContent = w.kind === "microvm"
     ? "VM and its disk (Claude's login there, Docker images, anything outside /project)" : "container and its key";
   $("#remove-confirm").hidden = false;
 });
-const hideConfirm = () => ($("#remove-confirm").hidden = true);
+const hideConfirm = () => { $("#remove-confirm").hidden = true; $("#archive-confirm").hidden = true; };
+$("#an-remove").addEventListener("click", () => $("#remove-btn").click());
+
+$("#archive-btn").addEventListener("click", () => {
+  const w = current();
+  $("#ar-name").textContent = w.name;
+  $("#ar-dir").textContent = w.dir;
+  $("#ar-what").textContent = w.kind === "microvm" ? "VM" : "container";
+  $("#remove-confirm").hidden = true;
+  $("#archive-confirm").hidden = false;
+});
+$("#ar-no").addEventListener("click", hideConfirm);
+async function setArchived(on) {
+  const w = current();
+  const btn = on ? $("#ar-yes") : $("#unarchive-btn");
+  btn.disabled = true;
+  msg(on ? `Archiving ${w.name}…` : `Unarchiving ${w.name}…`);
+  try {
+    const r = await api("POST", wsPath(w.name, on ? "/archive" : "/unarchive"));
+    hideConfirm();
+    const notes = r.notes || [];
+    msg(notes.length ? notes.join(" ") : on ? (r.revoked ? `Archived; revoked ${r.revoked} share link(s).` : "Archived.")
+      : `Unarchived: start the ${w.kind === "microvm" ? "VM" : "container"} and Claude when you need them.`, notes.length > 0);
+  } catch (e) {
+    msg(e.message, true);
+  }
+  btn.disabled = false;
+  await refresh();
+}
+$("#ar-yes").addEventListener("click", () => setArchived(true));
+$("#unarchive-btn").addEventListener("click", () => setArchived(false));
 $("#rm-no").addEventListener("click", hideConfirm);
 $("#rm-yes").addEventListener("click", async () => {
   const w = current();
