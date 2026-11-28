@@ -183,8 +183,19 @@ Screenshots are from a demo setup (made-up workspaces, keys and tokens).
     (`tags` in the policy), and used only for display. The sidebar groups workspaces by
     their first tag; groups collapse, and a collapsed one shows how many are waiting.
     **☆** pins a workspace to the top (per browser).
+  - **On a phone:** the sidebar folds into a bar at the top naming the open workspace
+    or page, with a count of the workspaces waiting for you. Tap it to open the list.
+    Picking something folds it again.
   - **Theme:** *Auto* (the system's), *Light* or *Dark*, at the foot of the sidebar,
     per browser. Terminals stay dark in both.
+- **Key bar** (touch screens, under the Claude terminal): keys phone keyboards lack.
+  - **▲ / ▼ Scroll:** tmux scrollback. Each tap sends mouse-wheel events, which
+    `ui/tmux.conf` turns into 10 lines of scrolling; hold to repeat. Esc, or scrolling
+    back to the bottom, leaves it.
+  - **Other keys:** *Tab* (completion), *⇧Tab* (Claude's mode), *Esc*, *↑*, *↓* and
+    *^C*.
+  - **Keyboard focus:** the bar keeps it on the terminal, so the phone's keyboard
+    stays up.
 - **Tabs:** *Claude* (sandboxed session, survives closing the tab) · *Browser* (live VNC,
   shared with Claude) · *VS Code* and *Terminal* (inside the container) · *Access* (SSH
   keys, API tokens, network allowlist, memory/process limits) · *Files* (browse, download

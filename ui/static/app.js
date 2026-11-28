@@ -148,6 +148,8 @@ function renderList() {
   const acts = new Map(all.map((w) => [w.name, termState(w)]));
   const waiting = all.filter((w) => acts.get(w.name) === "waiting").length;
   document.title = `${waiting ? `(${waiting}) ` : ""}Agent Sandboxes`;
+  $("#nav-wait").hidden = !waiting;
+  $("#nav-wait").textContent = `${waiting} waiting`;
   if (!all.length) {
     list.replaceChildren(el("p", { className: "ws-empty", textContent: "No workspaces yet." }));
     return;
@@ -299,6 +301,7 @@ function setPill(el, label, value, tone) {
 
 function renderDetail() {
   const page = state.view in PAGES;
+  renderNav(page);
   for (const [view, sel] of Object.entries(PAGES)) {
     $(sel).hidden = state.view !== view;
     $(`${sel}-btn`).setAttribute("aria-current", String(state.view === view));
@@ -379,7 +382,23 @@ function renderArchived(w, vm) {
   return true;
 }
 
+// Phones: the sidebar is folded into a toggle naming what's open; picking
+// something folds it again. Open while nothing is picked.
+function setNav(open) {
+  $(".sidebar").classList.toggle("open", open);
+  $("#nav-toggle").setAttribute("aria-expanded", String(open));
+}
+$("#nav-toggle").addEventListener("click", () => setNav(!$(".sidebar").classList.contains("open")));
+function renderNav(page) {
+  const w = page ? null : current();
+  const label = page ? $(`${PAGES[state.view]}-btn .n`)?.textContent : w?.name;
+  $("#nav-current").textContent = label || "Workspaces";
+  $(".sidebar").classList.toggle("has-current", !!label);
+  if (!label) setNav(true);
+}
+
 function select(name) {
+  setNav(false);
   if (state.selected !== name || state.view !== "ws") {
     state.view = "ws";
     state.selected = name;
@@ -400,6 +419,7 @@ function select(name) {
 const PAGE_LOAD = { pool: () => loadPool(), import: () => loadImport(), host: () => loadHost(), workers: () => loadBuildHost(), settings: () => loadSettings() };
 
 function showPage(view) {
+  setNav(false);
   state.view = view;
   history.replaceState(null, "", Object.keys(VIEW_OF_HASH).find((h) => VIEW_OF_HASH[h] === view));
   disconnectTerm();
@@ -585,6 +605,33 @@ function initXterm() {
   term.xterm.open($("#term"));
   term.xterm.onData((d) => send({ t: "i", d }));
   new ResizeObserver(() => fitTerm()).observe($("#term"));
+}
+
+// The key bar under the terminal (touch screens): keys phone keyboards lack.
+// Scrolling sends mouse-wheel events, which tmux (ui/tmux.conf) turns into
+// scrollback, 5 lines each; holding a scroll key repeats it.
+const TERM_KEYS = { tab: "\t", "shift-tab": "\x1b[Z", esc: "\x1b", up: "\x1b[A", down: "\x1b[B", "ctrl-c": "\x03",
+                    "scroll-up": "\x1b[<64;2;2M".repeat(2), "scroll-down": "\x1b[<65;2;2M".repeat(2) };
+let keyRepeat = null;
+const stopKeyRepeat = () => { clearTimeout(keyRepeat); clearInterval(keyRepeat); keyRepeat = null; };
+$("#term-keys").addEventListener("pointerdown", (ev) => {
+  const b = ev.target.closest("[data-key]");
+  if (!b) return;
+  ev.preventDefault();               // keep the focus (and the phone's keyboard) on the terminal
+  const d = TERM_KEYS[b.dataset.key];
+  send({ t: "i", d });
+  stopKeyRepeat();
+  if (b.dataset.key.startsWith("scroll-")) keyRepeat = setTimeout(() => (keyRepeat = setInterval(() => send({ t: "i", d }), 120)), 400);
+});
+for (const ev of ["pointerup", "pointercancel", "pointerleave"]) $("#term-keys").addEventListener(ev, stopKeyRepeat);
+$("#term-keys").addEventListener("click", (ev) => ev.preventDefault());
+// iOS overlays the keyboard on the page instead of shrinking it: lift the key bar by its height
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const lift = () => document.documentElement.style.setProperty("--kb",
+    `${Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop))}px`);
+  vv.addEventListener("resize", lift);
+  vv.addEventListener("scroll", lift);
 }
 
 function send(obj) {

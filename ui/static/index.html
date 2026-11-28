@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>Agent Sandboxes</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
@@ -17,7 +17,10 @@
   <aside class="sidebar">
     <header class="brand">
       <span class="logo" aria-hidden="true"></span>
-      <span>Agent Sandboxes</span>
+      <span class="brand-name">Agent Sandboxes</span>
+      <button id="nav-toggle" class="nav-toggle" type="button" aria-expanded="false" aria-controls="ws-list" title="Workspaces and pages">
+        <span id="nav-current">Workspaces</span><span class="waiting-count" id="nav-wait" hidden></span><span class="caret" aria-hidden="true">▾</span>
+      </button>
     </header>
 
     <div class="ws-tools">
@@ -152,6 +155,16 @@
 
       <div class="panel" data-panel="claude">
         <div id="term" class="term"></div>
+        <div class="term-keys" id="term-keys" role="toolbar" aria-label="Keys your phone's keyboard lacks">
+          <button type="button" data-key="scroll-up" title="Scroll back (tmux; Esc or scrolling to the bottom leaves)">▲ Scroll</button>
+          <button type="button" data-key="scroll-down" title="Scroll forward">▼ Scroll</button>
+          <button type="button" data-key="tab" title="Tab: complete">Tab</button>
+          <button type="button" data-key="shift-tab" title="Shift-Tab: Claude's mode (auto-accept, plan)">⇧Tab</button>
+          <button type="button" data-key="esc" title="Esc: interrupt Claude, leave scrollback">Esc</button>
+          <button type="button" data-key="up" title="Up">↑</button>
+          <button type="button" data-key="down" title="Down">↓</button>
+          <button type="button" data-key="ctrl-c" title="Ctrl-C">^C</button>
+        </div>
         <div class="overlay" id="term-overlay" hidden>
           <p id="term-overlay-msg"></p>
           <button class="btn primary" data-act="claude/start">Start Claude</button>

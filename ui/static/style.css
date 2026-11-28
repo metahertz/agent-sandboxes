@@ -161,11 +161,36 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .files .note { color: var(--muted); padding: 20px; }
 .logs { flex: 1; margin: 0; overflow: auto; padding: 12px 20px; font: 12px/1.5 var(--mono); background: var(--term-bg); color: #d6d6d0; white-space: pre-wrap; word-break: break-all; }
 
+/* phones: the sidebar folds into its header (a toggle naming what's open) */
+.nav-toggle { display: none; }
+/* keys a phone keyboard lacks, under the Claude terminal (touch screens only) */
+.term-keys { display: none; }
+@media (pointer: coarse), (max-width: 760px) {
+  /* stays in sight while the terminal is: above the page's bottom edge, or the
+     on-screen keyboard (--kb, from visualViewport in app.js, for iOS) */
+  .term-keys { display: flex; gap: 6px; padding: 6px 8px; overflow-x: auto; scrollbar-width: none; background: var(--term-bg); border-top: 1px solid #2a2a27; flex: none;
+               position: sticky; bottom: var(--kb, 0px); z-index: 4; }
+  .term-keys button { all: unset; flex: none; padding: 8px 12px; min-width: 2.2em; text-align: center; border-radius: 6px; background: #2a2a27; color: #e8e8e3; font: 13px/1 var(--mono); cursor: pointer; touch-action: manipulation; user-select: none; -webkit-user-select: none; }
+  .term-keys button:active { background: #3d3d38; }
+}
+
 @media (max-width: 760px) {
-  .shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; }
-  .sidebar { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; }
+  .shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; height: auto; }
+  .sidebar, .main { min-width: 0; }
+  .sidebar { border-right: 0; border-bottom: 1px solid var(--line); padding: 8px 12px; gap: 8px; position: sticky; top: 0; z-index: 5; }
+  .sidebar:not(.open) > :not(.brand) { display: none !important; }
+  .sidebar.open { max-height: 85vh; }
+  .brand { padding: 2px 4px; min-width: 0; }
+  .sidebar.has-current:not(.open) .brand-name { display: none; }
+  .nav-toggle { all: unset; display: flex; align-items: center; gap: 8px; margin-left: auto; min-width: 0; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; font-weight: 600; }
+  .sidebar.has-current:not(.open) .nav-toggle { margin-left: 0; flex: 1; }
+  #nav-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nav-toggle .caret { margin-left: auto; transition: transform .15s; }
+  .nav-toggle[aria-expanded="true"] .caret { transform: rotate(180deg); }
   .detail { height: auto; min-height: 80vh; }
   .term, .frame { min-height: 60vh; }
+  .tabs { overflow-x: auto; scrollbar-width: none; padding: 4px 8px 0; }
+  .tabs button { flex: none; white-space: nowrap; padding: 8px 10px; }
   .group.end { margin-left: 0; }
 }
 
@@ -274,7 +299,7 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 
 /* ---- sidebar: filter, sort, groups, activity; theme switch; workspace tags */
 .ws-tools { display: flex; gap: 6px; align-items: center; }
-.ws-tools input { flex: 1; font-size: 13px; padding: 5px 8px; }
+.ws-tools input { flex: 1; min-width: 0; font-size: 13px; padding: 5px 8px; }
 .ws-tools select { padding: 5px 6px; }
 .btn.icon { padding: 4px 8px; }
 .btn.icon[aria-pressed="true"] { background: var(--sunken); border-color: var(--line); }
@@ -284,7 +309,7 @@ textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset:
 .ws-group .caret { display: inline-block; transition: transform .15s; font-size: 9px; }
 .ws-group[aria-expanded="false"] .caret { transform: rotate(-90deg); }
 .ws-group .count { font-weight: 400; letter-spacing: 0; }
-.ws-group .waiting-count { margin-left: auto; text-transform: none; letter-spacing: 0; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 0 6px; font-size: 11px; }
+.ws-group .waiting-count, .nav-toggle .waiting-count { margin-left: auto; text-transform: none; letter-spacing: 0; color: var(--accent-fg); background: var(--accent); border-radius: 999px; padding: 0 6px; font-size: 11px; }
 .ws-item.compact { padding: 5px 10px; }
 .ws-item.compact .sub { display: none; }
 .ws-item .n { display: flex; align-items: center; gap: 6px; }
